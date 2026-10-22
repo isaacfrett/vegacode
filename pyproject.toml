@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.27"]  # 1.27: PEP 639 license / license-files
+build-backend = "hatchling.build"
+
+[project]
+# The distribution is `vegacode` (`vega` on PyPI is the Vega visualization grammar); the import
+# package and the command stay `vega`.
+name = "vegacode"
+version = "0.3.0"
+description = "Local coding agent that runs on your laptop: an offline AI coding assistant for the terminal, powered by open-weight LLMs through Ollama. Your code never leaves your machine. Vega writes, runs your tests in a sandbox and repairs what fails. Python CLI and TUI, built for small models (under 10B) on 16 GB."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"  # PEP 639 SPDX expression (no licence classifier with it)
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Isaac Frett" }]
+keywords = [
+    "local coding agent", "AI coding assistant", "offline AI coding assistant", "coding agent",
+    "AI agent", "AI agents", "local LLM", "local AI", "Ollama", "open-weight LLM",
+    "open-source LLM", "LLM", "terminal", "CLI", "TUI", "Textual", "privacy", "self-hosted",
+    "developer tools", "Python", "vegacode",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "openai>=1.68,<4", "typer>=0.15,<1", "rich>=13.9,<16", "ruff>=0.8", "textual>=8.0,<9",
+]
+
+[project.optional-dependencies]
+train = ["mlx-lm[train]"]
+learn = ["pypdf>=4"]  # PDFs (books) for vega learn
+# coverage: tests/test_acceptance.py checks `coverage run` task commands, which need it installed
+dev = ["pytest>=8", "mypy>=1.13", "coverage>=7", "jsonschema>=4"]
+
+[project.urls]
+Homepage = "https://github.com/isaacfrett/vegacode"
+Repository = "https://github.com/isaacfrett/vegacode"
+Issues = "https://github.com/isaacfrett/vegacode/issues"
+
+[project.scripts]
+vega = "vega.cli:app"
+vegacode = "vega.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vega"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# The default model profiles ship inside the package (read through importlib.resources when there
+# is no checkout); the repo-root models.toml stays the one source of truth.
+"models.toml" = "vega/default_models.toml"
+
+[tool.hatch.build.targets.sdist]
+# Only what a wheel is built from: no tests, evals, training data or private docs.
+only-include = [
+    "src/vega", "models.toml", "README.md", "pyproject.toml", "LICENSE", "NOTICE",
+]
+
+[tool.ruff]
+line-length = 100

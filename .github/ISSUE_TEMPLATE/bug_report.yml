@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Vega does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems go to a private advisory instead (see SECURITY.md).
+        Please remove secrets, private code and personal paths from anything you paste.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Vega did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The exact command(s), e.g. `vega run "..."`, and a minimal project if you can.
+      placeholder: |
+        1. mkdir demo && cd demo
+        2. vega run "..."
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Vega version
+      description: Output of `pip show vegacode` (the Version line).
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model profile and runtime
+      description: Output of `vega config`, plus the Ollama (or LM Studio / llama.cpp) version.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [macOS, Linux, Windows, Other]
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: RAM and chip
+      description: e.g. 16 GB, Apple M4. Small-model behaviour depends on it.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug log excerpt
+      description: Run with `vega --debug` (or VEGA_DEBUG=1) and paste the relevant part.
+      render: text

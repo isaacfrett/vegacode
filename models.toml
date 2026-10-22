@@ -1,0 +1,62 @@
+# Vega model profiles: the one place to choose the base model and its settings.
+#
+#   vega model list               profiles, whether built, and any eval scores
+#   vega model use coder-7b       make a profile the default `vega` model
+#   vega model build coder-7b     build `vega-coder-7b` alongside, for comparison
+#   vega eval --model coder-7b    evaluate a profile without changing the default
+#   vega model add NAME --base MODEL [--endpoint URL]   attach a model (appends a profile here)
+#   vega model check NAME         does it work through Vega? (~1-2 min; exit 1 on a failure)
+#   vega model remove NAME        drop a profile (weights are kept; prints the `ollama rm` command)
+#
+# Fields: base (Ollama model to build FROM), description, num_ctx, and any other Ollama PARAMETER
+# under [profiles.NAME.parameters]. Omit temperature to keep the base model's own recommended
+# sampling. request = { key = value } adds fields to every request. Memory figures were measured
+# on a 16 GB Apple Silicon Mac.
+#
+# Another local OpenAI-compatible server instead of Ollama (LM Studio, llama-server,
+# mlx_lm.server): endpoint = "http://127.0.0.1:1234/v1" and, if it serves the model under another
+# name, api_model = "...". Nothing is built; requests go straight there. num_ctx is then only what
+# Vega budgets for (set the same window in the server) and [parameters] do not apply. Endpoints
+# must be local or on the local network unless allow_remote = true.
+
+default = "granite-8b"
+
+[profiles.coder-7b]
+base = "qwen2.5-coder:7b-instruct-q4_K_M"
+description = "Former default (until 2026-10-15; granite-8b replaced it after a paired comparison on fixes). Qwen2.5-Coder 7B, 4-bit, ~5 GB loaded."
+num_ctx = 8192
+features_on = ["constrained"]  # on for this model after paired runs (2026-10-13)
+[profiles.coder-7b.parameters]
+temperature = 0.2
+
+[profiles.coder-7b-16k]
+base = "qwen2.5-coder:7b-instruct-q4_K_M"
+description = "coder-7b with a 16K context (8K filled up after one message in chat); ~+0.25 GB."
+num_ctx = 16384
+features_on = ["constrained"]  # on for this model after paired runs (2026-10-13)
+[profiles.coder-7b-16k.parameters]
+temperature = 0.2
+
+[profiles.coder-14b]
+base = "qwen2.5-coder:14b"
+description = "Over Vega's under-10B limit (14B; removed from comparisons 2026-10-14): kept for reference only. ~9.6 GB: heavy swap on 16 GB."
+num_ctx = 8192
+[profiles.coder-14b.parameters]
+temperature = 0.2
+
+[profiles.qwen3-8b]
+base = "qwen3:8b"
+description = "Qwen3 8B with thinking: unusable here (2026-10-15: replies spent their whole token budget on hidden reasoning and gave no answer). Use qwen3-8b-nothink."
+num_ctx = 8192
+
+[profiles.granite-8b]
+base = "granite4.1:8b"
+description = "Default since 2026-10-15, after paired comparisons with coder-7b on fixes and goals. IBM Granite 4.1 8B, ~5.3 GB."
+num_ctx = 8192
+features_off = ["plan"]  # off for this model: no measured gain and a much slower agent loop (paired A/B, 2026-10-18)
+
+[profiles.qwen3-8b-nothink]
+base = "qwen3:8b"
+description = "Qwen3 8B with thinking off (reasoning_effort none: 17*23 answered in 4 tokens). Compared with granite-8b on 2026-10-15."
+num_ctx = 8192
+request = { reasoning_effort = "none" }

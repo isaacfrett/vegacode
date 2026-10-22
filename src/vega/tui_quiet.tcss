@@ -1,0 +1,56 @@
+/* Quiet: one centred column, no permanent panel, no rules. The gauge is the only strong mark.
+   With App.transparent the background is the terminal's own (ANSI default). */
+
+.layout-quiet Screen { align-horizontal: center; }
+.layout-quiet #header,
+.layout-quiet #body,
+.layout-quiet #input-row,
+.layout-quiet #status { max-width: 100; }
+
+.layout-quiet #header { height: 1; border-bottom: none; margin-top: 1; }
+.layout-quiet #brand { color: $foreground; padding-right: 2; }
+.layout-quiet #path { color: $vega-muted; }
+.layout-quiet #model { padding: 0 2; }
+
+.layout-quiet #conversation { padding: 1 1 0 1; }
+.layout-quiet Screen.narrow #conversation { padding: 1 1 0 1; }
+.layout-quiet #side { display: none; }
+.layout-quiet Screen.panel-overlay #side {
+    display: block;
+    layer: overlay;
+    dock: right;
+    width: 40;
+    border-left: solid $vega-rule;
+    background: $vega-overlay;
+}
+.layout-quiet Screen.narrow.panel-overlay #side { width: 36; }
+
+.layout-quiet .gutter { width: 2; }
+.layout-quiet .gutter.you { color: $accent; }
+.layout-quiet .message.user { margin-bottom: 1; }
+.layout-quiet .user-text { color: $foreground; text-style: bold; }
+.layout-quiet .turn-changes { display: block; color: $vega-muted; }
+.layout-quiet .turn-changes.-empty { display: none; }
+.layout-quiet .message { margin-bottom: 1; }
+
+.layout-quiet #input-row {
+    border-top: none;
+    border-bottom: none;
+    margin-top: 1;
+    padding: 0 1;
+}
+.layout-quiet #status { margin-bottom: 1; }
+.layout-quiet #readouts { color: $vega-muted; }
+
+/* terminal background shows through */
+.transparent Screen,
+.transparent #conversation,
+.transparent ChoiceScreen #dialog,
+.transparent HelpScreen #dialog { background: ansi_default; }
+.transparent #conversation {
+    scrollbar-background: ansi_default;
+    scrollbar-background-hover: ansi_default;
+    scrollbar-background-active: ansi_default;
+}
+.transparent ChoiceScreen,
+.transparent HelpScreen { background: ansi_default; }

@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest something Vega should do, or do better.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and where does Vega fall short today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The behaviour or command you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: checkboxes
+    id: local-first
+    attributes:
+      label: Local-first
+      description: Vega runs fully on your machine by default.
+      options:
+        - label: This works without sending code or prompts to a remote service (or is opt-in).

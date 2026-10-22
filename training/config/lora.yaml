@@ -1,0 +1,24 @@
+model: mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+train: true
+fine_tune_type: lora
+optimizer: adamw
+data: training/data/processed
+seed: 42
+num_layers: 8
+batch_size: 1
+iters: 100
+val_batches: 2
+learning_rate: 0.00001
+steps_per_report: 10
+steps_per_eval: 25
+adapter_path: training/runs/adapters/vega
+save_every: 50
+test: true
+test_batches: -1
+max_seq_length: 1024
+grad_checkpoint: true
+lora_parameters:
+  keys: ["self_attn.q_proj", "self_attn.v_proj"]
+  rank: 8
+  scale: 20.0
+  dropout: 0.0
