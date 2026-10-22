@@ -308,6 +308,28 @@ CONTINUE_PROMPT = ("Your reply was cut off. Continue exactly where it stopped: n
 _OPENING_FENCE = re.compile(r"^\s*```[\w.+-]*[ \t]*\n")
 
 
+def join_continuation(text: str, part: str) -> str:
+    """`text` cut off at the token limit plus the model's continuation `part`. Models restart the
+    cut line with its indent: a cut inside the indent ("   ") then gets it twice ("   " + "    return
+    ..."), an unexpected indent; a cut mid-line ("from 1" + "    up to n") gets a run of spaces; a
+    restarted line ("    [1, 4" + "    [1, 4, 9]") would appear twice."""
+    if not features.on("continuation_seams"):
+        return text + part
+    body = part.lstrip(" \t")
+    if body == part:
+        return text + part
+    tail = text[text.rfind("\n") + 1:]
+    if not tail:  # the cut fell at a line start: the continuation's indent is the line's own
+        return text + part
+    if not tail.strip():  # cut inside the indent: keep the continuation's full indent instead
+        return text[:len(text) - len(tail)] + part
+    if body.startswith(tail.lstrip()):  # the model restarted the cut line: keep its version
+        return text[:len(text) - len(tail)] + part
+    if tail[-1] in " \t":  # the separating space is already there
+        return text + body
+    return text + " " + body if len(part) - len(body) > 1 else text + part
+
+
 def ask_complete(agent: CodingAgent, messages: list[dict[str, Any]], *,
                  continuations: int = CONTINUATIONS, **extra: Any) -> str:
     """One model reply, continued when it stops at the token limit (finish_reason "length"):
@@ -322,7 +344,7 @@ def ask_complete(agent: CodingAgent, messages: list[dict[str, Any]], *,
         part = choice.message.content or ""
         if attempt and write_loop.inside_open_block(text):  # no second opening fence
             part = _OPENING_FENCE.sub("", part, count=1)
-        text += part
+        text = join_continuation(text, part) if attempt else text + part
         if getattr(choice, "finish_reason", None) != "length":
             break
         debuglog.record("stage", stage="pipeline.continue", after_chars=len(text))

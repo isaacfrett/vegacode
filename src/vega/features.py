@@ -28,6 +28,9 @@ FEATURES: dict[str, str] = {
     "nudge_parse": "send back when an edited file no longer parses",
     "nudge_claim": "send back a claimed change when no edit succeeded",
     "nudge_length": "send back a reply cut off by the length limit once (else stop cleanly)",
+    # added 2026-10-21: a continuation restarted a cut-off line with its full indent (3 + 4 spaces)
+    "continuation_seams": "join a continued reply cleanly: a line cut inside its indent or mid-word "
+                          "is not indented twice",
     "repeat_guard": "do not re-run a call identical to one that already failed; say so instead",
     # added 2026-10-21: a task re-sent one refused write over a hundred times
     "repeat_stop": "end the agent-loop turn after 3 guarded repeats of failed calls in a row",
@@ -452,6 +455,11 @@ OPT_IN: dict[str, str] = {
     "until the model writes one failing test in tests/test_vega_repro.py (Vega runs it when "
     "written, before any source edit, ≤2 times); at the end of the turn that file stays only if "
     "it passes, else it is removed; not for tasks that ask for tests or limit the files to change",
+    # added 2026-10-21: with issue_localize the right file was #2 in a near-tie in 4 selfbuild
+    # attempts and the model edited #1. Opt-in until an A/B
+    "localize_ties": "issue_localize: the Likely-places block marks files scoring >= 0.85 x the "
+    "top one as equally likely; the turn's first source write is held once while such a file is "
+    "unread, and the no-edit finish gate names the Likely-places files",
 }
 ENV_ON = "VEGA_FEATURES_ON"
 # Switches whose code was removed (2026-10-17), with what replaced them.

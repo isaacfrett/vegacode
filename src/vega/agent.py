@@ -518,13 +518,18 @@ def command_writes(command: str) -> bool:
 
 
 def no_edit_problem(change: bool, wrote: bool, commands: list[str],
-                    answer: str = "") -> str | None:
+                    answer: str = "", places: list[str] | None = None) -> str | None:
     """finish_gate_no_edit: the send-back for a change task finishing with no file written this
     turn (selfbuild 2026-10-21: three bug reports answered in prose after 2-7 reads), else None.
     `commands`: this turn's run_command commands; one that may write files counts as an edit.
-    An answer that ends by asking the user a question is a clarification: not sent back."""
+    An answer that ends by asking the user a question is a clarification: not sent back.
+    `places` (localize_ties): the turn's Likely-places files, named in the send-back."""
     if not change or wrote or any(command_writes(c) for c in commands) or asks_the_user(answer):
         return None
+    if places:
+        from . import localize
+
+        return NO_EDIT_NOTE + " " + localize.no_edit_places(places)
     return NO_EDIT_NOTE
 
 
@@ -1538,6 +1543,9 @@ class CodingAgent:
         """issue_localize: the "Likely places" block for a change task on a large project (the
         files holding the task's names and strings, with the functions around them), or ""."""
         route = getattr(self, "last_route", None)
+        # localize_ties: the ranked files shown and the near-tied top ones, for this turn
+        self._likely_paths: list[str] = []
+        self._likely_tied: list[str] = []
         if (not features.on("issue_localize") or not self.can_write or not isinstance(route, dict)
                 or not asks_for_change(route, task)):
             return ""
@@ -1545,15 +1553,16 @@ class CodingAgent:
 
         started = time.monotonic()
         try:
-            text = localize.block(self.project, task, route)
+            located = localize.locate(self.project, task, route,
+                                      ties=features.on("localize_ties"))
         except Exception as exc:  # noqa: BLE001 - a hint never fails a turn
             debuglog.record("stage", stage="localize.error", error=str(exc))
             return ""
-        debuglog.record("stage", stage="localize", chars=len(text),
+        debuglog.record("stage", stage="localize", chars=len(located.text),
                         seconds=round(time.monotonic() - started, 3),
-                        files=[line.split(" ", 2)[1] for line in text.splitlines()[1:]
-                               if line[:1].isdigit()])
-        return text
+                        files=located.paths, tied=located.tied)
+        self._likely_paths, self._likely_tied = located.paths, located.tied
+        return located.text
 
     def _run(self, task: str) -> tuple[str, bool]:
         from . import question_pipeline  # routing rules (imports agent lazily: no cycle at load)
@@ -1658,6 +1667,7 @@ class CodingAgent:
         gate_rounds = 0
         gate_states: set[tuple[int, str]] = set()
         no_edit_rounds = 0  # finish_gate_no_edit: change task with no write, sent back
+        tie_checked = False  # localize_ties: the first source write was checked (once a turn)
         commands_run: list[str] = []  # finish_gate_no_edit: this turn's run_command commands
         # constraint_docs: the documents the task names as its rules, read this turn or not;
         # the first write held once while one is unread, the rules quoted once at the finish
@@ -1787,7 +1797,10 @@ class CodingAgent:
                 if no_edit_rounds < NO_EDIT_ROUNDS and features.on("finish_gate_no_edit"):
                     # repro_first: the repro test alone is not the change the task asks for
                     edited = wrote if repro is None else repro.source_written
-                    missing = no_edit_problem(gate.change, edited, commands_run, content or "")
+                    missing = no_edit_problem(
+                        gate.change, edited, commands_run, content or "",
+                        getattr(self, "_likely_paths", None) if features.on("localize_ties")
+                        else None)
                     if missing:
                         no_edit_rounds += 1
                         problems.append(missing)
@@ -2004,8 +2017,29 @@ class CodingAgent:
                     repro_hold = repro_first.hold_note(repro.path)
                     debuglog.record("stage", stage="repro_first.hold", tool=name,
                                     path=str(args.get("path", "")), repro=repro.path)
+                tie_hold = None
+                if (name in _WRITE_TOOLS and not tie_checked and fetch_first is None
+                        and constraint_hold is None and repro_hold is None
+                        and "_error" not in args and features.on("localize_ties")
+                        and getattr(self, "_likely_tied", None)):
+                    from . import localize
+
+                    target = self._relative(args.get("path"))
+                    if target and localize.is_source(target):
+                        tie_checked = True  # the turn's first source write: checked once
+                        unread = localize.tie_unread(target, self._likely_tied, docs_read)
+                        if unread:
+                            tie_hold = localize.tie_hold_note(target, unread, self._likely_tied)
+                            debuglog.record("stage", stage="localize_ties.hold", tool=name,
+                                            path=target, unread=unread, tied=self._likely_tied)
                 if "_error" in args:
                     result = args["_error"]
+                elif tie_hold is not None:
+                    # selfbuild 2026-10-21: the right file was #2 in a near-tie and the model
+                    # edited #1 without reading #2; not run once, the model reads it first
+                    result = tie_hold
+                    self._emit("discarded", reason="source edit before reading an equally likely "
+                               "file", retry=True)
                 elif repro_hold is not None:
                     # selfbuild 2026-10-21: almost every logged attempt that wrote edited source
                     # before any check, none wrote a test failing on the unchanged code. Not run

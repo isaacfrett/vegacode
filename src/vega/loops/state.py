@@ -144,11 +144,13 @@ def pid_alive(pid: int) -> bool:
 
 
 def _looks_like_daemon(pid: int) -> bool:
-    """Guard against a recycled pid: the process must be a Python running the loops daemon."""
+    """Guard against a recycled pid: the process must be a Python running the loops daemon.
+    `-ww`: without a terminal, Linux ps cuts the command at 80 columns, and a long interpreter
+    path then hides the `loops` argument."""
     if sys.platform == "win32":
         return True
     try:
-        command = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+        command = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True,
                                  text=True, timeout=5, check=False).stdout
     except (OSError, subprocess.TimeoutExpired):
         return True  # cannot tell; trust the pid file rather than start a second daemon

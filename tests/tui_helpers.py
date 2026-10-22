@@ -91,6 +91,13 @@ async def wait_until(pilot: Any, condition: Callable[[], bool], seconds: float =
     raise AssertionError("condition not reached in time")
 
 
+async def click_ready(pilot: Any, selector: str) -> None:
+    """Click a widget of the current screen once it is laid out: a dialog pushed a moment ago may
+    not have a region yet on a slow CI runner, and a click there lands on nothing."""
+    await wait_until(pilot, lambda: pilot.app.screen.query_one(selector).region.area > 0)
+    await pilot.click(selector)
+
+
 async def send(pilot: Any, text: str, *, wait: bool = True) -> None:
     app = pilot.app
     app.query_one(PromptInput).load_text(text)

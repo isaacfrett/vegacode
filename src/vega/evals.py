@@ -36,7 +36,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import agent as agent_module
-from . import categories, debuglog, external, features, sandbox, transcripts, web
+from . import categories, debuglog, external, features, repro_first, sandbox, transcripts, web
 from .stats import bootstrap_diff_ci, bootstrap_mean_diff_ci, mcnemar_exact, rate_text
 from .agent import CodingAgent, max_reply_tokens, sampling_overrides
 from .resources import Guard, Limits
@@ -692,7 +692,7 @@ def classify_failure(case: dict[str, Any], attempt: dict[str, Any], response: st
         return "cut_off"
     if attempt.get("failure") == "regression":
         return "regression"
-    if "was modified" in detail or attempt.get("unexpected_files"):
+    if "was modified" in detail or _wrong_file(case, attempt):
         return "wrong_file"
     if _is_read_only(case):
         return "wrong_answer"
@@ -708,9 +708,50 @@ def classify_failure(case: dict[str, Any], attempt: dict[str, Any], response: st
         if _ASKS_USER.search(response or ""):
             return "asked_user"
         return "no_edit"
+    if "diff" in attempt and not attempt["diff"].get("files"):
+        # writes that left no change behind (rewrote the same text, or undid their own edit)
+        return "asked_user" if _ASKS_USER.search(response or "") else "no_edit"
     if any(marker in detail for marker in ("SyntaxError", "IndentationError")):
         return "broken_code"
     return "wrong_fix"
+
+
+def _unexpected_files(expected: list[str] | None, changed: list[str]) -> list[str]:
+    """Changed files outside the case's `expected_files` ([] when the case lists none). Vega's own
+    bookkeeping and the repro_first test (`repro_first.REPRO_NAME`, written by the harness's
+    opt-in reproduce-first step) are never unexpected."""
+    if expected is None:
+        return []
+    return [path for path in changed
+            if path not in expected and not _vega_own(path) and not _is_repro_test(path)]
+
+
+def _is_repro_test(path: str) -> bool:
+    return path.replace("\\", "/").rsplit("/", 1)[-1] == repro_first.REPRO_NAME
+
+
+def _edited_expected_source(case: dict[str, Any], attempt: dict[str, Any]) -> bool:
+    """The diff touches at least one of the case's expected files that is not a test file."""
+    expected = case.get("expected_files") or []
+    changed = set((attempt.get("diff") or {}).get("files") or [])
+    return any(path in changed and not repro_first.is_test_path(path) for path in expected)
+
+
+def _wrong_file(case: dict[str, Any], attempt: dict[str, Any]) -> bool:
+    """Files outside `expected_files` changed and none of the expected source files was: the
+    attempt worked in the wrong place. Extra files next to an edited expected source file
+    (re-exports, a new helper module) are `extra_files`, and the attempt is labelled by what its
+    edit did (wrong_fix, broken_code, ...)."""
+    unexpected = [path for path in attempt.get("unexpected_files") or []
+                  if not _is_repro_test(path)]
+    return bool(unexpected) and not _edited_expected_source(case, attempt)
+
+
+def _extra_files(case: dict[str, Any], attempt: dict[str, Any]) -> list[str]:
+    """Unexpected files changed alongside an edited expected source file (not a wrong_file)."""
+    if not _edited_expected_source(case, attempt):
+        return []
+    return list(attempt.get("unexpected_files") or [])
 
 
 def _transcript_dir(suite: str, kind: str) -> Path:
@@ -763,7 +804,7 @@ def _classify_external(case: dict[str, Any], attempt: dict[str, Any], response: 
         return "step_limit"
     if attempt.get("failure") == "regression":
         return "regression"
-    if "was modified" in attempt.get("detail", "") or attempt.get("unexpected_files"):
+    if "was modified" in attempt.get("detail", "") or _wrong_file(case, attempt):
         return "wrong_file"
     if _is_read_only(case):
         return "wrong_answer"
@@ -835,15 +876,13 @@ def _run_external_attempt(
         "diff": diff,
         "asked": bool(_ASKS_USER.search(response or "")) and not diff["files"],
         "expect": case.get("expect"),
-        "unexpected_files": (
-            [path for path in diff["files"] if path not in expected and not _vega_own(path)]
-            if expected is not None
-            else []),
+        "unexpected_files": _unexpected_files(expected, diff["files"]),
         "writes_ok": stats["writes_ok"],
         "writes_failed": stats["writes_failed"],
     }
     if outcome.regression and outcome.acceptance:
         attempt["regression_detail"] = outcome.regression
+    attempt["extra_files"] = _extra_files(case, attempt)
     attempt["failure_class"] = _classify_external(case, attempt, response)
     if transcript is not None:
         try:
@@ -950,10 +989,7 @@ def _run_attempt(
         # asked the user instead of building: a question and no file changed (clarify metrics)
         "asked": bool(_ASKS_USER.search(response or "")) and not diff["files"],
         "expect": case.get("expect"),
-        "unexpected_files": (
-            [path for path in diff["files"] if path not in expected and not _vega_own(path)]
-            if expected is not None
-            else []),
+        "unexpected_files": _unexpected_files(expected, diff["files"]),
     }
     if outcome.regression and outcome.acceptance:
         attempt["regression_detail"] = outcome.regression
@@ -966,6 +1002,7 @@ def _run_attempt(
     if isinstance(route, dict):
         attempt["route"] = {key: route[key] for key in ("name", "reasons", "targets", "inputs",
                                                          "fell_back") if key in route}
+    attempt["extra_files"] = _extra_files(case, attempt)
     attempt["failure_class"] = classify_failure(
         case, attempt, response, meter.writes_ok, meter.writes_failed)
     if transcript is not None:

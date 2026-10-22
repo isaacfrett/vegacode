@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Colour switches change Rich and pytest output (FORCE_COLOR forces colour whatever its value,
+# even "0"). Cleared before vega is imported: some Rich consoles are created at import time.
+for _name in ("FORCE_COLOR", "PY_COLORS", "NO_COLOR"):
+    os.environ.pop(_name, None)
 
 from vega import server
 
@@ -16,6 +23,9 @@ def no_server_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
                  "VEGA_DEBUG", "VEGA_TEACH", "VEGA_SEED", "VEGA_TEMPERATURE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(server, "context_length", lambda model=None: None)
+    # CI services set CI=true, and pytest then prints full, untruncated assertion diffs; the
+    # pytest runs Vega starts inherit it. Tests describe a developer machine, where it is unset.
+    monkeypatch.delenv("CI", raising=False)
     # Every test runs with the shipped feature defaults ("test what ships"): VEGA_FEATURES_OFF is
     # cleared above and never set here. A test that is not about a default turns that one feature
     # off itself (tests/switches.py), with a comment saying why.

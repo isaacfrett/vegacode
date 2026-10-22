@@ -21,6 +21,11 @@ console = Console()
 IGNORED_DIRS = {
     ".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache", ".ruff_cache",
     ".pytest_cache", ".cache", ".tox", ".gradle", ".godot", ".next", "Pods", "DerivedData",
+    # Vega's own per-project state (notes.md from `remember`, session digests, state.json): never
+    # project content. Without this, search_text returned the agent's own note as the first hit and
+    # it edited the note instead of the code (selfbuild, 2026-10-21). read_file of an explicit
+    # .vega/ path still works; only search and listing skip it.
+    ".vega",
 }
 # Skipped only at the top of the home folder (Vega started in ~): ~/Library is huge. Anywhere else
 # a Library folder is ordinary content (a project's, or a snapshot's Users/<u>/Library to inspect).
@@ -95,6 +100,7 @@ def project_overview(project: Path, limit: int = 150) -> str:
                   for p in _project_files(project, limit=OVERVIEW_WALK_LIMIT)]
         capped = len(walked) >= OVERVIEW_WALK_LIMIT
         files = sorted(walked)
+    files = [f for f in files if not ignored_parts(f.split("/"), project)]  # e.g. untracked .vega/
     total = f"{len(files)}+" if capped else str(len(files))
     if len(files) <= FULL_LISTING_MAX:
         listing = "\n".join(files) or "(no files)"
