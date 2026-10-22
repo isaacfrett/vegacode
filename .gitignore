@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+# Vega's own per-project state and the scratch VEGA_HOME CONTRIBUTING.md suggests
+.vega/
+.vega-dev/
+training/data/processed/
+training/runs/adapters/
+training/runs/checkpoints/
+*.safetensors
+.DS_Store
+work/
+outputs/
+# Collected training candidates (incl. accepted/ and rejected/) are local working state.
+training/candidates/
+# Per-attempt eval transcripts: local diagnostic data.
+evals/transcripts/
+# Downloaded benchmark data and the suites generated from it.
+evals/data/

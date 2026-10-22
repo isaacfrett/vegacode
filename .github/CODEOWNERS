@@ -1,0 +1,7 @@
+# Every change needs the owner's review (enforced when branch protection requires code owner
+# review).
+* @isaacfrett
+
+# CI and release configuration: these workflows publish to PyPI.
+/.github/ @isaacfrett
+/pyproject.toml @isaacfrett

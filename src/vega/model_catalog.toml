@@ -1,0 +1,123 @@
+# Vega's model catalogue: local models under 10B parameters that run free on a laptop. Shipped
+# with Vega; read by `vega model list|pull|recommend|watch` and the
+# Models pane. Edit it like models.toml: one [models.NAME] table per model, NAME being the profile
+# name the model gets when it is pulled or queued.
+#
+# Fields
+#   tag          the Ollama model to pull (`ollama pull <tag>`)
+#   family       library family, for `vega model watch --online`
+#   params_b     parameters, billions (Vega uses models under 10B only)
+#   download_gb  approximate download / disk size in GB (10^9 bytes). Measured on this machine
+#                where `size_source = "measured"`, otherwise the Ollama library listing.
+#                `vega model pull` asks the registry for the exact size before downloading.
+#   ram_gb       RAM the fit rule says it needs: download_gb x 1.25 + 2 GB (weights, an 8K
+#                context cache and runtime). Fits: <= 60% of total RAM; tight: <= 85%.
+#   licence      the weights' licence (all free to run locally; read the terms for commercial use)
+#   default      the model Vega ships with (one entry); fallback: the next choice
+#   num_ctx / request / features_on / temperature   profile settings when Vega adds it
+#
+# Eval scores are not kept here: model_store merges them from a separate scores file when one
+# exists (model_store.SCORES_FILE). Without it the catalogue lists models with no scores.
+
+updated = "2026-10-16"
+
+[models.granite-8b]
+tag = "granite4.1:8b"
+family = "granite"
+params_b = 8.8
+download_gb = 5.3
+size_source = "measured"
+ram_gb = 8.6
+licence = "Apache-2.0"
+default = true
+num_ctx = 8192
+notes = "Shipped default since 2026-10-15."
+
+[models.coder-7b]
+tag = "qwen2.5-coder:7b-instruct-q4_K_M"
+family = "qwen"
+params_b = 7.6
+download_gb = 4.7
+size_source = "measured"
+ram_gb = 7.9
+licence = "Apache-2.0"
+fallback = true
+num_ctx = 8192
+temperature = 0.2
+features_on = ["constrained"]
+notes = "Default until 2026-10-15, now the fallback; ~5 GB loaded (measured)."
+
+[models.qwen3-8b-nothink]
+tag = "qwen3:8b"
+family = "qwen"
+params_b = 8.2
+download_gb = 5.2
+size_source = "library"
+ram_gb = 8.5
+licence = "Apache-2.0"
+num_ctx = 8192
+request = { reasoning_effort = "none" }
+notes = "Thinking off. With thinking on it spent 2,048 tokens per reply on hidden reasoning (unusable here)."
+
+[models.granite-micro]
+tag = "granite4:micro"
+family = "granite"
+params_b = 3.4
+download_gb = 2.1
+size_source = "library"
+ram_gb = 4.6
+licence = "Apache-2.0"
+num_ctx = 8192
+notes = "Small Granite for 8 GB machines."
+
+[models.llama31-8b]
+tag = "llama3.1:8b"
+family = "llama"
+params_b = 8.0
+download_gb = 4.9
+size_source = "library"
+ram_gb = 8.1
+licence = "Llama 3.1 Community License"
+num_ctx = 8192
+
+[models.gemma3-4b]
+tag = "gemma3:4b"
+family = "gemma"
+params_b = 4.3
+download_gb = 3.3
+size_source = "library"
+ram_gb = 6.1
+licence = "Gemma Terms of Use"
+num_ctx = 8192
+
+[models.phi4-mini]
+tag = "phi4-mini:3.8b"
+family = "phi"
+params_b = 3.8
+download_gb = 2.5
+size_source = "library"
+ram_gb = 5.1
+licence = "MIT"
+num_ctx = 8192
+
+[models.mistral-7b]
+tag = "mistral:7b"
+family = "mistral"
+params_b = 7.2
+download_gb = 4.1
+size_source = "library"
+ram_gb = 7.1
+licence = "Apache-2.0"
+num_ctx = 8192
+notes = "Older (2023-24) general model; a baseline rather than a candidate."
+
+[models.deepseek-coder-6b]
+tag = "deepseek-coder:6.7b"
+family = "deepseek-coder"
+params_b = 6.7
+download_gb = 3.8
+size_source = "library"
+ram_gb = 6.8
+licence = "DeepSeek License"
+num_ctx = 8192
+notes = "Older (2023) code model; a baseline rather than a candidate."

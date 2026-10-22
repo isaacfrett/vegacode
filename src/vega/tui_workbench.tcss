@@ -1,0 +1,164 @@
+/* Workbench: three columns (changes and steps, conversation, preview), dense and keyboard-first.
+   Tab moves between panes; the focused pane's rule turns to the accent. The diff preview is the
+   bold element. */
+
+.layout-workbench #header {
+    height: 1;
+    border-bottom: none;
+    background: $panel;
+}
+.layout-workbench #brand { padding-right: 2; }
+.layout-workbench #model { padding: 0 2; }
+
+/* #left and #right hold whichever panes the view puts there (view.py); widths are set inline
+   from the view. Panes in a column share its height. */
+.layout-workbench #left,
+.layout-workbench #right {
+    display: block;
+    height: 100%;
+}
+.layout-workbench Screen.no-left #left,
+.layout-workbench Screen.no-right #right { display: none; }
+.layout-workbench .wb-pane { height: 1fr; }
+.layout-workbench .wb-text {
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: $vega-rule;
+    scrollbar-background: $background;
+}
+.layout-workbench #preview { height: 2fr; }
+/* plan, machine and session are short: as tall as their content, the lists and preview fill
+   the rest of the column */
+.layout-workbench .wb-plan,
+.layout-workbench .wb-machine,
+.layout-workbench .wb-session { height: auto; max-height: 60%; }
+.layout-workbench #side { display: none; }
+.layout-workbench #conversation { width: 1fr; padding: 0 1; }
+
+.layout-workbench .wb-pane,
+.layout-workbench #conversation {
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: bold;
+    background: $background;
+}
+.layout-workbench .wb-pane:focus,
+.layout-workbench .wb-pane:focus-within,
+.layout-workbench #conversation:focus-within {
+    border: solid $accent;
+    border-title-color: $accent;
+}
+.layout-workbench #wb-changes,
+.layout-workbench #wb-steps { padding: 0; }
+.layout-workbench OptionList { scrollbar-size-vertical: 1; }
+.layout-workbench OptionList > .option-list--option-highlighted {
+    background: transparent; text-style: none;
+}
+.layout-workbench OptionList:focus > .option-list--option-highlighted {
+    background: $panel; text-style: bold;
+}
+.layout-workbench OptionList > .option-list--option-disabled { color: $vega-muted; }
+.layout-workbench OptionList > .option-list--option-hover { background: $panel; }
+
+/* A side column on screen: a ColumnDivider is drawn over the conversation's border on that side
+   (the same rule; accent under the mouse and while dragging). The bottom border carries the drag
+   hint and the width readout. */
+.layout-workbench #conversation { border-subtitle-color: $vega-muted; }
+.layout-workbench #conversation:focus-within { border-subtitle-color: $accent; }
+
+.layout-workbench .gutter { width: 5; }
+.layout-workbench .message { margin-bottom: 1; }
+
+.layout-workbench #input-row {
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: bold;
+    padding: 0 1;
+}
+.layout-workbench #input-row:focus-within { border: solid $accent; border-title-color: $accent; }
+.layout-workbench #status { background: $panel; }
+
+/* narrow: conversation only; Ctrl+P overlays the shared details panel */
+.layout-workbench Screen.narrow #left,
+.layout-workbench Screen.narrow #right,
+.layout-workbench Screen.panel-hidden #left,
+.layout-workbench Screen.panel-hidden #right { display: none; }
+.layout-workbench Screen.narrow #conversation { border: none; padding: 1 1 0 1; }
+.layout-workbench Screen.narrow #input-row,
+.layout-workbench Screen.narrow #input-row:focus-within {
+    border: none;
+    border-top: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: none;
+}
+.layout-workbench Screen.narrow.panel-overlay #side { display: block; }
+
+/* Loops: as tall as its rows (two lines per loop), so Changes and Steps keep the space */
+.layout-workbench .wb-loops { height: auto; max-height: 40%; }
+
+/* Git: as tall as its rows up to 40% of the column (it scrolls past that), so Changes and Steps
+   keep room; Tests and Problems share the rest like the other lists; Context is a text pane like
+   Machine */
+.layout-workbench .wb-git { height: auto; max-height: 40%; }
+.layout-workbench #wb-git,
+.layout-workbench #wb-tests,
+.layout-workbench #wb-problems,
+.layout-workbench #wb-models { padding: 0; }
+.layout-workbench .wb-context { height: auto; max-height: 70%; }
+/* alone in a column, they take all of it */
+.layout-workbench .wb-git:first-child:last-child,
+.layout-workbench .wb-context:first-child:last-child { max-height: 100%; }
+
+/* Product view (tui_product.py): Product over Release in the left column. Product is as tall as
+   its content; Release takes the rest. The verdict inside Product is the one bold element. */
+.layout-workbench .wb-product { height: auto; max-height: 70%; }
+.layout-workbench .wb-release { height: 1fr; padding: 0 1; }
+.layout-workbench #wb-release > .option-list--option-highlighted,
+.layout-workbench #ps-release > .option-list--option-highlighted { background: transparent; }
+.layout-workbench #wb-release:focus > .option-list--option-highlighted,
+.layout-workbench #ps-release:focus > .option-list--option-highlighted {
+    background: $panel; text-style: none;
+}
+/* narrow product view: the strip under the header, on the header's band, with a rule below */
+.layout-workbench Screen.narrow.product-mode #strip {
+    display: block;
+    background: $panel;
+    border-bottom: solid $vega-rule;
+}
+.layout-workbench Screen.narrow.product-mode #conversation { padding: 0 1; }
+
+/* the product screen (F3 on a narrow terminal) */
+ProductScreen { layout: vertical; background: $background; }
+ProductScreen #header { height: 1; border-bottom: none; background: $panel; padding: 0 1; }
+ProductScreen #model { padding: 0 2; }
+#ps-tabs {
+    height: 2;
+    padding: 0 1;
+    background: $panel;
+    border-bottom: solid $vega-rule;
+    text-wrap: nowrap;
+}
+#ps-body { height: 1fr; }
+ProductScreen .wb-pane {
+    width: 1fr;
+    height: 100%;
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: bold;
+    background: $background;
+}
+ProductScreen .wb-pane:focus,
+ProductScreen .wb-pane:focus-within { border: solid $accent; border-title-color: $accent; }
+ProductScreen #ps-product, ProductScreen #ps-release { height: 100%; max-height: 100%; }
+ProductScreen .wb-text {
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: $vega-rule;
+    scrollbar-background: $background;
+}
+ProductScreen OptionList { scrollbar-size-vertical: 1; padding: 0 1; }
+ProductScreen OptionList > .option-list--option-disabled { color: $vega-muted; }
+#ps-keys { height: 1; padding: 0 1; text-wrap: nowrap; }
+#ps-status { height: 1; padding: 0 1; background: $panel; }
+#ps-gauge { width: 1fr; text-wrap: nowrap; }
+#ps-hint { width: auto; }

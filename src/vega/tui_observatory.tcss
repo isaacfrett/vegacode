@@ -1,0 +1,70 @@
+/* Observatory: bordered panes with thin single rules and caption labels. Conversation ~60%, a
+   right stack of instruments (Plan, Changes, Machine). The Machine pane is the bold element. */
+
+.layout-observatory #header { height: 2; border-bottom: solid $vega-rule; }
+.layout-observatory #brand { color: $accent; }
+.layout-observatory #model { color: $vega-readout; }
+
+.layout-observatory #body { padding: 0 1; }
+.layout-observatory #conversation {
+    width: 3fr;
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: none;
+    padding: 0 1;
+}
+.layout-observatory #side {
+    width: 2fr;
+    padding: 0;
+    border-left: none;
+    margin-left: 1;
+}
+.layout-observatory .pane {
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: none;
+    padding: 0 1;
+    margin-bottom: 0;
+}
+.layout-observatory .panel-title { display: none; }
+.layout-observatory .panel-body { padding-left: 0; }
+.layout-observatory .panel-hint { padding-left: 0; }
+.layout-observatory #changes { padding-left: 0; }
+.layout-observatory #machine-pane { display: block; height: 1fr; min-height: 14; }
+.layout-observatory #session-pane { display: none; }
+.layout-observatory #plan-pane { max-height: 9; }
+.layout-observatory #changes-pane { max-height: 14; }
+
+.layout-observatory Screen.narrow #body { padding: 0; }
+.layout-observatory Screen.narrow #conversation { width: 1fr; border: none; padding: 0 1; }
+.layout-observatory Screen.narrow.panel-overlay #side {
+    width: 44;
+    margin-left: 0;
+    padding: 0;
+    border-left: none;
+    background: $vega-overlay;
+}
+.layout-observatory Screen.narrow.panel-overlay .pane { background: $vega-overlay; }
+.layout-observatory Screen.narrow.panel-overlay #machine-pane { min-height: 0; height: auto; }
+.layout-observatory Screen.narrow.panel-overlay #overlay-hint { padding-left: 1; }
+
+.layout-observatory .gutter.vega { color: $accent; }
+.layout-observatory .gutter.you { color: $vega-readout; }
+
+.layout-observatory #input-row {
+    margin: 0 1;
+    border: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: none;
+    padding: 0 1;
+}
+.layout-observatory Screen.narrow #input-row {
+    margin: 0;
+    border: none;
+    border-top: solid $vega-rule;
+}
+.layout-observatory #input-row:focus-within { border: solid $accent; }
+.layout-observatory Screen.narrow #input-row:focus-within {
+    border: none;
+    border-top: solid $vega-rule;
+}

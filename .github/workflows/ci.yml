@@ -1,0 +1,148 @@
+# CI for every pull request and push to main.
+# Actions are pinned to full commit SHAs (the comment names the release); Dependabot bumps them.
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUTF8: "1"
+  FORCE_COLOR: "0"
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "ruff==0.17.0"
+      # Errors that break the program (syntax errors, undefined names, invalid comparisons). The
+      # full default rule set is not enforced yet; existing code has findings to clean up first.
+      - run: ruff check --select E9,F63,F7,F82 --output-format=github .
+
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # Windows has never been run or tested. Its jobs report only and never fail the run; they are
+    # not required checks until a maintainer has triaged a run and says Windows is supported.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Git identity for tests that commit
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+      - name: Pytest
+        shell: bash
+        # Tests that need the macOS sandbox (sandbox-exec), node, go, WebKit or the private eval
+        # data skip themselves when it is missing. VEGA_HOME keeps every test off ~/.vega.
+        run: |
+          export VEGA_HOME="$RUNNER_TEMP/vega-home"
+          python -m pytest -q -ra -p no:cacheprovider
+
+  package:
+    name: Build and smoke-install the wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: Wheel holds only the package
+        run: |
+          python - <<'EOF'
+          import pathlib, zipfile
+          wheel = next(pathlib.Path("dist").glob("vegacode-*.whl"))
+          names = zipfile.ZipFile(wheel).namelist()
+          stray = [n for n in names if not n.startswith(("vega/", "vegacode-"))]
+          assert not stray, f"unexpected files in {wheel.name}: {stray}"
+          assert "vega/default_models.toml" in names, "default model profiles missing"
+          print(f"{wheel.name}: {len(names)} files, {wheel.stat().st_size / 1e6:.2f} MB")
+          EOF
+      - name: Install into a clean venv and run outside the checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install dist/vegacode-*.whl
+          mkdir -p "$RUNNER_TEMP/empty" && cd "$RUNNER_TEMP/empty"
+          export VEGA_HOME="$RUNNER_TEMP/vega-home"
+          for cmd in "vega --help" "vegacode --help" "vega models" "vega features" "vega config"; do
+            echo "::group::$cmd"
+            "$RUNNER_TEMP/venv/bin/"$cmd
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  keywords:
+    name: README and keyword consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # docs/release/keywords.md is the source of truth; the GitHub description and topics are
+      # set by hand in the repository settings.
+      - run: >-
+          python .github/scripts/check_keywords.py --readme README.md
+          --pyproject pyproject.toml --keywords docs/release/keywords.md
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PR comments would need pull-requests: write; findings show in the job log instead.
+          GITLEAKS_ENABLE_COMMENTS: "false"

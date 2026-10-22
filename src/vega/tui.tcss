@@ -1,0 +1,235 @@
+/* Vega full-screen chat: shared rules and the classic layout. Colours come from the themes in
+   tui.py; tui_quiet / tui_observatory / tui_workbench.tcss override per layout (App class
+   layout-<name>). Screen.narrow / Screen.wide follow the layout's width threshold. */
+
+Screen {
+    background: $background;
+    color: $foreground;
+    layout: vertical;
+}
+
+/* header ---------------------------------------------------------------------------------- */
+
+#header {
+    height: 2;
+    padding: 0 1;
+    border-bottom: solid $vega-rule;
+}
+#brand { width: auto; text-style: bold; color: $accent; padding-right: 3; }
+#path { width: 1fr; color: $foreground; text-wrap: nowrap; text-overflow: ellipsis; }
+#model { width: auto; color: $vega-muted; padding: 0 3; }
+#state { width: auto; min-width: 18; text-align: right; }
+/* the product view names itself after the path ("product view"); hidden in the code view */
+#mode { display: none; width: 1fr; color: $vega-muted; text-wrap: nowrap; }
+#header.with-mode #mode { display: block; }
+#header.with-mode #path { width: auto; max-width: 60%; padding-right: 3; }
+/* the product strip (narrow product view): verdict and signals under the header */
+#strip { display: none; height: 2; padding: 0 1; text-wrap: nowrap; }
+
+/* body: conversation and side panel ---------------------------------------------------------- */
+
+#body {
+    height: 1fr;
+    layers: base overlay;
+}
+#left, #right, #machine-pane, #overlay-hint { display: none; }
+/* the workbench's draggable conversation edges (ColumnDivider); the app shows them */
+/* overlay: screen takes them out of the row, so they cost no width: the left one sits on the
+   conversation's left border, the right one (after the conversation, moved back one cell) on its
+   right border */
+ColumnDivider {
+    display: none;
+    width: 1;
+    height: 100%;
+    overlay: screen;
+    pointer: ew-resize;
+}
+#divider-right { offset-x: -1; }
+#conversation {
+    width: 1fr;
+    overflow-x: hidden;
+    padding: 1 1 0 1;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: $vega-rule;
+    scrollbar-color-hover: $vega-muted;
+    scrollbar-color-active: $vega-muted;
+    scrollbar-background: $background;
+    scrollbar-background-hover: $background;
+    scrollbar-background-active: $background;
+}
+Screen.narrow #conversation { padding: 0 1 0 1; }
+#side {
+    width: 34;
+    height: 100%;
+    padding: 1 1 0 1;
+    border-left: solid $vega-rule;
+    background: $background;
+}
+Screen.panel-hidden #side { display: none; }
+Screen.narrow #side { display: none; }
+Screen.narrow.panel-overlay #side {
+    display: block;
+    layer: overlay;
+    dock: right;
+    width: 34;
+    background: $vega-overlay;
+    border-left: solid $accent;
+}
+Screen.panel-overlay #side { overflow-y: auto; scrollbar-size-vertical: 1; }
+Screen.panel-overlay #overlay-hint {
+    display: block;
+    dock: bottom;
+    height: 1;
+    color: $vega-muted;
+    background: $vega-overlay;
+}
+
+.pane { height: auto; margin-bottom: 1; }
+.panel-title { text-style: bold; color: $foreground; }
+.panel-body { height: auto; padding-left: 1; }
+.panel-empty { color: $vega-muted; }
+.panel-hint { height: 1; padding-left: 1; color: $vega-muted; }
+#changes {
+    height: auto;
+    max-height: 12;
+    border: none;
+    padding: 0 0 0 1;
+    background: transparent;
+    scrollbar-size-vertical: 1;
+}
+#changes:focus { background: transparent; }
+#changes > .option-list--option-highlighted { background: transparent; text-style: none; }
+#changes:focus > .option-list--option-highlighted { background: $panel; text-style: none; }
+#changes > .option-list--option-hover { background: transparent; }
+
+/* messages ----------------------------------------------------------------------------------- */
+
+.message { height: auto; margin-bottom: 1; }
+.gutter { width: 6; text-style: bold; }
+.gutter.you { color: $vega-muted; }
+.gutter.vega { color: $accent; }
+.user-text { width: 1fr; color: $foreground; }
+.note-body { width: 1fr; color: $foreground; }
+.note.warning .note-body { color: $vega-warning-text; }
+.note.output .note-body { color: $foreground; }
+.note.dismissible { margin-bottom: 1; }
+
+.turn-body { width: 1fr; height: auto; }
+.steps { height: auto; }
+.working { height: 1; color: $vega-muted; }
+.turn-changes { height: auto; display: none; }
+.answer { margin: 0; padding: 0; background: transparent; }
+.answer.stopped { color: $vega-muted; }
+.toggle { height: 1; width: auto; color: $vega-muted; }
+.answer MarkdownBlock:last-child { margin-bottom: 0; }
+/* Textual colours inline code like a warning; here it is plain project text in the accent. */
+.answer MarkdownBlock:dark > .code_inline,
+.answer MarkdownBlock:light > .code_inline { background: transparent; color: $accent; }
+/* Teach mode: the model's plan and why lines sit quietly above the answer; the takeaway hangs
+   off a rule in the teaching tint under it. */
+.lesson { height: auto; display: none; margin-bottom: 1; }
+.takeaway { margin: 1 0; padding: 0 0 0 1; background: transparent;
+            border-left: outer $vega-teach; }
+.takeaway MarkdownH1, .takeaway MarkdownH2, .takeaway MarkdownH3 {
+    color: $vega-teach; background: transparent; text-style: bold; content-align: left top;
+    margin: 0; padding: 0;
+}
+.takeaway MarkdownBlock:last-child { margin-bottom: 0; }
+.takeaway MarkdownBlock:dark > .code_inline,
+.takeaway MarkdownBlock:light > .code_inline { background: transparent; color: $accent; }
+.toggle:hover { color: $accent; }
+.toggle:focus { color: $accent; text-style: underline; }
+
+Markdown { background: transparent; }
+MarkdownFence { margin: 1 0; }
+
+/* input and status bar ----------------------------------------------------------------------- */
+
+#input-row {
+    height: auto;
+    max-height: 10;
+    border-top: solid $vega-rule;
+    border-bottom: solid $vega-rule;
+    padding: 0 1;
+}
+#prompt-mark { width: 2; color: $accent; text-style: bold; }
+#prompt {
+    width: 1fr;
+    height: auto;
+    max-height: 8;
+    border: none;
+    padding: 0;
+    background: transparent;
+}
+#prompt:focus { border: none; background: transparent; }
+#prompt .text-area--cursor-line { background: transparent; }
+#prompt .text-area--placeholder { color: $vega-muted; }
+
+#status { height: 1; padding: 0 1; }
+#gauge { width: auto; }
+#readouts { width: 1fr; text-wrap: nowrap; }
+#hints { width: auto; text-align: right; }
+
+/* dialogs ------------------------------------------------------------------------------------ */
+/* The dialog has the screen's own background, so its border cells show no halo; the backdrop
+   dims what is behind it. */
+
+ChoiceScreen, HelpScreen, EvidenceScreen {
+    align: center middle; background: $background 60%;
+}
+#dialog {
+    width: 90;
+    max-width: 96%;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $background;
+    border: solid $accent;
+}
+ChoiceScreen.command #dialog { border: solid $warning; }
+#dialog-title { text-style: bold; color: $foreground; }
+#dialog-body { color: $vega-muted; margin-top: 1; }
+#dialog-detail {
+    height: auto;
+    max-height: 24;
+    margin-top: 1;
+    padding: 0 1;
+    background: $panel;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $panel;
+    scrollbar-color: $vega-rule;
+}
+#dialog-buttons { height: 1; margin-top: 1; }
+#dialog-buttons Button { margin-right: 2; min-width: 0; border: none; }
+#dialog-buttons Button.primary,
+#dialog-buttons Button.primary:hover,
+#dialog-buttons Button.primary:focus {
+    background: $accent; color: $background; text-style: bold;
+}
+#dialog-buttons Button.secondary,
+#dialog-buttons Button.secondary:hover,
+#dialog-buttons Button.secondary:focus {
+    background: $panel; color: $foreground; text-style: none;
+}
+#dialog-buttons Button.secondary:focus { text-style: underline; }
+#dialog-buttons Button.primary:focus { text-style: bold underline; }
+#dialog-hint { width: 1fr; text-align: right; color: $vega-muted; }
+HelpScreen #dialog-hint, EvidenceScreen #dialog-hint { margin-top: 1; }
+
+/* F2 customize: docked at the bottom so the live workbench stays visible above it ------------ */
+
+ViewScreen {
+    align: center bottom;
+    background: transparent;
+}
+#view-dialog {
+    width: 100%;
+    height: auto;
+    max-height: 80%;
+    padding: 0 2;
+    border-top: solid $accent;
+    border-title-color: $accent;
+    border-title-style: bold;
+    background: $vega-overlay;
+}
+#view-body { width: 100%; }
