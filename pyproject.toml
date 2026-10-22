@@ -37,7 +37,7 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
-    "openai>=1.68,<3", "typer>=0.15,<1", "rich>=13.9,<15", "ruff>=0.8", "textual>=8.0,<9",
+    "openai>=1.68,<4", "typer>=0.15,<1", "rich>=13.9,<15", "ruff>=0.8", "textual>=8.0,<9",
 ]
 
 [project.optional-dependencies]
