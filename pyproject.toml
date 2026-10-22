@@ -44,10 +44,10 @@ dependencies = [
 train = ["mlx-lm[train]"]
 learn = ["pypdf>=4"]  # PDFs (books) for vega learn
 # the data-science / ML eval suite runs Vega's code with these (the sandbox uses Vega's Python)
-datasci = ["numpy==2.1.3", "pandas==2.2.3", "scikit-learn==1.5.2", "scipy==1.18.1"]
+datasci = ["numpy==2.4.6", "pandas==2.2.3", "scikit-learn==1.9.1", "scipy==1.18.1"]
 # the API / MCP eval suite runs Vega's code with these; pydantic and httpx pinned to the versions
 # openai already brought in
-apidev = ["fastapi==0.142.2", "httpx==0.28.1", "pydantic==2.14.1", "mcp==2.2.0"]
+apidev = ["fastapi==0.146.0", "httpx==0.28.1", "pydantic==2.14.1", "mcp==2.3.0"]
 # coverage: tests/test_acceptance.py checks `coverage run` task commands, which need it installed
 dev = ["pytest>=8", "mypy>=1.13", "coverage>=7", "jsonschema>=4"]
 
