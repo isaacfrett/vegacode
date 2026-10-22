@@ -2799,8 +2799,11 @@ class VegaApp(App[None]):
         preview = self._pane("preview")
         if preview is None:
             return
+        body = next(iter(preview.query("#preview-body").results(Static)), None)
+        if body is None:  # F3 or /view is still rebuilding the column: render once it is in
+            self.call_after_refresh(self._render_preview)
+            return
         g, colours = glyphs(), palette(self)
-        body = preview.query_one("#preview-body", Static)
         width = max(20, preview.scrollable_content_region.width or 40)
         key = self.preview_key or ""
         file_match = re.match(r"f(\d+):(\d+)$", key)
