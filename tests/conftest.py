@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# Colour switches change Rich and pytest output (FORCE_COLOR forces colour whatever its value,
+# even "0"). Cleared before vega is imported: some Rich consoles are created at import time.
+for _name in ("FORCE_COLOR", "PY_COLORS", "NO_COLOR"):
+    os.environ.pop(_name, None)
 
 from vega import server
 
