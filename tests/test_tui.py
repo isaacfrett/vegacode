@@ -8,7 +8,16 @@ from pathlib import Path
 
 import pytest
 from switches import switch_off
-from tui_helpers import answer, calls, drive, make_app, scripted_agent, send, wait_until
+from tui_helpers import (
+    answer,
+    calls,
+    click_ready,
+    drive,
+    make_app,
+    scripted_agent,
+    send,
+    wait_until,
+)
 from typer.testing import CliRunner
 
 from vega import cli, tools
@@ -204,7 +213,7 @@ def test_review_modal_apply_and_skip(tmp_path: Path, monkeypatch) -> None:
         await wait_until(pilot, lambda: isinstance(app.screen, ChoiceScreen)
                          and app.screen is not screen)
         assert (project / "a.py").read_text() == "x = 2\ny = 1\n"
-        await pilot.click("#no")  # the "Skip" button
+        await click_ready(pilot, "#no")  # the "Skip" button
         await wait_until(pilot, lambda: not app.working)
         await pilot.pause()
         outcomes = [e.outcome for e in app.query_one(Steps).entries if e.kind == "step"]
@@ -225,7 +234,7 @@ def test_review_buttons_are_labelled(tmp_path: Path) -> None:
         await wait_until(pilot, lambda: isinstance(app.screen, ChoiceScreen))
         labels = [str(button.label) for button in app.screen.query("Button")]
         assert labels == ["Apply change", "Skip"]
-        await pilot.click("#yes")
+        await click_ready(pilot, "#yes")
         await wait_until(pilot, lambda: not app.working)
 
     drive(app, script)
