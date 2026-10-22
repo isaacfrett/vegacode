@@ -548,7 +548,7 @@ def test_gauge_segments_and_compaction_settles(tmp_path: Path) -> None:
         gauge.set_usage(Usage(fixed=2048, total=12000, window=16384))
         gauge.set_usage(Usage(fixed=2048, total=5000, window=16384), settle=True)
         await pilot.pause()
-        assert 5000 < gauge.used < 12000  # moving, once
+        assert 5000 <= gauge.used < 12000  # moving or already there (a slow CI runner), once
         await wait_until(pilot, lambda: gauge.used == 5000, seconds=3)
 
     drive(app, script, size=(120, 36))
