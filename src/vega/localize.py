@@ -14,6 +14,7 @@ Deterministic and cheap: one read of each candidate text file (â‰¤ MAX_FILES, â‰
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -346,13 +347,45 @@ def _enclosing(path: str, text: str, lines: dict[int, float]) -> list[str]:
     return out
 
 
-def block(project: Path, task: str, route: dict | None = None,
-          min_files: int = MIN_FILES) -> str:
-    """The 'Likely places' block for the first prompt, or "" (small project, nothing matched)."""
+TIE_RATIO = 0.85  # localize_ties: a file scoring >= this x the top score is about as likely
+TIE_NOTE = ("Files {0} score about the same: read {1} before deciding which to edit "
+            "(the top rank alone is not the answer).")
+
+
+@dataclass
+class Located:
+    """The block and the ranked files it shows (best first); `tied`: the shown files scoring
+    within TIE_RATIO of the top one, the top one included (empty when the top stands alone)."""
+    text: str = ""
+    paths: list[str] = field(default_factory=list)
+    tied: list[str] = field(default_factory=list)
+
+
+def near_ties(places: list[Place], ratio: float = TIE_RATIO) -> list[str]:
+    """localize_ties: the paths scoring >= ratio x the top score, the top included; [] when no
+    other file comes that close (selfbuild 2026-10-21: the right file was #2 at 25.33 vs 27.04
+    and 10.96 vs 12.09, and the model edited #1)."""
+    if len(places) < 2 or places[0].score <= 0:
+        return []
+    tied = [p.path for p in places if p.score >= ratio * places[0].score]
+    return tied if len(tied) > 1 else []
+
+
+def _numbers(count: int) -> tuple[str, str]:
+    words = [str(i) for i in range(1, count + 1)]
+    listed = " and ".join(words) if count == 2 else ", ".join(words[:-1]) + " and " + words[-1]
+    return listed, "both" if count == 2 else f"all {count}"
+
+
+def locate(project: Path, task: str, route: dict | None = None, min_files: int = MIN_FILES,
+           ties: bool = False) -> Located:
+    """The 'Likely places' block for the first prompt and the files it ranks, or an empty
+    Located (small project, nothing matched). `ties` (localize_ties): the block says which top
+    files score about the same."""
     project = project.resolve()
     files = _candidates(project)
     if len(files) < min_files:
-        return ""
+        return Located()
     texts: dict[str, str] = {}
     for rel in files:
         text = _read_text(project, rel)
@@ -362,16 +395,66 @@ def block(project: Path, task: str, route: dict | None = None,
     # Only evidence beyond plain words is worth a block: a word-only match is a guess.
     places = [p for p in places if p.reasons][:TOP_FILES]
     if not places:
-        return ""
+        return Located()
+    tied = near_ties(places) if ties else []
+    # the longest the note can be once the block is trimmed (fewer tied files: a shorter note)
+    note = TIE_NOTE.format(*_numbers(len(tied))) if tied else ""
     out = [HEADER]
     for i, place in enumerate(places, 1):
         reasons = list(dict.fromkeys(place.reasons))
         why = ", ".join(r if len(r) <= 60 else r[:57] + '..."' for r in reasons[:3])
-        out.append(f"{i}. {place.path} ({why})")
+        mark = " [about as likely as 1]" if tied and i > 1 and place.path in tied else ""
+        out.append(f"{i}. {place.path} ({why}){mark}")
         for line in _enclosing(place.path, texts[place.path], place.lines):
             out.append(f"   - {line}")
+    budget = MAX_CHARS - (len(note) + 1 if note else 0)
     text = "\n".join(out)
-    while len(text) > MAX_CHARS and len(out) > 2:
+    while len(text) > budget and len(out) > 2:
         out.pop()
         text = "\n".join(out)
-    return text
+    shown = [p.path for p in places[:sum(line[:1].isdigit() for line in out[1:])]]
+    tied = [path for path in tied if path in shown]
+    if len(tied) > 1:  # trimming the block never leaves the note about a file it dropped
+        text += "\n" + TIE_NOTE.format(*_numbers(len(tied)))
+    else:
+        tied = []
+    return Located(text, shown, tied)
+
+
+def block(project: Path, task: str, route: dict | None = None,
+          min_files: int = MIN_FILES, ties: bool = False) -> str:
+    """The 'Likely places' block for the first prompt, or "" (small project, nothing matched)."""
+    return locate(project, task, route, min_files, ties).text
+
+
+def is_source(path: str) -> bool:
+    """localize_ties: a code file the issue's fix would go in (not a test, not prose)."""
+    lower = path.lower()
+    return bool(path) and not _is_test(path) and not lower.endswith(_DOC_SUFFIXES) \
+        and "." in lower.rsplit("/", 1)[-1]
+
+
+def tie_unread(target: str | None, tied: list[str], read: set[str]) -> list[str]:
+    """localize_ties: the near-tied top files other than `target` not read this turn, when
+    `target` is a source file ([] otherwise). `read`: normalised paths read_file returned."""
+    if not target or len(tied) < 2 or not is_source(target):
+        return []
+    norm = os.path.normpath
+    return [path for path in tied if norm(path) != norm(target) and norm(path) not in read]
+
+
+def tie_hold_note(target: str, unread: list[str], tied: list[str]) -> str:
+    """localize_ties: the send-back for the first source write while a near-tied file is unread."""
+    names = ", ".join(f"`{path}`" for path in unread)
+    ranked = ", ".join(f"{i}. `{path}`" for i, path in enumerate(tied, 1))
+    return ("(Vega harness) Not written yet: the Likely places ranked these files about equally "
+            f"likely ({ranked}), and you have not read {names} this turn. read_file "
+            + ("it" if len(unread) == 1 else "each one") + " first and decide which file really "
+            f"holds the cause; the top rank alone is not the answer. Then make the change there "
+            f"(repeat this edit to `{target}` unchanged if it is the right place).")
+
+
+def no_edit_places(paths: list[str]) -> str:
+    """localize_ties: the line the no-edit finish gate adds when the turn had Likely places."""
+    return ("The Likely places for this task were " + ", ".join(f"`{p}`" for p in paths)
+            + ": read them and edit the one that holds the cause.")

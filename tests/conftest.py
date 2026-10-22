@@ -16,6 +16,9 @@ def no_server_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
                  "VEGA_DEBUG", "VEGA_TEACH", "VEGA_SEED", "VEGA_TEMPERATURE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(server, "context_length", lambda model=None: None)
+    # CI services set CI=true, and pytest then prints full, untruncated assertion diffs; the
+    # pytest runs Vega starts inherit it. Tests describe a developer machine, where it is unset.
+    monkeypatch.delenv("CI", raising=False)
     # Every test runs with the shipped feature defaults ("test what ships"): VEGA_FEATURES_OFF is
     # cleared above and never set here. A test that is not about a default turns that one feature
     # off itself (tests/switches.py), with a comment saying why.

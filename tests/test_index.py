@@ -200,3 +200,36 @@ def test_symlink_outside_project_is_not_indexed(tmp_path: Path) -> None:
     (project / "link.py").symlink_to(outside / "secret.py")
     result = execute("search_code", {"query": "leaked_secret"}, project)
     assert result.startswith("No code matched")
+
+
+@pytest.mark.parametrize("git", [True, False])
+def test_vega_state_dir_is_hidden_from_search_and_listing(tmp_path: Path, git: bool) -> None:
+    # Selfbuild 2026-10-21: after `remember`, search_text returned .vega/notes.md as its first hit
+    # and the agent edited its own note instead of the code.
+    from vega.tools import project_overview
+
+    if git:
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    write(tmp_path, "app.py", "def approval_prompt():\n    return 'approval prompt'\n")
+    saved = execute("remember", {"note": "The approval prompt lives in app.py (approval_prompt)."}, tmp_path)
+    assert (tmp_path / ".vega" / "notes.md").is_file(), saved
+    write(tmp_path, ".vega/sessions.md", "- approval prompt work\n")
+
+    for name, args in [
+        ("search_text", {"query": "approval prompt"}),
+        ("search_code", {"query": "approval prompt"}),
+        ("repo_map", {}),
+        ("list_files", {}),
+        ("find_files", {"query": "notes"}),
+        ("find_files", {"query": ".vega"}),
+    ]:
+        assert ".vega/" not in execute(name, args, tmp_path), name
+    assert "app.py" in execute("search_text", {"query": "approval prompt"}, tmp_path)
+    assert "app.py" in execute("search_code", {"query": "approval prompt"}, tmp_path)
+    assert ".vega" not in {f.path.split("/")[0] for f in build_index(tmp_path).files}
+    files_section = project_overview(tmp_path).split("Git", 1)[0]  # git status itself stays as git says
+    assert "app.py" in files_section and ".vega/" not in files_section
+
+    # An explicit read still works: the notes feature and the user's own requests keep access.
+    read = execute("read_file", {"path": ".vega/notes.md"}, tmp_path)
+    assert "approval prompt lives in app.py" in read
