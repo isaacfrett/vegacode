@@ -72,7 +72,8 @@ are free).
 
 ## Requirements
 
-- **Python 3.11 or newer.**
+- **Python 3.11 or newer.** Where `python3` is older (macOS's own is 3.9), `pip3 install vegacode`
+  installs a small launcher that sets Vega up under a newer Python; see [Install](#install).
 - **[Ollama](https://ollama.com/download)**, or another local OpenAI-compatible model server.
   The model download needs a network connection; after that, Vega works offline.
 - **Tested on a 16 GB Apple Silicon Mac.** The default model is a 5.3 GB download; Vega estimates
@@ -97,18 +98,40 @@ Llama 3.1 8B. Vega's comparisons use models under 10B parameters.
 
 ## Install
 
-From PyPI:
+On a stock Mac, with nothing else installed first:
 
 ```sh
-pipx install vegacode        # or: pip install vegacode, inside a virtual environment
+pip3 install vegacode && python3 -m vega
 ```
 
-From source:
+macOS's own `pip3` is Python 3.9, and Vega needs 3.11 or newer. On Python 3.9 and 3.10 pip
+installs only a small launcher, none of Vega's dependencies. `python3 -m vega` then finds a Python
+3.11+ on your machine (or offers to install one with uv or Homebrew, asking first), shows what it
+will do, and with your yes creates Vega's own environment in `~/.local/share/vega/venv`, installs
+the same vegacode there (about 120 MB with its dependencies) and links `vega` and `vegacode` into
+`~/.local/bin`. If that folder is not on your `PATH` it prints the line to add. Nothing is
+installed into the system or Homebrew Python. After that, run `vega`. (`python3 -m vega` rather
+than `vega` the first time: macOS's pip puts the launcher in `~/Library/Python/3.9/bin`, which is
+not on `PATH`.)
+
+If pip instead says `Requires-Python >=3.11` and `No matching distribution found`, your `pip3` is
+Python 3.9 and it only found vegacode releases from before the launcher (0.3.0). Use one of the
+commands below.
+
+With [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/), name the Python: without
+`--python` they may pick an older `python3` and install only the launcher.
+
+```sh
+uv tool install --python 3.12 vegacode       # uv downloads Python 3.12 if needed
+pipx install --python python3.12 vegacode    # or: pip install vegacode, in a Python 3.11+ venv
+```
+
+From source (needs Python 3.11+ for the venv):
 
 ```sh
 git clone https://github.com/isaacfrett/vegacode.git
 cd vegacode
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -e .
 source .venv/bin/activate
 ```

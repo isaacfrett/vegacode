@@ -6,10 +6,14 @@ build-backend = "hatchling.build"
 # The distribution is `vegacode` (`vega` on PyPI is the Vega visualization grammar); the import
 # package and the command stay `vega`.
 name = "vegacode"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local coding agent that runs on your laptop: an offline AI coding assistant for the terminal, powered by open-weight LLMs through Ollama. Your code never leaves your machine. Vega writes, runs your tests in a sandbox and repairs what fails. Python CLI and TUI, built for small models (under 10B) on 16 GB."
 readme = "README.md"
-requires-python = ">=3.11"
+# >=3.9 so that macOS's own pip3 (Python 3.9) installs something: on 3.9/3.10 only the `vega`
+# package installs (every dependency below is marked python_version >= "3.11") and the `vega`
+# command sets Vega up under a Python 3.11+ it finds or installs (src/vega/_bootstrap.py). Vega
+# itself needs 3.11.
+requires-python = ">=3.9"
 license = "AGPL-3.0-only"  # PEP 639 SPDX expression (no licence classifier with it)
 license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Isaac Frett" }]
@@ -37,14 +41,22 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
-    "openai>=1.68,<4", "typer>=0.15,<1", "rich>=13.9,<16", "ruff>=0.8", "textual>=8.0,<9",
+    'openai>=1.68,<4; python_version >= "3.11"',
+    'typer>=0.15,<1; python_version >= "3.11"',
+    'rich>=13.9,<16; python_version >= "3.11"',
+    'ruff>=0.8; python_version >= "3.11"',
+    'textual>=8.0,<9; python_version >= "3.11"',
 ]
 
 [project.optional-dependencies]
-train = ["mlx-lm[train]"]
-learn = ["pypdf>=4"]  # PDFs (books) for vega learn
+# Same marker as the dependencies: on Python 3.9/3.10 an extra installs nothing either.
+train = ['mlx-lm[train]; python_version >= "3.11"']
+learn = ['pypdf>=4; python_version >= "3.11"']  # PDFs (books) for vega learn
 # coverage: tests/test_acceptance.py checks `coverage run` task commands, which need it installed
-dev = ["pytest>=8", "mypy>=1.13", "coverage>=7", "jsonschema>=4"]
+dev = [
+    'pytest>=8; python_version >= "3.11"', 'mypy>=1.13; python_version >= "3.11"',
+    'coverage>=7; python_version >= "3.11"', 'jsonschema>=4; python_version >= "3.11"',
+]
 
 [project.urls]
 Homepage = "https://github.com/isaacfrett/vegacode"
@@ -52,8 +64,9 @@ Repository = "https://github.com/isaacfrett/vegacode"
 Issues = "https://github.com/isaacfrett/vegacode/issues"
 
 [project.scripts]
-vega = "vega.cli:app"
-vegacode = "vega.cli:app"
+# vega._launch runs vega.cli:app on Python 3.11+ and the bootstrap on older ones.
+vega = "vega._launch:main"
+vegacode = "vega._launch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vega"]
@@ -71,3 +84,11 @@ only-include = [
 
 [tool.ruff]
 line-length = 100
+# Vega's code is 3.11+; requires-python says 3.9 only for the launcher (below).
+target-version = "py311"
+
+[tool.ruff.per-file-target-version]
+# Run by Python 3.9 (macOS's own) to set Vega up under 3.11+: 3.9 syntax, stdlib only.
+"src/vega/_launch.py" = "py39"
+"src/vega/_bootstrap.py" = "py39"
+"src/vega/__main__.py" = "py39"
