@@ -677,12 +677,14 @@ def test_tui_dialog_approves_after_viewing_code(tmp_path: Path) -> None:
         worker.start()
         await wait_until(pilot, lambda: isinstance(app.screen, AdapterScreen))
         screen = app.screen
+        # on_mount hides the detail panel; under load the screen can be current before it ran
+        await wait_until(pilot, lambda: not screen.query_one("#dialog-detail").display)
         assert str(screen.query_one("#dialog-title").render()) == "Allow a new site adapter?"
         assert "API domains: api.blog.example" in str(screen.query_one("#dialog-body").render())
         assert [str(b.label) for b in screen.query("Button")] == ["Approve", "View code", "Deny"]
         assert not screen.query_one("#dialog-detail").display
         await pilot.press("v")
-        assert screen.query_one("#dialog-detail").display
+        await wait_until(pilot, lambda: screen.query_one("#dialog-detail").display)
         await pilot.press("a")
         await wait_until(pilot, lambda: bool(answer))
         worker.join(5)

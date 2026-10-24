@@ -2,6 +2,14 @@
 
 Notable changes to vegacode, newest first. Versions follow `pyproject.toml`.
 
+## 0.3.1 (2026-10-23)
+
+- Installs on a stock Mac: `pip3 install vegacode && python3 -m vega`. With Python 3.9 or 3.10
+  (macOS's own `pip3` is 3.9) pip installs only a small launcher. It finds a Python 3.11+ (or
+  offers to install one with uv or Homebrew, asking first), sets Vega up in its own environment in
+  `~/.local/share/vega/venv` after you agree, links `vega` into `~/.local/bin` and starts it. Vega
+  itself still needs Python 3.11+.
+
 ## 0.3.0 (2026-10-21)
 
 First public release.

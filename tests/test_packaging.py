@@ -121,8 +121,9 @@ def test_missing_explicit_file_does_not_fall_back(tmp_path: Path,
 def test_distribution_metadata() -> None:
     project = PYPROJECT["project"]
     assert project["name"] == "vegacode"
-    assert project["scripts"] == {"vega": "vega.cli:app", "vegacode": "vega.cli:app"}
-    assert project["readme"] == "README.md" and project["requires-python"] == ">=3.11"
+    # The launcher runs vega.cli:app on 3.11+ (tests/test_bootstrap.py covers 3.9/3.10).
+    assert project["scripts"] == {"vega": "vega._launch:main", "vegacode": "vega._launch:main"}
+    assert project["readme"] == "README.md" and project["requires-python"] == ">=3.9"
     assert all(url.startswith("https://github.com/isaacfrett/vegacode")
                for url in project["urls"].values())
     assert project["license"] == "AGPL-3.0-only"
