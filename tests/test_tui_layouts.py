@@ -73,7 +73,7 @@ def test_path_time_memory_and_plan_labels() -> None:
     assert plan_position([]) == ("plan cleared", "")
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("layout", list(LAYOUT_THEMES))
 @pytest.mark.parametrize("mode", ["dark", "light"])
 def test_every_palette_meets_contrast(layout: str, mode: str) -> None:
     theme = LAYOUT_THEMES[layout][mode]
@@ -138,11 +138,16 @@ def test_failed_check_expands_marks_the_plan_and_stays_in_view(
         # the model marked every item done, but the last check failed
         plan = str(app.query_one("#plan").render())
         assert f"{g.warn} add a test for it" in plan and "last check failed" in plan
-        # in view: the reply's first line, or (when the steps are long) the first ⚠ step
-        top, bottom = conversation.scroll_y, conversation.scroll_y + \
-            conversation.scrollable_content_region.height
-        reply = app._offset_in(conversation, second.answer)
-        warn = app._offset_in(conversation, second.steps) + second.steps.first_warning_row()
+        # in view: the reply's first line, or (when the steps are long) the first ⚠ step. The
+        # scroll settles asynchronously: wait for it (a fixed pause failed under a loaded machine)
+        for _ in range(100):  # up to 10 s: under a loaded test run the scroll can take seconds
+            top, bottom = conversation.scroll_y, conversation.scroll_y + \
+                conversation.scrollable_content_region.height
+            reply = app._offset_in(conversation, second.answer)
+            warn = app._offset_in(conversation, second.steps) + second.steps.first_warning_row()
+            if top <= warn < bottom:
+                break
+            await pilot.pause(0.1)
         assert top <= warn < bottom
         assert top <= reply or warn == bottom - 1
         # units: lines for writes, `N s` for times
@@ -263,7 +268,7 @@ def test_quiet_follows_the_terminal_background(tmp_path: Path) -> None:
     drive(app, script)
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("layout", [name for name in LAYOUTS if name != "chat"])  # chat: test_tui_chat
 def test_each_layout_renders_at_both_sizes_and_themes(tmp_path: Path, monkeypatch,
                                                       layout: str) -> None:
     project = calc_project(tmp_path, monkeypatch)

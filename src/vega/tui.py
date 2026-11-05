@@ -5,11 +5,16 @@ to the UI thread with call_from_thread; approvals (edit review, run_command) blo
 Future until the modal on the UI thread answers. Ctrl+C asks the agent to stop after its current
 step (CodingAgent.request_stop). `vega --plain` keeps the line-mode chat in cli.py.
 
-Four layouts share one widget tree and one behaviour; CSS (tui*.tcss, scoped by an App class
-`layout-<name>`) decides what is shown and where. VEGA_LAYOUT or /layout picks one (workbench
-is the default; what its columns hold is the user's choice, see view.py, /view and F2):
-classic (conversation and side panel), quiet (one centred column), observatory (bordered panes and
-an instrument stack), workbench (changes, conversation and a diff preview in three columns).
+Five layouts share one widget tree and one behaviour; CSS (tui*.tcss, scoped by an App class
+`layout-<name>`) decides what is shown and where. The default is chat (2026-10-24): one
+conversation column, the input and a one-line status, in the terminal's own colours; panels open
+one at a time from the / menu (Ctrl+K) and what is open is remembered (view.py). /layout, /view
+or VEGA_LAYOUT pick the others: classic (conversation and side panel), quiet (one centred
+column), observatory (bordered panes and an instrument stack), workbench (changes, conversation
+and a diff preview in three bordered columns).
+
+Vega never changes the size of the user's terminal window: a layout that needs more room than the
+window has folds its panels away and says so.
 """
 
 from __future__ import annotations
@@ -30,24 +35,30 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+from pygments.token import Token
 from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.highlight import ANSIDarkHighlightTheme, highlight
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
+from textual.widgets.markdown import MarkdownFence
 from textual.widgets.option_list import Option
 
 from . import (
     clipboard,
     context,
+    extensions,
     features,
+    home_start,
+    live_stats,
     models,
     product,
     resources,
@@ -59,6 +70,7 @@ from . import (
     tui_models,
     tui_problems,
     tui_product,
+    tui_table,
     tui_tests,
     usage,
     view,
@@ -69,8 +81,9 @@ from .tools import WRITE_TOOLS, WritePlan, execute, is_project, tool_specs
 from .transcripts import SessionLog
 from .ui import step_outcome, step_summary, undo_note, write_diff
 
-LAYOUTS = ("classic", "quiet", "observatory", "workbench")
-WIDE_AT = {"classic": 100, "quiet": 100, "observatory": 100, "workbench": 110}
+LAYOUTS = ("chat", "classic", "quiet", "observatory", "workbench")
+COLUMN_LAYOUTS = ("chat", "workbench")  # layouts whose side columns hold the view's panes
+WIDE_AT = {"chat": 46, "classic": 100, "quiet": 100, "observatory": 100, "workbench": 110}
 SIDE_WIDTH = 34  # the classic side panel, and the overlay panel in every layout
 GAUGE_CELLS = 20
 PLACEHOLDER = "Ask Vega to change, explain or check something"
@@ -79,12 +92,83 @@ NOT_A_PROJECT = (
     "sees a partial view. Start Vega inside a project, or use vega -p <path>."
 )
 MEMORY_EVERY = 5.0  # seconds between model-memory readings
+RESOURCES_EVERY = 2.0  # seconds between the chat status line's CPU/memory/swap readings
+CHAT_COLUMN = 88  # the chat layout's reading column (tui_chat.tcss max-width), in cells
 PREVIEW_LINES = 400  # most lines of a step's output shown in the workbench preview
 
 
 def layout_from_env() -> str:
+    """VEGA_LAYOUT when it names a layout, else "" (then view.json, then view.DEFAULT_LAYOUT)."""
     wanted = os.environ.get("VEGA_LAYOUT", "").strip().lower()
-    return wanted if wanted in LAYOUTS else "workbench"
+    return wanted if wanted in LAYOUTS else ""
+
+
+def colorfgbg_appearance(value: str | None = None) -> str | None:
+    """light/dark from COLORFGBG ("15;0" = foreground;background ANSI indexes), which iTerm2,
+    rxvt, Konsole and others set; None when it is missing or unclear."""
+    value = os.environ.get("COLORFGBG", "") if value is None else value
+    last = value.split(";")[-1].strip()
+    if not last.isdigit():
+        return None
+    index = int(last)
+    return "light" if index in {7, 15} or 9 <= index <= 14 else "dark"
+
+
+def osc_appearance(reply: str) -> str | None:
+    """light/dark from a terminal's answer to OSC 11 (`ESC ] 11 ; rgb:RRRR/GGGG/BBBB`)."""
+    match = re.search(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)", reply)
+    if not match:
+        return None
+    channels = [int(part, 16) / (16 ** len(part) - 1) for part in match.groups()]
+    luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+    return "light" if luminance > 0.5 else "dark"
+
+
+def query_terminal_appearance(timeout: float = 0.2) -> str | None:
+    """Ask the terminal for its background colour (OSC 11) before the app starts, so the
+    terminal theme picks accents that read on it. Only on a POSIX terminal we talk to directly;
+    one that does not answer costs `timeout` seconds and nothing else."""
+    if os.name == "nt" or os.environ.get("TMUX") or os.environ.get("STY"):
+        return None
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        return None
+    try:
+        if not (sys.__stdin__ and sys.__stdin__.isatty() and sys.__stdout__
+                and sys.__stdout__.isatty()):
+            return None
+        fd = sys.__stdin__.fileno()
+        saved = termios.tcgetattr(fd)
+    except (AttributeError, OSError, ValueError, termios.error):
+        return None
+    reply = b""
+    try:
+        tty.setcbreak(fd)
+        sys.__stdout__.write("\x1b]11;?\x1b\\")
+        sys.__stdout__.flush()
+        deadline = time.monotonic() + timeout
+        while not reply.endswith((b"\x07", b"\x1b\\")):
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            reply += os.read(fd, 64)
+    except (OSError, ValueError):
+        return None
+    finally:
+        with contextlib.suppress(OSError, ValueError, termios.error):
+            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+    return osc_appearance(reply.decode("ascii", "replace"))
+
+
+DETECTED_APPEARANCE: str | None = None  # set by run_tui from the terminal's answer (OSC 11)
+
+
+def default_appearance() -> str:
+    """dark or light, for a theme that needs to know: the terminal's answer, COLORFGBG, dark."""
+    return DETECTED_APPEARANCE or colorfgbg_appearance() or "dark"
 
 
 # -- glyphs and palette ----------------------------------------------------------------------------
@@ -97,12 +181,12 @@ def glyphs(ascii_only: bool | None = None) -> SimpleNamespace:
         return SimpleNamespace(
             done="+", doing=">", pending="-", closed=">", opened="v", fixed="=", used="#",
             empty=".", tick="|", warn="!", prompt=">", minus="-", spinner="|/-\\", star="*",
-            ellipsis="~", spark=" .:-=+*#", bullet="-", fail="x", open="o",
+            ellipsis="~", spark=" .:-=+*#", bullet="-", fail="x", open="o", up="Up",
         )
     return SimpleNamespace(
         done="✓", doing="▸", pending="·", closed="▸", opened="▾", fixed="█", used="█",
         empty="░", tick="│", warn="⚠", prompt="›", minus="−", spinner="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", star="✦",
-        ellipsis="…", spark="▁▂▃▄▅▆▇█", bullet="·", fail="✗", open="○",
+        ellipsis="…", spark="▁▂▃▄▅▆▇█", bullet="·", fail="✗", open="○", up="↑",
     )
 
 
@@ -185,10 +269,67 @@ LAYOUT_THEMES: dict[str, dict[str, Theme]] = {
 THEMES = LAYOUT_THEMES["classic"]  # vega-dark / vega-light
 
 
+def _ansi_theme(name: str, dark: bool, *, accent: str, warning: str, error: str,
+                teach: str) -> Theme:
+    """The terminal theme: foreground and background are the terminal's own (ANSI default), so
+    Vega inherits the user's colours, font colours and light or dark; accents are ANSI colours
+    from the user's palette. `dark` only picks which ANSI colours read on that background: in
+    the stock macOS palettes blue is unreadable on black and yellow or cyan on white."""
+    return Theme(
+        name=name, dark=dark, ansi=True, primary=accent, accent=accent,
+        secondary="ansi_bright_black", foreground="ansi_default", background="ansi_default",
+        surface="ansi_default", panel="ansi_default", boost="ansi_default",
+        success="ansi_green", warning=warning, error=error,
+        variables={
+            "vega-muted": "ansi_bright_black", "vega-fixed": "ansi_bright_black",
+            "vega-rule": "ansi_bright_black", "vega-track": "ansi_bright_black",
+            "vega-warning-text": warning, "vega-overlay": "ansi_default",
+            "vega-readout": "ansi_default", "vega-add-bg": "ansi_default",
+            "vega-del-bg": "ansi_default", "vega-teach": "ansi_magenta",
+            "text-muted": "ansi_bright_black", "button-focus-text-style": "bold underline",
+            "border": accent, "border-blurred": "ansi_bright_black",
+            "block-cursor-foreground": "ansi_default", "block-cursor-background": accent,
+            "block-cursor-text-style": "reverse",
+            "input-cursor-background": "ansi_default", "input-cursor-foreground": "ansi_default",
+            "input-cursor-text-style": "reverse",
+            "input-selection-background": accent, "input-selection-foreground": "ansi_default",
+            "screen-selection-background": accent, "screen-selection-foreground": "ansi_default",
+            "footer-background": "ansi_default", "scrollbar": "ansi_bright_black",
+            "scrollbar-background": "ansi_default",
+            "ansi-background": "ansi_default", "ansi-foreground": "ansi_default",
+        },
+    )
+
+
+# the default theme (view.THEMES "terminal"): the terminal's own colours
+TERMINAL_THEMES: dict[str, Theme] = {
+    "dark": _ansi_theme("vega-terminal-dark", True, accent="ansi_cyan", warning="ansi_yellow",
+                        error="ansi_bright_red", teach="ansi_magenta"),
+    "light": _ansi_theme("vega-terminal-light", False, accent="ansi_blue",
+                         warning="ansi_bright_red", error="ansi_red", teach="ansi_magenta"),
+}
+THEME_FAMILIES: dict[str, dict[str, Theme]] = {"terminal": TERMINAL_THEMES, **LAYOUT_THEMES}
+THEME_ABOUT = {
+    "terminal": "your terminal's own colours and background (default)",
+    "classic": "deep blue night, pale blue accent",
+    "quiet": "neutral ink and paper, one blue accent",
+    "observatory": "night sky and chart paper, amber readouts",
+    "workbench": "ink on paper, diff tints carry the colour",
+    "layout": "each layout's own palette (as before 2026-10-24)",
+}
+
+
+def rich_colour(value: str) -> str:
+    """A theme colour as Rich reads it: Textual's `ansi_green` is Rich's `green`."""
+    if value.startswith("ansi_"):
+        return value[5:]
+    return value
+
+
 def palette(app: App) -> dict[str, str]:
     theme = app.current_theme
     variables = theme.variables
-    return {
+    colours = {
         "fg": theme.foreground or "", "accent": theme.accent or "", "bg": theme.background or "",
         "success": theme.success or "", "error": theme.error or "", "tick": theme.warning or "",
         "warning": variables.get("vega-warning-text", theme.warning or ""),
@@ -199,6 +340,7 @@ def palette(app: App) -> dict[str, str]:
         "panel": theme.panel or "",
         "teach": variables.get("vega-teach", theme.accent or ""),
     }
+    return {key: rich_colour(value) for key, value in colours.items()}
 
 
 def short_path(path: Path | str) -> str:
@@ -304,12 +446,12 @@ def context_usage(agent: CodingAgent, window: int | None = None) -> Usage:
     if budget is not None:
         tools = budget.fixed_tokens
     else:
-        tools = context.estimate_text_tokens(json.dumps(tool_specs(
+        tools = context.estimate_text_tokens(json.dumps(extensions.tool_list(tool_specs(
             include_delegate=agent.can_delegate,
             include_remember=agent.can_write and features.on("remember"),
             include_plan=agent.planning == "on" and features.on("plan"),
             include_index=features.on("code_index"),
-        )))
+        ), "", agent=agent)))
     system = context.estimate_text_tokens(str(agent.messages[0].get("content") or ""))
     fixed = int((system + tools) * scale)
     if budget is not None:
@@ -340,7 +482,7 @@ def gauge_bar(fixed: float, used: float, window: int, cells: int, colours: dict[
               g: SimpleNamespace) -> Text:
     """The bar alone: fixed prompt, conversation, empty track, and the compaction tick."""
     fixed_cells, conversation = gauge_cells(fixed, used, window, cells)
-    tick = round(context.COMPACT_AT * cells)
+    tick = round(context.compact_at(window) * cells)
     bar = Text()
     for index in range(cells):
         if index == tick:
@@ -435,6 +577,13 @@ class PromptInput(TextArea):
         self._draft = ""
 
     async def _on_key(self, event: events.Key) -> None:
+        menu_key = {"up": "up", "down": "down", "tab": "tab", "enter": "enter",
+                    "escape": "escape"}.get(event.key)
+        app = self.app
+        if menu_key and getattr(app, "menu_open", False) and app.menu_key(menu_key):
+            event.stop()
+            event.prevent_default()
+            return
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -477,7 +626,93 @@ class PromptInput(TextArea):
         self._draft = ""
 
 
+@dataclass(frozen=True)
+class MenuEntry:
+    """One row of the / menu. `then` is what Enter does: run the command, or fill the input
+    with it (`fill`) so the user picks from the next list or types an argument."""
+
+    command: str
+    about: str
+    group: str = "command"  # command | panel | theme | view | style | layout
+    then: str = "run"  # run | fill
+    top: bool = True  # listed when only "/" is typed (the others appear as you type)
+    state: str = ""  # shown on the right: "open", "current"
+    swatch: tuple[str, ...] = ()  # theme previews: colours drawn as small blocks
+
+
+def menu_matches(entries: list[MenuEntry], typed: str) -> list[MenuEntry]:
+    """Entries for what is typed after "/": only the top-level list for a bare "/", else every
+    entry whose command starts with it, or when none does, those whose words all appear in
+    command and description."""
+    query = typed[1:].lower() if typed.startswith("/") else typed.lower()
+    if not query.strip():
+        return [entry for entry in entries if entry.top]
+    first, second = [], []
+    words = query.split()
+    for entry in entries:
+        name = entry.command[1:].lower()
+        if name.startswith(query):
+            first.append(entry)
+        elif all(word in f"{name} {entry.about.lower()}" for word in words):
+            second.append(entry)
+    return first or second
+
+
+class SlashMenu(OptionList):
+    """The / menu over the bottom of the conversation: every command, panel, theme and view,
+    filtered as you type. The input keeps the focus (PromptInput hands it Up, Down, Tab, Enter
+    and Esc while it is open), so nothing here takes a click."""
+
+    can_focus = False
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.entries: list[MenuEntry] = []
+        self._shape: tuple[int, dict[str, str]] = (80, {})
+
+    def show(self, entries: list[MenuEntry], width: int, colours: dict[str, str],
+             highlighted: int = 0) -> None:
+        """Fill the menu. The chosen row carries the prompt's mark and the accent (a reversed
+        row would vanish where the terminal's own colours are both "default")."""
+        self.entries = entries
+        self._shape = (width, colours)
+        self.clear_options()
+        highlighted = max(0, min(highlighted, len(entries) - 1))
+        name_w = min(22, max((cell_len(entry.command) for entry in entries), default=8))
+        mark = glyphs().prompt
+        for index, entry in enumerate(entries):
+            chosen = index == highlighted
+            row = Text(no_wrap=True, overflow="ellipsis")
+            row.append(f"{mark} " if chosen else "  ", style=f"bold {colours['accent']}")
+            row.append(entry.command.ljust(name_w),
+                       style=f"bold {colours['accent' if chosen else 'fg']}")
+            row.append("  ")
+            right = Text()
+            for colour in entry.swatch:
+                right.append("██", style=colour)
+            if entry.state:
+                right.append((" " if entry.swatch else "") + entry.state,
+                             style=colours["accent"])
+            room = max(8, width - name_w - 6 - cell_len(right.plain) - 2)
+            row.append(_clip(entry.about, room).ljust(room),
+                       style=colours["fg" if chosen else "muted"])
+            if right:
+                row.append("  ")
+                row.append_text(right)
+            self.add_option(Option(row))
+        self.highlighted = highlighted if entries else None
+
+    def move(self, index: int) -> None:
+        """Highlight row `index` (the rows are redrawn to move the mark)."""
+        self.show(self.entries, *self._shape, highlighted=index)
+
+
 GUTTERS = {
+    # chat: by the chat style (view.CHAT_STYLES): rail marks your messages with the prompt's
+    # mark, gutter names both speakers, bubbles needs no label (your messages sit on the right)
+    "chat-rail": {"you": ">", "vega": ""},  # the message box's "> " mark
+    "chat-gutter": {"you": "you", "vega": "vega"},
+    "chat-bubbles": {"you": "", "vega": ""},
     "classic": {"you": "you", "vega": "vega"},
     "quiet": {"you": "›", "vega": ""},
     "observatory": {"you": "you", "vega": "vega"},
@@ -496,6 +731,8 @@ class Gutter(Static):
         if not self.speaker:
             return ""
         layout = getattr(self.app, "layout_name", "classic")
+        if layout == "chat":
+            layout = f"chat-{self.app.view.chat_style}"
         label = GUTTERS.get(layout, GUTTERS["classic"]).get(self.speaker, self.speaker)
         if label == "›" and glyphs().prompt != "›":
             label = glyphs().prompt
@@ -702,6 +939,7 @@ class StepsToggle(Static):
 
     def refresh_label(self) -> None:
         g = glyphs()
+        self.set_class(not self.count, "-empty")
         if not self.count:
             self.update(f"{seconds_label(self.seconds)}, no tools used")
             return
@@ -724,6 +962,50 @@ class StepsToggle(Static):
         self.action_toggle()
 
 
+class _TerminalDark(ANSIDarkHighlightTheme):
+    """Textual's ANSI code colours, with function names and decorators moved off blue: in the
+    stock macOS and xterm palettes ANSI blue on black cannot be read."""
+
+    STYLES: ClassVar[dict[Any, str]] = {
+        **ANSIDarkHighlightTheme.STYLES,
+        Token.Name.Function: "ansi_cyan", Token.Name.Function.Magic: "ansi_cyan",
+        Token.Name.Decorator: "ansi_cyan bold", Token.Name.Tag: "ansi_cyan bold",
+        Token.Name.Attribute: "ansi_yellow",
+    }
+
+
+class CodeFence(MarkdownFence):
+    """A fenced code block; with the terminal theme it is drawn behind a rule in the margin
+    (no tinted box: the terminal's background stays) and readable on dark backgrounds."""
+
+    @classmethod
+    def highlight(cls, code: str, language: str, ansi: bool = False,
+                  dark: bool = False) -> Any:
+        if ansi and dark:
+            return highlight(code, language=language or None, theme=_TerminalDark)
+        return super().highlight(code, language, ansi=ansi, dark=dark)
+
+
+class Answer(Markdown):
+    """A reply's Markdown, with Vega's code blocks."""
+
+    BLOCKS: ClassVar[dict[str, Any]] = {**Markdown.BLOCKS, "fence": CodeFence,
+                                        "code_block": CodeFence,
+                                        "table_open": tui_table.TableBlock}
+
+
+_OPTION_LINE = re.compile(r"^( {2,4})([a-d]\) )", re.MULTILINE)
+
+
+def options_as_lists(text: str) -> str:
+    """Show a clarifying question's lettered options one per line: `   a) x` under a numbered
+    question is a list item's continuation in Markdown and would run on in one line. Display
+    only; the reply the model and /copy see is unchanged."""
+    if not re.search(r"^\d+\. .+\n {2,4}a\) ", text, re.MULTILINE):
+        return text
+    return _OPTION_LINE.sub(r"   - \2", text)
+
+
 class Turn(Horizontal):
     """One agent turn: live steps and a working line, then the answer with the steps collapsed
     (expanded when a check failed). `changes` is the compact changed-files row (quiet layout)."""
@@ -733,7 +1015,7 @@ class Turn(Horizontal):
         self.number = number
         self.steps = Steps()
         self.working = Static("", classes="working")
-        self.answer = Markdown("", classes="answer")
+        self.answer = Answer("", classes="answer")
         self.lesson = Static("", classes="lesson")  # teach mode: plan, why and fix lines
         self.lessons: list[tuple[str, str]] = []
         self.takeaway = Markdown("", classes="takeaway")  # teach mode: the answer's sections
@@ -787,7 +1069,8 @@ class Turn(Horizontal):
         self.working.remove()
         self.answer.display = True
         body, sections = teaching.split(text)
-        self.answer.update(body if sections and body else text)
+        self.answer.update(options_as_lists(
+            extensions.render_markdown(body if sections and body else text)))
         if sections and body:
             self.takeaway.update(sections)
             self.takeaway.display = True
@@ -802,7 +1085,9 @@ class Turn(Horizontal):
         if not self.done:
             self.steps.display = detail != "hidden" and bool(self.steps.entries)
             return
-        self.toggle.display = detail != "hidden"
+        # the chat layout leaves out "0.4 s, no tools used": a reply with no steps needs no line
+        chat_empty = getattr(self.app, "layout_name", "") == "chat" and not self.steps.step_count
+        self.toggle.display = detail != "hidden" and not chat_empty
         self.toggle.set_expanded(detail == "expanded" or (detail == "collapsed"
                                                            and self.steps.failed))
         if detail == "hidden":
@@ -966,7 +1251,8 @@ def diff_rows(before: list[str], after: list[str], width: int, colours: dict[str
         text.append(num + " ", style=f"{colours['muted']} on {bg}" if bg else colours["muted"])
         text.append(mark + " ", style=f"bold {style} on {bg}" if bg else style)
         content = _clip(line.expandtabs(4), body_w).ljust(body_w)
-        text.append(content, style=f"{colours['fg']} on {bg}" if bg else colours["fg"])
+        tint = f"{colours['fg']} on {bg}" if bg else colours["fg"]
+        text.append(content, style=style if bg == "default" else tint)
 
     for number, group in enumerate(groups):
         first, last = group[0][3] + 1, group[-1][4]
@@ -1010,7 +1296,8 @@ def unified_rows(diff: str, width: int, colours: dict[str, str], g: SimpleNamesp
         text.append(mark + " ", style=f"bold {style} on {bg}" if bg else style)
         content = _clip(line.expandtabs(4), body_w)
         text.append(content.ljust(body_w) if bg else content,
-                    style=f"{colours['fg']} on {bg}" if bg else colours["fg"])
+                    style=style if bg == "default" else
+                    f"{colours['fg']} on {bg}" if bg else colours["fg"])
 
     for line in lines:
         if line.startswith("diff --git "):
@@ -1205,7 +1492,22 @@ def web_screen(kind: str, detail: str, backend: str) -> WebAccessScreen:
                            hint="s session   p project   n no").add_class("web")
 
 
+LAYOUT_ABOUT = {
+    "chat": "one conversation column; panels open one at a time (default)",
+    "classic": "conversation and a side panel",
+    "quiet": "one centred column, no rules",
+    "observatory": "bordered panes and an instrument stack",
+    "workbench": "changes, conversation and a diff preview in bordered columns",
+}
+CHAT_STYLE_ABOUT = {
+    "rail": "your messages marked with the prompt's mark, replies plain (default)",
+    "gutter": "speaker names in a margin and a title line on top",
+    "bubbles": "your messages on the right in a light frame, replies on the left",
+}
+
 HELP_KEYS = [
+    ("/", "the menu: commands, panels, themes and views, filtered as you type"),
+    ("Ctrl+K", "the same menu from anywhere"),
     ("Enter", "send"),
     ("Shift+Enter", "new line (Ctrl+J where Shift+Enter is not passed through)"),
     ("↑ / ↓", "earlier messages, from the first or last line of the input"),
@@ -1215,7 +1517,7 @@ HELP_KEYS = [
     ("Cmd+V", "paste into the message; pasted newlines never send it"),
     ("Ctrl+U", "undo the last turn's file changes"),
     ("Ctrl+R", "review edits on or off"),
-    ("Ctrl+P", "show or hide the panel (Esc also closes it)"),
+    ("Ctrl+P", "show or hide the panels (chat with none open: pick one)"),
     ("Ctrl+T", "light or dark theme"),
     ("Ctrl+L", "clear the view (Vega keeps the conversation)"),
     ("Ctrl+Q", "quit"),
@@ -1238,11 +1540,16 @@ HELP_COMMANDS = [
     ("/status", "Git status"),
     ("/diff", "tracked changes against HEAD"),
     ("/undo [--force]", "restore the files changed in the last turn"),
+    ("/project [path]", "the folder Vega works in; with a path, switch to it (the chat stays)"),
     ("/review on|off", "ask before applying each edit"),
     ("/teach on|off", "teach mode: Vega says why as it works and ends with what to take away"),
-    ("/layout [name]", "workbench (default), classic, quiet or observatory"),
-    ("/view [preset]", ("what the workbench shows; presets product, workbench, focus, "
-                        "review, monitor, steps")),
+    ("/resources on|off", "live CPU, memory, swap and model under the message box (chat)"),
+    ("/panel [name]", "open or close a panel (files, preview, plan, git, tests, ...)"),
+    ("/theme [name]", "colours: terminal (default), classic, quiet, observatory, workbench"),
+    ("/style [name]", "the chat layout's look: rail (default), gutter or bubbles"),
+    ("/layout [name]", "chat (default), workbench, classic, quiet or observatory"),
+    ("/view [preset]", ("what the side columns show; presets chat, workbench, product, "
+                        "focus, review, monitor, steps")),
     ("/product", "the same as F3"),
     ("/ship", "not built yet: the Release checklist shows what is left"),
     ("/usage on|off", "the local usage log (off by default; events only, never sent)"),
@@ -1593,6 +1900,7 @@ def _total_memory() -> float | None:
 class VegaApp(App[None]):
     CSS_PATH: ClassVar[list[str]] = [  # type: ignore[misc]
         "tui.tcss", "tui_quiet.tcss", "tui_observatory.tcss", "tui_workbench.tcss",
+        "tui_chat.tcss",
     ]
     ENABLE_COMMAND_PALETTE = False
     TITLE = "vega"
@@ -1602,6 +1910,7 @@ class VegaApp(App[None]):
         Binding("ctrl+u", "undo", "Undo", priority=True, show=False),
         Binding("ctrl+r", "toggle_review", "Review", priority=True, show=False),
         Binding("ctrl+p", "toggle_panel", "Panel", priority=True, show=False),
+        Binding("ctrl+k", "open_menu", "Menu", priority=True, show=False),
         Binding("ctrl+t", "toggle_theme", "Theme", priority=True, show=False),
         Binding("ctrl+l", "clear_view", "Clear", priority=True, show=False),
         Binding("tab", "cycle_pane(1)", "Next pane", priority=True, show=False),
@@ -1618,17 +1927,33 @@ class VegaApp(App[None]):
         memory_probe: Callable[[], float] | None = None, session_log: SessionLog | None = None,
         layout: str | None = None, total_memory_gb: float | None = None,
         swap_probe: Callable[[], float | None] | None = None, transparent: bool | None = None,
-        teach: bool | None = None,
+        teach: bool | None = None, theme: str | None = None, appearance: str | None = None,
+        resource_probe: Callable[[], live_stats.Reading] | None = None,
     ) -> None:
         super().__init__()
-        for themes in LAYOUT_THEMES.values():
-            for theme in themes.values():
-                self.register_theme(theme)
-        self.layout_name = layout if layout in LAYOUTS else layout_from_env()
+        for themes in THEME_FAMILIES.values():
+            for each in themes.values():
+                self.register_theme(each)
         self.view = view.load()
-        wanted = os.environ.get("VEGA_THEME", "dark").strip().lower()
-        self.mode = wanted if wanted in {"dark", "light"} else "dark"
-        self.theme = LAYOUT_THEMES[self.layout_name][self.mode].name
+        self.migrated = view.migrated
+        view.migrated = False
+        # the layout: the caller's, VEGA_LAYOUT, the saved one, else chat
+        self.layout_name = layout if layout in LAYOUTS else (
+            layout_from_env() or (self.view.layout if self.view.layout in LAYOUTS else "")
+            or view.DEFAULT_LAYOUT)
+        # the colours: the caller's theme, the saved one (terminal by default); NO_COLOR keeps
+        # the terminal's own colours with every colour taken out (Textual's NoColor filter)
+        self.theme_family = theme if theme in view.THEMES else self.view.theme
+        if self.no_color:
+            self.theme_family = "terminal"
+        # light or dark: VEGA_THEME, the saved choice, else what the terminal says (default dark)
+        wanted = os.environ.get("VEGA_THEME", "").strip().lower()
+        chosen = appearance or (wanted if wanted in {"dark", "light"} else "")
+        if not chosen and self.view.appearance in {"dark", "light"}:
+            chosen = self.view.appearance
+        self.mode = chosen if chosen in {"dark", "light"} else default_appearance()
+        self.theme = self._theme_name()
+        self._use_no_color_filter()
         if transparent is None:
             transparent = os.environ.get("VEGA_OPAQUE", "").strip() in {"", "0"}
         self.transparent_ok = transparent
@@ -1656,6 +1981,9 @@ class VegaApp(App[None]):
             def probe() -> tuple[float, float | None]:
                 return memory_probe(), swap_probe() if swap_probe else None
         self.machine_probe = probe
+        # the chat status line's live readings (live_stats; no subprocess per reading)
+        self.resource_probe = resource_probe or live_stats.Sampler().read
+        self.reading: live_stats.Reading | None = None
         self.total_memory_gb = total_memory_gb if total_memory_gb is not None else _total_memory()
         self.working = False
         self.awaiting_approval = False
@@ -1702,10 +2030,41 @@ class VegaApp(App[None]):
         self.task_stamp: str | None = None  # ... when agent.last_acceptance ran
         self._acceptance_seen: Any = None
         self.pending_fix: tuple[str, str] | None = None  # (check key, prepared text) in the box
+        self._asked: tuple[str, list[Any]] | None = None  # an answer's questions, to present
         self._blocking: set[str] = set()  # blocking checks in the last report (usage log)
         self._code_view: view.View | None = None  # the code view F3 returns to
         self._product_switched = 0.0  # when F3 last switched views (the F3-back measure)
         self.usage_session = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        self.menu_open = False
+        self._menu_closed_for: str | None = None  # Esc closed the menu for this text
+        self._menu_theme: str | None = None  # the theme to put back if a previewed one is left
+
+    # themes
+
+    def _theme_name(self, family: str | None = None, layout: str | None = None) -> str:
+        family = family or self.theme_family
+        if family == "layout":
+            family = layout or self.layout_name
+        if family == "chat" or family not in THEME_FAMILIES:
+            family = "terminal"
+        return THEME_FAMILIES[family][self.mode].name
+
+    def _use_no_color_filter(self) -> None:
+        """Textual picks its NO_COLOR filter before Vega's theme is set: with the terminal's own
+        colours, strip the colour (NoColor) rather than grey out a palette (Monochrome)."""
+        if not self.no_color:
+            return
+        from textual.filter import Monochrome, NoColor
+
+        self._filters = [NoColor() if isinstance(f, Monochrome) else f for f in self._filters]
+
+    def _apply_theme(self) -> None:
+        # a theme chosen while the / menu was previewing one is the user's now: closing the menu
+        # must not put the previewed-over theme back (Enter can reach the input before the menu)
+        self._menu_theme = None
+        self.theme = self._theme_name()
+        self.set_class(self.current_theme.ansi, "ansi")
+        self._restyle()
 
     # layout
 
@@ -1718,6 +2077,7 @@ class VegaApp(App[None]):
             yield Static("ready", id="state")
         yield Static("", id="strip")
         with Horizontal(id="body"):
+            yield SlashMenu(id="menu")
             with Vertical(id="left"):
                 yield from (make_pane(name) for name in self.view.left)
             yield ColumnDivider("left", id="divider-left", classes="divider")
@@ -1745,15 +2105,17 @@ class VegaApp(App[None]):
                 yield Static("^P or Esc to close", id="overlay-hint")
             with Vertical(id="right"):
                 yield from (make_pane(name) for name in self.view.right)
-        with Horizontal(id="input-row"):
-            yield Static(glyphs().prompt, id="prompt-mark")
-            yield PromptInput(id="prompt")
-        with Horizontal(id="status"):
-            yield ContextGauge(id="gauge")
-            yield Static("", id="readouts")
-            yield Static("", id="hints")
+        with Vertical(id="footer"):  # the message box and the status line under it
+            with Horizontal(id="input-row"):
+                yield Static(self._prompt_mark(), id="prompt-mark")
+                yield PromptInput(id="prompt")
+            with Horizontal(id="status"):
+                yield ContextGauge(id="gauge")
+                yield Static("", id="readouts")
+                yield Static("", id="hints")
 
     def on_mount(self) -> None:
+        self.query_one("#menu", SlashMenu).display = False
         self.query_one("#changes", ChangesList).display = False
         self.query_one("#plan-pane").border_title = "Plan"
         self.query_one("#changes-pane").border_title = "Changes"
@@ -1761,12 +2123,19 @@ class VegaApp(App[None]):
         self.query_one("#session-pane").border_title = "Session"
         self.set_layout(self.layout_name, announce=False)
         self.query_one("#gauge", ContextGauge).set_usage(context_usage(self.agent))
-        if not is_project(self.project):
+        # started in ~ (or /, a large non-project folder): ask what the user is working on first
+        context = self._chat_context()
+        asked = (home_start.chat_opened(self, project=self.project, **context)
+                 or extensions.chat_opened(self, project=self.project, **context))
+        if not asked and not is_project(self.project):
             self._add(Note(NOT_A_PROJECT + "  (Esc dismisses)", "warning", dismissible=True))
+        self._first_run_hint()
         self.query_one("#prompt", PromptInput).focus()
         self.set_interval(0.1, self._tick)
         self.set_interval(MEMORY_EVERY, self._read_memory)
         self._read_memory()
+        self.set_interval(RESOURCES_EVERY, self._read_resources)
+        self._read_resources()
         self.set_interval(LOOPS_EVERY, self._read_loops)
         self._read_loops()
         self.read_git()
@@ -1781,13 +2150,17 @@ class VegaApp(App[None]):
         self.layout_name = name
         for other in LAYOUTS:
             self.set_class(other == name, f"layout-{other}")
+        for style in view.CHAT_STYLES:
+            self.set_class(style == self.view.chat_style, f"style-{style}")
         transparent = name == "quiet" and self.transparent_ok
         self.set_class(transparent, "transparent")
         self.ansi_color = True if transparent else None
-        self.theme = LAYOUT_THEMES[name][self.mode].name
+        self.theme = self._theme_name()
+        self.set_class(self.current_theme.ansi, "ansi")
         self.default_screen.remove_class("panel-overlay", "panel-hidden")
         boxed = name in {"observatory", "workbench"}
         self.query_one("#conversation").border_title = "Conversation" if boxed else None
+        self.query_one("#prompt-mark", Static).update(self._prompt_mark())
         self.query_one("#input-row").border_title = "Message" if boxed else None
         self._apply_view_styles()
         self._apply_width(self.size.width)
@@ -1796,17 +2169,56 @@ class VegaApp(App[None]):
         self._restyle()
         self.call_after_refresh(self._after_layout)
         if announce:
-            self._add(Note(f"Layout {name}. /layout lists the others; VEGA_LAYOUT={name} starts "
-                           "with it."))
+            self._save_settings(layout=name)
+            self._add(Note(f"Layout {name}, kept for next time. /layout lists the others."))
+
+    @property
+    def columns(self) -> bool:
+        """The layout puts the view's panes in side columns (chat and workbench)."""
+        return self.layout_name in COLUMN_LAYOUTS
 
     @property
     def step_detail(self) -> str:
-        return self.view.steps if self.layout_name == "workbench" else "collapsed"
+        return self.view.steps if self.columns else "collapsed"
+
+    def _save_settings(self, **changes: Any) -> None:
+        """Change settings (theme, layout, ...) without touching the panes, and keep them."""
+        from dataclasses import replace
+
+        self.view = replace(self.view, **changes)
+        try:
+            view.save(self.view)
+        except OSError as exc:
+            self.notify(f"Couldn't save the setting: {exc}", severity="warning")
+
+    def _first_run_hint(self) -> None:
+        """Once per user, in the chat layout: the three keys worth knowing. A user whose
+        view.json predates the chat layout is told where the workbench went."""
+        if self.layout_name != "chat":
+            return
+        if self.migrated:
+            self._add(Note("Vega now opens with just the conversation. Your panels are a / away: "
+                           "/panel opens one, /view workbench brings the whole workbench back "
+                           "(your old settings are in view-v1.json).", dismissible=True))
+        if self.view.hinted:
+            return
+        g = glyphs()
+        colours = palette(self)
+        hint = Text()
+        for index, (key, what) in enumerate((("/", "commands, panels and themes"),
+                                             (g.up, "your earlier messages"),
+                                             ("Esc", "stops Vega"))):
+            if index:
+                hint.append("    ")
+            hint.append(key, style=f"bold {colours['accent']}")
+            hint.append(f" {what}", style=colours["muted"])
+        self._add(Note(hint, "hint", dismissible=True))
+        self._save_settings(hinted=True)
 
     def apply_view(self, new: view.View, *, save: bool = True) -> None:
         """Show `new` now (panes rebuilt only if their placement changed); `save` keeps it for
         the next start."""
-        new = view.with_teach(new, self.view.teach)  # presets do not switch teach mode
+        new = view.with_settings(new, self.view)  # presets keep teach mode, theme, layout
         old, self.view = self.view, new
         if save:
             try:
@@ -1838,7 +2250,7 @@ class VegaApp(App[None]):
         screen = self.default_screen
         screen.set_class(not self.view.left, "no-left")
         screen.set_class(not self.view.right, "no-right")
-        product_mode = self.layout_name == "workbench" and self.view.mode == "product"
+        product_mode = self.columns and self.view.mode == "product"
         screen.set_class(product_mode, "product-mode")
         self.query_one("#header").set_class(product_mode, "with-mode")
         self._update_dividers()
@@ -1853,6 +2265,11 @@ class VegaApp(App[None]):
             visible = shown and present
             self.query_one(f"#divider-{side}", ColumnDivider).display = visible
 
+    def _prompt_mark(self) -> str:
+        """The message box's mark: "> " in the chat layout (the 2026-10-28 mockup), the layout
+        glyph elsewhere."""
+        return ">" if self.layout_name == "chat" else glyphs().prompt
+
     def _model_label(self) -> str:
         model = self.agent.model
         if model == server.model_name() == "vega":
@@ -1864,6 +2281,7 @@ class VegaApp(App[None]):
 
     def _discover(self) -> None:
         """Background start-up: load the model and cache the fixed prompt (#2), learn the window."""
+        extensions.warm()  # the lab's imports now, not in the first turn
         if self.warm_up:
             self.agent.warm_up()
         window = self.agent.num_ctx
@@ -1883,8 +2301,7 @@ class VegaApp(App[None]):
         return self.default_screen.has_class("narrow")
 
     def _wide_at(self) -> int:
-        return self.view.wide_at() if self.layout_name == "workbench" else \
-            WIDE_AT[self.layout_name]
+        return self.view.wide_at() if self.columns else WIDE_AT[self.layout_name]
 
     def _apply_width(self, width: int) -> None:
         narrow = width < self._wide_at()
@@ -1922,17 +2339,69 @@ class VegaApp(App[None]):
             return
         prompt.remember(text)
         prompt.load_text("")
+        context = self._chat_context()
+        instead = home_start.chat_message(self, text, **context)
+        if instead is None:
+            instead = extensions.chat_message(self, text, **context)
+        if instead == "":  # taken already (e.g. home_start offered a project to open first)
+            self._add(UserMessage(text))
+            return
+        if instead is not None:
+            text = instead
         if self.pending_fix is not None:  # the user sent (maybe edited) a prepared fix request
             self.product_usage("fix_sent", check=self.pending_fix[0],
                                edited=text != self.pending_fix[1].strip())
             self.pending_fix = None
         self.start_turn(text)
 
+    def _chat_context(self) -> dict[str, Any]:
+        """What the chat_opened / chat_message hooks may use: no private state, only callables."""
+        return {"agent": self.agent, "sessions": self.session_log.path.parent,
+                "say": lambda text: self._add(Note(text)), "switch": self.switch_project,
+                "send": self._send_text}
+
+    def _send_text(self, text: str) -> None:
+        """Run `text` as a turn now (an extension's deferred request), unless one is running."""
+        if self.working:
+            self.notify("Vega is still working. Send it again when the answer is in.",
+                        severity="warning")
+            return
+        self.start_turn(text)
+
+    def switch_project(self, path: Path) -> None:
+        """Work in another folder from here on, keeping the conversation on screen and in the
+        model's history: the agent's per-project state starts over (CodingAgent.change_project),
+        the transcript continues in a new session file for that folder, and the panes re-read."""
+        path = Path(path).expanduser().resolve()
+        if path == self.project:
+            return
+        if not path.is_dir():
+            self._add(Note(f"No folder at {short_path(path)}.", "warning"))
+            return
+        self.session_log.close()
+        self.session_log = SessionLog(self.session_log.path.parent, path)
+        self.project = path
+        self.agent.change_project(path)
+        self.changes = []
+        self.tests_run, self.tests_stamp, self.task_stamp = None, None, None
+        self.git_state, self.problems, self.problem_rows = None, {}, []
+        self.product_turns = []
+        with contextlib.suppress(Exception):  # the header is in every layout; never fatal
+            self.query_one("#path", Static).update(short_path(path))
+        self.query_one("#gauge", ContextGauge).set_usage(context_usage(self.agent))
+        self.read_git()
+        self.read_product()
+        self._refresh_panels()
+        self._add(Note(f"Now working in {short_path(path)}."))
+
     def _command(self, text: str) -> None:
         command, _, argument = text.partition(" ")
         command, argument = command.lower(), argument.strip().lower()
         if command in {"/exit", "/quit"}:
             self._quit()
+            return
+        if command == "/":
+            self.action_open_menu()
             return
         if command == "/help":
             self.action_help()
@@ -1941,8 +2410,8 @@ class VegaApp(App[None]):
             if not argument:
                 others = ", ".join(name for name in LAYOUTS if name != self.layout_name)
                 self._add(Note(f"Layout {self.layout_name}. Others: {others}. Switch with "
-                               "/layout <name>; VEGA_LAYOUT=<name> sets the one Vega starts "
-                               "with."))
+                               "/layout <name> (kept for next time; VEGA_LAYOUT=<name> "
+                               "overrides it for one start)."))
             elif argument in LAYOUTS:
                 self.set_layout(argument)
             else:
@@ -1963,6 +2432,15 @@ class VegaApp(App[None]):
         if command in {"/view", "/pane", "/width", "/steps"}:
             self._view_command(command, argument)
             return
+        if command == "/panel":
+            self._panel_command(argument)
+            return
+        if command == "/theme":
+            self._theme_command(argument)
+            return
+        if command == "/style":
+            self._style_command(argument)
+            return
         if command == "/copy":
             self._copy_command(argument)
             return
@@ -1981,8 +2459,23 @@ class VegaApp(App[None]):
         if command == "/teach":
             self._teach_command(argument)
             return
+        if command == "/resources":
+            self._resources_command(argument)
+            return
         if command == "/product":
             self.action_product_view()
+            return
+        if command == "/project":
+            target = text.partition(" ")[2].strip()  # keep the path's case
+            if not target:
+                self._add(Note(f"Working in {short_path(self.project)}. /project <path> switches "
+                               "to another folder (the conversation stays)."))
+            elif self.working:
+                self.notify("Vega is still working. Switch when the answer is in.",
+                            severity="warning")
+            else:
+                self.switch_project(Path(target).expanduser() if target.startswith(("~", "/"))
+                                    else self.project / target)
             return
         if command == "/ship":
             self._add(Note(tui_product.SHIP_LATER + " The Release checklist (F3) shows what is "
@@ -2145,9 +2638,13 @@ class VegaApp(App[None]):
         if new is None:
             self._add(Note(f"Usage: {usage}", "warning"))
             return
+        layout = view.LAYOUT_PRESETS.get(words[0]) if command == "/view" and words else None
         self.apply_view(new)
-        where = "" if self.layout_name == "workbench" else \
-            " It applies to the workbench layout (/layout workbench)."
+        if layout and layout != self.layout_name:
+            self.set_layout(layout, announce=False)
+            self._save_settings(layout=layout)
+        where = "" if self.columns else \
+            " It applies to the chat and workbench layouts (/layout chat)."
         self._add(Note(f"View saved: {new.describe()}.{where}"))
 
     # turns
@@ -2229,6 +2726,8 @@ class VegaApp(App[None]):
         elif kind == "final":
             turn.finish(str(data.get("text", "")), time.monotonic() - turn.started)
             self._scroll_to_turn(turn)
+            if data.get("questions"):  # presented when the turn is done (_turn_done)
+                self._asked = (str(data.get("text", "")), list(data["questions"]))
 
     def _check_finished(self, entry: Entry) -> None:
         """A run_check result: if it failed, the plan item in progress (else the first one not
@@ -2271,6 +2770,24 @@ class VegaApp(App[None]):
             self._record_product_turn(turn, wrote=bool(new))
             self._scroll_to_turn(turn)
         self.read_product()
+        self._present_questions()
+
+    def _present_questions(self) -> None:
+        """The answer asked the user questions: an extension may present them (a selector) and
+        send the reply as the user's next message; by default the user types it."""
+        asked, self._asked = self._asked, None
+        if asked is None:
+            return
+        text, questions = asked
+        reply = extensions.present_questions(self, questions, text=text, agent=self.agent,
+                                             send=self.send_reply)
+        if reply:
+            self.send_reply(reply)
+
+    def send_reply(self, text: str) -> None:
+        """Send `text` as the user's message, as if typed (ignored while a turn runs)."""
+        if text.strip() and not self.working:
+            self.start_turn(text.strip())
 
     def _show_turn_changes(self, turn: Turn, records: list[ChangeRecord]) -> None:
         """The quiet layout's compact row under a turn that changed files."""
@@ -2297,13 +2814,21 @@ class VegaApp(App[None]):
         """Scroll to the end once the finished turn is laid out; if that hides the start of the
         reply, scroll back to it, keeping the first ⚠ step in view when the steps are open."""
         conversation = self.query_one("#conversation", VerticalScroll)
+        seen = {"height": -1, "tries": 0}
 
         def settle() -> None:
+            seen["height"] = conversation.max_scroll_y
             conversation.scroll_end(animate=False, immediate=True)
             self.call_after_refresh(keep_reply)
 
         def keep_reply() -> None:
             if not turn.is_mounted:
+                return
+            # the content can still grow after the first scroll (expanded steps laid out late on a
+            # busy machine): scroll to the new end again, a few times at most
+            if conversation.max_scroll_y != seen["height"] and seen["tries"] < 3:
+                seen["tries"] += 1
+                settle()
                 return
             top = self._offset_in(conversation, turn.answer)
             if top is None or top >= conversation.scroll_y:
@@ -2633,7 +3158,7 @@ class VegaApp(App[None]):
         text.append(" conversation ", style=label)
         text.append(tokens_label(conversation), style=value)
         text.append(f"\n{g.tick}", style=colours["tick"])
-        text.append(f" compacts at {round(context.COMPACT_AT * 100)}%", style=label)
+        text.append(f" compacts at {round(context.compact_at(gauge.window) * 100)}%", style=label)
 
         def row(name: str, reading: str, note: str = "") -> None:
             text.append("\n" + name.ljust(12), style=label)
@@ -2671,12 +3196,12 @@ class VegaApp(App[None]):
 
     def _pane(self, name: str) -> Any:
         """The workbench pane `name` if the current view shows it, else None."""
-        if self.layout_name != "workbench":
+        if not self.columns:
             return None
         return next(iter(self.query(f"#{PANE_IDS[name]}")), None)
 
     def _refresh_workbench(self) -> None:
-        if self.layout_name != "workbench":
+        if not self.columns:
             return
         self._refresh_files_pane()
         self._refresh_steps_list()
@@ -2878,7 +3403,10 @@ class VegaApp(App[None]):
     def action_cycle_pane(self, step: int) -> None:
         """Tab: in the workbench, move between the panes (each shows a focus ring); elsewhere
         and in dialogs, the usual next/previous control."""
-        if self.screen is not self.default_screen or self.layout_name != "workbench" \
+        if self.menu_open and self.screen is self.default_screen:
+            self.menu_key("tab" if step > 0 else "shift+tab")
+            return
+        if self.screen is not self.default_screen or not self.columns \
                 or self.narrow or self.default_screen.has_class("panel-hidden"):
             if step > 0:
                 self.screen.focus_next()
@@ -2899,7 +3427,7 @@ class VegaApp(App[None]):
     # product view (tui_product.py; the readiness report comes from product.py in a worker)
 
     def _product_shown(self) -> bool:
-        return (self.layout_name == "workbench"
+        return (self.columns
                 and (self.view.mode == "product" or self._pane("product") is not None
                      or self._pane("release") is not None)) \
             or isinstance(self.screen, tui_product.ProductScreen)
@@ -2994,7 +3522,7 @@ class VegaApp(App[None]):
         if (pane := self._pane("release")) is not None:
             self._fill_release_pane(pane)
         strip = self.query_one("#strip", Static)
-        if self.layout_name == "workbench" and self.view.mode == "product":
+        if self.columns and self.view.mode == "product":
             strip.update(tui_product.strip_text(self.product_report, self._tests_figure(),
                                                 max(10, self.size.width - 2), palette(self)))
         self.query_one("#mode", Static).update(
@@ -3059,9 +3587,10 @@ class VegaApp(App[None]):
         if self.screen is not self.default_screen:
             return
         to_product = self.view.mode != "product"
-        target = view.preset("product") if to_product else (self._code_view or view.View())
+        target = view.preset("product") if to_product else (self._code_view or view.preset(
+            "chat" if self.layout_name == "chat" else "workbench"))
         quick = time.monotonic() - self._product_switched < 10
-        if self.layout_name == "workbench" \
+        if self.columns \
                 and self.size.width >= view.preset("product").wide_at():
             if to_product:
                 self._code_view = self.view
@@ -3123,6 +3652,9 @@ class VegaApp(App[None]):
     def _refresh_status(self) -> None:
         """The status bar fits what it can, in priority order: gauge, memory, the ^P panel hint
         (right-aligned), the last reply time, then the other key hints."""
+        if self.layout_name == "chat":
+            self._refresh_chat_status()
+            return
         colours = palette(self)
         width = self.size.width - 2  # #status has one cell of padding each side
         if self.layout_name == "quiet":
@@ -3194,6 +3726,321 @@ class VegaApp(App[None]):
             ordered.append("^P panel")
         self.query_one("#hints", Static).update(Text("  ".join(ordered), style=colours["muted"]))
 
+    def _state_text(self, colours: dict[str, str]) -> Text:
+        if self.awaiting_approval:
+            return Text("waiting for you", style=f"bold {colours['warning']}")
+        if self.working:
+            g = glyphs()
+            seconds = time.monotonic() - (self.turn.started if self.turn else time.monotonic())
+            frame = g.doing if self.animation_level == "none" else \
+                g.spinner[self._frame % len(g.spinner)]
+            dots = g.ellipsis if g.ellipsis == "…" else "..."
+            verb = f"stopping after this step{dots}" if self.agent.stop_requested \
+                else f"working{dots}"
+            return Text(f"{frame} {verb} {seconds:.0f} s", style=colours["accent"])
+        return Text("ready", style=colours["success"])
+
+    def chat_column_width(self) -> int:
+        """The width of the message box and status line: the reading column (CHAT_COLUMN) when
+        the conversation is alone on screen, the full window when panels sit beside it (see
+        tui_chat.tcss)."""
+        screen = self.default_screen
+        alone = (screen.has_class("no-left") and screen.has_class("no-right")) \
+            or screen.has_class("narrow") or screen.has_class("panel-hidden")
+        return min(self.size.width, CHAT_COLUMN) if alone else self.size.width
+
+    def _refresh_chat_status(self) -> None:
+        """The chat layout's one dim line under the message box: state, the live readings (CPU,
+        memory and pressure, swap, the loaded model; /resources), context, folder on the left;
+        on the right the one key that leads everywhere else (Esc while Vega works). Items drop
+        from the right of the left side when the line is short; the state never drops."""
+        colours = palette(self)
+        width = max(10, self.chat_column_width() - 2)
+        self.query_one("#gauge", ContextGauge).display = False
+        header = self.view.chat_style == "gutter"  # the header line carries state and model
+        items: list[tuple[str, str]] = []  # (text, style)
+        live = self.resources_shown() and self.reading is not None
+        if live:  # the 2026-10-28 line: cpu, memory and pressure, swap, the loaded model
+            assert self.reading is not None
+            for text, kind in live_stats.segments(self.reading, self._model_label()):
+                items.append((text, colours["warning"] if kind == "warn" else colours["muted"]))
+        named = live and self.reading is not None and self.reading.model is not None
+        if not header and not named:
+            items.append((self._model_label(), colours["muted"] if live else colours["fg"]))
+        gauge = self.query_one("#gauge", ContextGauge)
+        if "gauge" in self.view.status and gauge.window:
+            share = round(100 * gauge.used / gauge.window)
+            items.append((f"context {share}%", colours["muted"]))
+        if not header:
+            items.append((clip_middle(short_path(self.project), 40), colours["muted"]))
+        if "memory" in self.view.status and self.memory_mb and not live:
+            items.append((f"memory {memory_label(self.memory_mb, self.total_memory_gb)}",
+                          colours["muted"]))
+        if "reply" in self.view.status and self.last_reply is not None:
+            items.append((f"last reply {seconds_label(self.last_reply[0])}", colours["muted"]))
+        needs = sum(row.needs_you for row in self.loop_rows)
+        if needs:
+            items.insert(0, (f"loops {needs} waiting", colours["warning"]))
+        if self.agent.review:
+            items.insert(0, ("review on", colours["warning"]))
+        if self.agent.teach:
+            items.insert(0, (" teach ", f"bold {colours['bg']} on {colours['teach']}"))
+        hint = Text()
+        if "keys" in self.view.status or self.working:
+            if self.working:
+                hint.append("esc", style=f"bold {colours['fg']}")
+                hint.append(" stop", style=colours["muted"])
+            else:
+                hint.append("/", style=f"bold {colours['accent']}")
+                hint.append(" commands", style=colours["muted"])
+                if self.narrow and (self.view.left or self.view.right):
+                    hint.append("   ^P", style=f"bold {colours['fg']}")
+                    hint.append(" panels", style=colours["muted"])
+        line = Text(no_wrap=True, overflow="ellipsis")
+        if not header:
+            state = self._state_text(colours)
+            if not (self.working or self.awaiting_approval):
+                state.stylize(colours["muted"])  # idle: the line stays dim
+            line.append_text(state)
+        room = width - cell_len(hint.plain) - 2
+        for text, style in items:
+            gap = "   " if line.plain else ""
+            if cell_len(line.plain) + len(gap) + cell_len(text) > room:
+                break
+            line.append(gap)
+            line.append(text, style=style)
+        self.query_one("#readouts", Static).update(line)
+        self.query_one("#hints", Static).update(hint)
+
+    # the / menu
+
+    def menu_entries(self) -> list[MenuEntry]:
+        """Everything the / menu offers, built fresh so open panels and the current theme show."""
+        entries = [
+            MenuEntry("/panel", "open or close a panel: files, diff, plan, tests, git, ...",
+                      "panel", "fill"),
+            MenuEntry("/theme", "colours: your terminal's own or a Vega palette", "theme", "fill"),
+            MenuEntry("/view", "presets: chat, workbench, review, monitor, ...", "view", "fill"),
+        ]
+        for command, about in HELP_COMMANDS:
+            name, _, args = command.partition(" ")
+            if name in {"/view", "/theme", "/panel"}:
+                continue
+            entries.append(MenuEntry(name, about, then="fill" if args and "[" not in args
+                                     else "run"))
+        for name, about in view.PANES.items():
+            title = view.PANE_TITLES[name]
+            entries.append(MenuEntry(f"/panel {name}", f"{title}: {about[0].lower()}{about[1:]}",
+                                     "panel", top=False,
+                                     state="open" if self.view.column(name) else ""))
+        for family in view.THEMES:
+            if family == "layout":
+                swatch: tuple[str, ...] = ()
+            else:
+                theme = THEME_FAMILIES[family][self.mode]
+                swatch = tuple(rich_colour(c) for c in (
+                    theme.background or "", theme.accent or "", theme.success or "",
+                    theme.error or ""))
+                if family == "terminal":
+                    swatch = swatch[1:]  # its background is the terminal's
+            entries.append(MenuEntry(f"/theme {family}", THEME_ABOUT[family], "theme", top=False,
+                                     state="current" if family == self.theme_family else "",
+                                     swatch=swatch))
+        entries.append(MenuEntry("/theme light", "light background colours", "theme", top=False))
+        entries.append(MenuEntry("/theme dark", "dark background colours", "theme", top=False))
+        for name, (_, about) in view.PRESETS.items():
+            entries.append(MenuEntry(f"/view {name}", about, "view", top=False,
+                                     state="current" if name == self.view.preset else ""))
+        for name in LAYOUTS:
+            entries.append(MenuEntry(f"/layout {name}", LAYOUT_ABOUT[name], "layout", top=False,
+                                     state="current" if name == self.layout_name else ""))
+        for name in view.CHAT_STYLES:
+            entries.append(MenuEntry(f"/style {name}", CHAT_STYLE_ABOUT[name], "style",
+                                     top=False,
+                                     state="current" if name == self.view.chat_style else ""))
+        return entries
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if isinstance(event.text_area, PromptInput):
+            self._update_menu()
+
+    def _update_menu(self) -> None:
+        prompt = self.query_one("#prompt", PromptInput)
+        menu = self.query_one("#menu", SlashMenu)
+        text = prompt.text
+        wanted = (text.startswith("/") and "\n" not in text and prompt._browse is None
+                  and text != self._menu_closed_for and self.screen is self.default_screen)
+        matches = menu_matches(self.menu_entries(), text) if wanted else []
+        if not matches:
+            self._close_menu()
+            return
+        if text != self._menu_closed_for:
+            self._menu_closed_for = None
+        menu.show(matches[:40], max(20, self.size.width - 4), palette(self))
+        menu.styles.max_height = max(3, min(12, self.size.height - 8))
+        menu.display = True
+        self.menu_open = True
+        self._preview_menu_theme()
+
+    def _close_menu(self, *, keep_preview: bool = False) -> None:
+        menu = self.query_one("#menu", SlashMenu)
+        menu.display = False
+        self.menu_open = False
+        if self._menu_theme is not None and not keep_preview:
+            self.theme = self._menu_theme
+            self._restyle()
+        self._menu_theme = None
+
+    def _preview_menu_theme(self) -> None:
+        """Arrowing over /theme NAME shows that theme behind the menu; leaving puts yours back."""
+        menu = self.query_one("#menu", SlashMenu)
+        entry = menu.entries[menu.highlighted] if menu.highlighted is not None else None
+        family = entry.command.split()[-1] if entry and entry.command.startswith("/theme ") \
+            else None
+        if family in view.THEMES:
+            if self._menu_theme is None:
+                self._menu_theme = self.theme
+            name = self._theme_name(family)
+            if self.theme != name:
+                self.theme = name
+                self._restyle()
+        elif self._menu_theme is not None:
+            self.theme, self._menu_theme = self._menu_theme, None
+            self._restyle()
+
+    def menu_key(self, key: str) -> bool:
+        """A key typed in the input while the menu is open; True when the menu used it."""
+        menu = self.query_one("#menu", SlashMenu)
+        prompt = self.query_one("#prompt", PromptInput)
+        if key == "escape":
+            self._menu_closed_for = prompt.text
+            self._close_menu()
+            return True
+        if not menu.entries:
+            return False
+        index = menu.highlighted or 0
+        if key in {"up", "down", "shift+tab"}:
+            step = -1 if key in {"up", "shift+tab"} else 1
+            menu.move((index + step) % len(menu.entries))
+            self._preview_menu_theme()
+            return True
+        entry = menu.entries[index]
+        typed = prompt.text.strip().lower()
+        if key == "enter" and not entry.command.lower().startswith(typed):
+            return False  # a word match only ("/review on"): Enter sends what was typed
+        if key == "tab" or (key == "enter" and entry.then == "fill"
+                            and prompt.text.strip() != entry.command):
+            prompt.load_text(entry.command + " ")
+            prompt.move_cursor(prompt.document.end)
+            return True
+        if key == "enter":
+            prompt.remember(entry.command)
+            self._close_menu(keep_preview=entry.group == "theme")
+            prompt.load_text("")
+            self._command(entry.command)
+            return True
+        return False
+
+    def action_open_menu(self) -> None:
+        """Ctrl+K: the / menu, from wherever the focus is."""
+        if self.screen is not self.default_screen:
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.focus()
+        self._menu_closed_for = None
+        if not prompt.text.startswith("/"):
+            prompt.load_text("/")
+        prompt.move_cursor(prompt.document.end)
+        self._update_menu()
+
+    # commands for the chat layout: panels, themes, styles
+
+    def _panel_command(self, argument: str) -> None:
+        names = argument.split()
+        if not names:
+            rows = [f"{view.PANE_TITLES[n]} ({n}){' - open' if self.view.column(n) else ''}"
+                    for n in view.PANES]
+            self._add(Note("Panels: " + ", ".join(rows) + ". /panel NAME opens or closes one; "
+                           "/panel close closes them all.", "output"))
+            return
+        if names == ["close"] or names == ["none"]:
+            from dataclasses import replace
+
+            new = replace(self.view, left=(), right=(), preset="custom")
+        elif all(name in view.PANES for name in names):
+            new = self.view
+            for name in names:
+                new = view.toggle_pane(new, name)
+        else:
+            unknown = ", ".join(n for n in names if n not in view.PANES)
+            self._add(Note(f"No panel called {unknown}. Choose from "
+                           f"{', '.join(view.PANES)}.", "warning"))
+            return
+        if not self.columns:
+            self.set_layout("chat", announce=False)
+            self._save_settings(layout="chat")
+        self.apply_view(new)
+        opened = [view.PANE_TITLES[n] for n in names if new.column(n)]
+        if self.narrow and (new.left or new.right):
+            needed = new.wide_at()
+            self._add(Note(f"{', '.join(opened) or 'Panels'} need a window at least {needed} "
+                           f"columns wide (this one is {self.size.width}); Ctrl+P shows "
+                           "the details over the conversation until then.", "warning"))
+
+    def _theme_command(self, argument: str) -> None:
+        if not argument:
+            lines = Text()
+            colours = palette(self)
+            for family in view.THEMES:
+                mark = "current" if family == self.theme_family else ""
+                lines.append(f"\n  {family.ljust(12)}", style=f"bold {colours['fg']}")
+                if family != "layout":
+                    theme = THEME_FAMILIES[family][self.mode]
+                    for colour in (theme.background, theme.accent, theme.success, theme.error):
+                        if colour and not (family == "terminal" and colour == theme.background):
+                            lines.append("██", style=rich_colour(colour))
+                    lines.append(" ")
+                lines.append(THEME_ABOUT[family], style=colours["muted"])
+                if mark:
+                    lines.append(f"  {mark}", style=colours["accent"])
+            head = Text(f"Theme {self.theme_family}, {self.mode}. /theme NAME switches; "
+                        "/theme light or dark sets the background kind.",
+                        style=colours["fg"])
+            self._add(Note(head + lines, "output"))
+            return
+        if argument in {"light", "dark", "auto"}:
+            self.mode = argument if argument != "auto" else default_appearance()
+            self._save_settings(appearance=argument)
+        elif argument in view.THEMES:
+            if self.no_color and argument != "terminal":
+                self._add(Note("NO_COLOR is set, so Vega keeps your terminal's colours.",
+                               "warning"))
+                return
+            self.theme_family = argument
+            self._save_settings(theme=argument)
+        else:
+            self._add(Note(f"No theme called {argument}. Choose from "
+                           f"{', '.join(view.THEMES)}, or light, dark or auto.", "warning"))
+            return
+        self._apply_theme()
+        self._add(Note(f"Theme {self.theme_family} ({self.mode}), kept for next time."))
+
+    def _style_command(self, argument: str) -> None:
+        if argument not in view.CHAT_STYLES:
+            about = "; ".join(f"{n}: {CHAT_STYLE_ABOUT[n]}" for n in view.CHAT_STYLES)
+            self._add(Note(f"Chat style {self.view.chat_style}. Styles: {about}. "
+                           "/style NAME switches.", "output" if not argument else "warning"))
+            return
+        self._save_settings(chat_style=argument)
+        for style in view.CHAT_STYLES:
+            self.set_class(style == argument, f"style-{style}")
+        for gutter in self.query(Gutter):
+            gutter.refresh()
+        self._refresh_status()
+        self._add(Note(f"Chat style {argument}, kept for next time."
+                       + ("" if self.layout_name == "chat" else " It shows in the chat layout "
+                          "(/layout chat).")))
+
     def _read_memory(self) -> None:
         def read() -> None:
             try:
@@ -3204,6 +4051,50 @@ class VegaApp(App[None]):
             self.call_from_thread(self._memory_read, value, swap)
 
         self.run_worker(read, thread=True, group="memory", exclusive=True, exit_on_error=False)
+
+    def resources_shown(self) -> bool:
+        """The live readings show in the chat layout unless /resources off (or VEGA_RESOURCES=0)
+        turned them off."""
+        if os.environ.get("VEGA_RESOURCES", "").strip().lower() in {"0", "off", "false"}:
+            return False
+        return self.layout_name == "chat" and self.view.resources
+
+    def _read_resources(self) -> None:
+        """Every RESOURCES_EVERY seconds, in a worker thread: CPU, memory, swap and the loaded
+        model for the chat status line. Only the status line's text changes (no focus moves)."""
+        if not self.resources_shown():
+            return
+
+        def read() -> None:
+            try:
+                reading = self.resource_probe()
+            except Exception:  # noqa: BLE001 - the readings are optional
+                return
+            self.call_from_thread(self._resources_read, reading)
+
+        self.run_worker(read, thread=True, group="resources", exclusive=True,
+                        exit_on_error=False)
+
+    def _resources_read(self, reading: live_stats.Reading) -> None:
+        self.reading = reading
+        if self.layout_name == "chat":
+            self._refresh_chat_status()
+
+    def _resources_command(self, argument: str) -> None:
+        if argument not in {"", "on", "off"}:
+            self._add(Note("Usage: /resources on|off", "warning"))
+            return
+        if argument:
+            self.view = view.with_resources(self.view, argument == "on")
+            try:
+                view.save(self.view)
+            except OSError as exc:
+                self.notify(f"Couldn't save the setting: {exc}", severity="warning")
+            self._read_resources()
+            self._refresh_status()
+        state = "on" if self.view.resources else "off"
+        self._add(Note(f"Live resources in the status line: {state} (CPU, memory and pressure, "
+                       "swap, the loaded model). /resources on|off changes it."))
 
     def _read_loops(self) -> None:
         """Every LOOPS_EVERY seconds: rows for the Loops pane, the ^P panel and the status bar."""
@@ -3818,6 +4709,8 @@ class VegaApp(App[None]):
         self._refresh_machine()
 
     def _set_state(self) -> None:
+        if self.layout_name == "chat":
+            self._refresh_chat_status()
         state = self.query_one("#state", Static)
         colours = palette(self)
         if self.awaiting_approval:
@@ -4079,6 +4972,15 @@ class VegaApp(App[None]):
 
     def action_toggle_panel(self) -> None:
         screen = self.default_screen
+        if self.layout_name == "chat" and not (self.view.left or self.view.right):
+            if self.screen is self.default_screen:
+                prompt = self.query_one("#prompt", PromptInput)
+                prompt.focus()
+                self._menu_closed_for = None
+                prompt.load_text("/panel ")
+                prompt.move_cursor(prompt.document.end)
+                self._update_menu()
+            return
         if self.narrow or self.layout_name == "quiet":
             screen.toggle_class("panel-overlay")
             self.panel_open = screen.has_class("panel-overlay")
@@ -4090,8 +4992,8 @@ class VegaApp(App[None]):
 
     def action_toggle_theme(self) -> None:
         self.mode = "light" if self.mode == "dark" else "dark"
-        self.theme = LAYOUT_THEMES[self.layout_name][self.mode].name
-        self._restyle()
+        self._save_settings(appearance=self.mode)
+        self._apply_theme()
 
     def action_clear_view(self) -> None:
         for child in list(self.query_one("#conversation").children):
@@ -4099,9 +5001,9 @@ class VegaApp(App[None]):
                 child.remove()
 
     def action_customize(self) -> None:
-        if self.layout_name != "workbench":
-            self.notify("Customizing applies to the workbench layout: /layout workbench first.",
-                        severity="warning")
+        if not self.columns:
+            self.notify("Customizing applies to the chat and workbench layouts: /layout chat "
+                        "first.", severity="warning")
             return
         if self.screen is self.default_screen:
             self.push_screen(ViewScreen(self.view))
@@ -4163,76 +5065,25 @@ def file_row(path: str, added: int, removed: int, width: int, counts_w: int, g: 
     return text
 
 
-# xterm window operations (CSI 8 ; rows ; cols t): Terminal.app, iTerm2 and most Linux terminals resize
-# the window; terminals that do not support it ignore the sequence. A very large size is clamped to the
-# screen, which fills it like a desktop app.
-_RESIZE = "\x1b[8;{rows};{cols}t"
-_FILL_SCREEN = (999, 999)
-
-
-def _window_resizable(stream: Any = None) -> bool:
-    """Resize only a real terminal we can talk to directly: not when switched off (VEGA_WINDOW=keep),
-    piped, inside tmux/screen (they swallow or misroute it) or on Windows consoles."""
-    stream = stream or sys.__stdout__
-    if os.environ.get("VEGA_WINDOW", "").strip().lower() in {"keep", "off", "0", "no"}:
+def needs_appearance(saved: view.View) -> bool:
+    """Whether the terminal must be asked light or dark: only for the terminal theme (the others
+    carry their own background) and only when nothing else has said."""
+    if os.environ.get("VEGA_THEME", "").strip().lower() in {"dark", "light"}:
         return False
-    if os.name == "nt" or os.environ.get("TMUX") or os.environ.get("STY"):
+    if saved.appearance in {"dark", "light"} or colorfgbg_appearance() is not None:
         return False
-    try:
-        return bool(stream and stream.isatty())
-    except (AttributeError, ValueError):
-        return False
-
-
-def _resize_window(rows: int, cols: int, stream: Any = None) -> None:
-    stream = stream or sys.__stdout__
-    stream.write(_RESIZE.format(rows=rows, cols=cols))
-    stream.flush()
-
-
-def _wait_for_new_size(before: tuple[int, int], fileno: int, limit: float = 1.5,
-                       settle: float = 0.15, size: Any = os.get_terminal_size,
-                       sleep: Any = time.sleep, clock: Any = time.monotonic) -> tuple[int, int]:
-    """The terminal resizes asynchronously. Starting the app before it is done made Textual lay out
-    for the old, small window (side columns collapsed, stale borders) and it never saw the change:
-    wait until the size differs from `before` and has stopped changing, or `limit` passes."""
-    deadline = clock() + limit
-    current = before
-    changed_at = None
-    while clock() < deadline:
-        now = size(fileno)
-        now = (now.lines, now.columns)
-        if now != current:
-            current, changed_at = now, clock()
-        elif changed_at is not None and clock() - changed_at >= settle:
-            break
-        sleep(0.03)
-    return current
+    return saved.theme == "terminal"
 
 
 def run_tui(project: Path, *, review: bool = False, undo_depth: int = 20,
             teach: bool | None = None) -> None:
-    """Open the full-screen chat for `project` (blocks until the user quits). The terminal window
-    grows to fill the screen while Vega runs and returns to its size afterwards."""
-    original = None
-    if _window_resizable():
-        try:
-            fileno = sys.__stdout__.fileno()
-            size = os.get_terminal_size(fileno)
-            original = (size.lines, size.columns)
-            _resize_window(*_FILL_SCREEN)
-            _wait_for_new_size(original, fileno)
-        except (OSError, ValueError):
-            original = None
+    """Open the full-screen chat for `project` (blocks until the user quits). The window keeps
+    the size the user gave it (Vega never resizes it; 2026-10-24)."""
+    global DETECTED_APPEARANCE
+    if needs_appearance(view.load()):
+        DETECTED_APPEARANCE = query_terminal_appearance()
     app = VegaApp(project, review=review, undo_depth=undo_depth, teach=teach)
-    try:
-        app.run()
-    finally:
-        if original is not None:
-            try:
-                _resize_window(*original)
-            except (OSError, ValueError):
-                pass
+    app.run()
     if getattr(app, "forced_exit", False):
         # A model reply or command may still be running in the worker thread: do not wait for it.
         sys.stdout.flush()

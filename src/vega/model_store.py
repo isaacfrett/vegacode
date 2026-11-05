@@ -13,7 +13,16 @@ disk through Ollama's HTTP API (/api/tags, /api/pull, /api/delete). Rules:
   (server/routes.go DeleteHandler -> manifest.RemoveNamed -> RemoveUnreferencedBlobs, which skips
   every digest a remaining manifest retains), so a shared weights file stays. The space shown
   before removal is computed the same way from Ollama's manifests on disk when they are readable.
-- Size rule: models under 10B parameters only (catalogue entries, and any tag naming its size).
+- Memory rule (owner, 2026-10-28; replaced "under 10B parameters"): the minimum-requirements
+  machine is a 16 GB Apple silicon Mac, and a model qualifies when it runs there within the memory
+  budget: its loaded size at its quantization (Ollama /api/ps `size`: weights + context cache +
+  compute buffers) is at most MEMORY_BUDGET_GB = 10 GB (VEGA_MODEL_MEMORY_BUDGET_GB changes it),
+  measured on that machine with Vega running. A measured loaded size (catalogue
+  `loaded_gb`, from `vega lab bench model-screen`) decides; otherwise the estimate `size x 1.25 +
+  2 GB` from the download size is used; a model whose size is unknown is listed as "size unknown,
+  measure first", never dropped. Models over the budget are out of scope (listed as such, never
+  comparison targets). Parameter count no longer decides: a mixture-of-experts model needs memory
+  for its TOTAL parameters (every expert is loaded) and runs at the speed of its ACTIVE ones.
 - Network: only `pull` and `watch --online` go online; everything else is local.
 """
 
@@ -36,7 +45,10 @@ from . import models, server
 
 CATALOG_FILE = Path(os.getenv("VEGA_MODEL_CATALOG", Path(__file__).with_name("model_catalog.toml")))
 GB = 1e9  # sizes are shown in GB (10^9 bytes), as Ollama and the library show them
-MAX_PARAMS_B = 10.0
+MEMORY_BUDGET_GB = 10.0  # loaded size a model may have on the 16 GB minimum-requirements machine
+MIN_MACHINE = "16 GB Apple silicon Mac"
+TOOL_CALLING = ("yes", "no", "unverified")
+ARCHITECTURES = ("dense", "moe", "hybrid", "hybrid-moe")
 GB_PER_BILLION = 0.62  # a 4-bit (Q4_K_M) download per billion parameters: 8.8B -> 5.35 GB measured
 FIT_RATIO, TIGHT_RATIO = 0.60, 0.85
 WATCH_FAMILIES = ("granite", "qwen", "llama", "gemma", "phi", "mistral", "deepseek-coder")
@@ -60,6 +72,61 @@ def min_free_gb() -> float:
 
 def ram_needed_gb(size_gb: float) -> float:
     return size_gb * 1.25 + 2.0
+
+
+def memory_budget_gb() -> float:
+    """The loaded-size budget in GB (VEGA_MODEL_MEMORY_BUDGET_GB, default MEMORY_BUDGET_GB)."""
+    try:
+        value = float(os.environ.get("VEGA_MODEL_MEMORY_BUDGET_GB", MEMORY_BUDGET_GB))
+    except ValueError:
+        return MEMORY_BUDGET_GB
+    return value if value > 0 else MEMORY_BUDGET_GB
+
+
+@dataclass(frozen=True)
+class Budget:
+    """Where a model stands against the memory budget."""
+    state: str  # "within", "over" or "unknown"
+    loaded_gb: float | None  # the measured loaded size, else the estimate, else None
+    measured: bool
+    budget_gb: float
+
+    @property
+    def over(self) -> bool:
+        return self.state == "over"
+
+    @property
+    def text(self) -> str:
+        if self.state == "unknown":
+            return "size unknown, measure first"
+        how = "measured" if self.measured else "estimated"
+        gb = f"{self.loaded_gb:.1f} GB loaded ({how})"
+        if self.state == "within":
+            return f"within the {self.budget_gb:g} GB budget: {gb}" + (
+                "" if self.measured else "; measure to confirm")
+        return f"over the {self.budget_gb:g} GB budget: {gb}" + (
+            "" if self.measured else "; out of scope unless measured under")
+
+
+def budget_check(size_gb: float | None = None, loaded_gb: float | None = None,
+                 budget_gb: float | None = None, params_b: float | None = None) -> Budget:
+    """A measured loaded size decides; else the estimate from the download size (size x 1.25 +
+    2 GB, the fit rule's RAM need); else from the total parameter count at 4 bits
+    (GB_PER_BILLION); with none of them the state is "unknown" (list it, measure first)."""
+    budget = memory_budget_gb() if budget_gb is None else budget_gb
+    if loaded_gb:
+        return Budget("within" if loaded_gb <= budget else "over", loaded_gb, True, budget)
+    if not size_gb and params_b:
+        size_gb = params_b * GB_PER_BILLION
+    if size_gb:
+        need = ram_needed_gb(size_gb)
+        return Budget("within" if need <= budget else "over", need, False, budget)
+    return Budget("unknown", None, False, budget)
+
+
+BUDGET_RULE = (f"minimum requirements: {MIN_MACHINE}; a model qualifies when it runs there "
+               f"within the memory budget (loaded size <= {MEMORY_BUDGET_GB:g} GB by default, "
+               "VEGA_MODEL_MEMORY_BUDGET_GB), measured with Vega running")
 
 
 def fit(size_gb: float | None, total_ram_gb: float | None) -> str:
@@ -134,6 +201,25 @@ class CatalogEntry:
     measured_on: str = ""
     notes: str = ""
     scores: dict[str, Score] = field(default_factory=dict)
+    label: str = ""  # display name, e.g. "Granite 8B" (default: the catalogue name)
+    active_params_b: float | None = None  # mixture-of-experts: parameters used per token
+    architecture: str = "dense"  # dense, moe, hybrid (Mamba-2 + attention) or hybrid-moe
+    quant: str = ""  # quantization of the download, e.g. Q4_K_M, MXFP4
+    tool_calling: str = "unverified"  # Ollama tool calling: yes / no / unverified
+    loaded_gb: float | None = None  # measured loaded size (/api/ps) on the minimum machine
+    status: str = ""  # e.g. "not screened", "out of scope": shown with the entry
+    verified: str = ""  # which fields were checked where and when (the rest are unverified)
+    features_off: list[str] = field(default_factory=list)  # defaults the profile turns off (e.g. plan)
+    renderer: str = ""  # Ollama renderer for the profile's Modelfile (RENDERER; a Hugging Face GGUF)
+    parser: str = ""  # Ollama reply parser (PARSER), the same
+
+    @property
+    def display(self) -> str:
+        return self.label or self.name
+
+    @property
+    def budget(self) -> Budget:
+        return budget_check(self.download_gb, self.loaded_gb)
 
     @property
     def measured(self) -> bool:
@@ -162,11 +248,18 @@ def load_catalog(path: Path | None = None, scores_path: Path | None = None
                  ) -> dict[str, CatalogEntry]:
     """The catalogue with measured scores merged in from the scores file where it exists. Scores
     for a name the catalogue no longer lists are ignored (a dropped model keeps its history)."""
+    shipped = path is None
     path = path or CATALOG_FILE
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     measured = load_scores(scores_path)
     entries: dict[str, CatalogEntry] = {}
-    for name, raw in data.get("models", {}).items():
+    listed = dict(data.get("models", {}))
+    if shipped:  # an extension's own entries (extensions.catalog_models): the file's win
+        from . import extensions
+
+        for name, raw in extensions.catalog_models().items():
+            listed.setdefault(name, raw)
+    for name, raw in listed.items():
         raw = {**raw, **measured.get(name, {})}
         try:
             scores = {suite: Score(int(s["passed"]), int(s["total"]), str(s.get("commit", "")),
@@ -182,13 +275,27 @@ def load_catalog(path: Path | None = None, scores_path: Path | None = None
                 temperature=float(raw["temperature"]) if "temperature" in raw else None,
                 request=dict(raw.get("request", {})), features_on=list(raw.get("features_on", [])),
                 measured_on=str(raw.get("measured_on", "")), notes=str(raw.get("notes", "")),
-                scores=scores,
+                scores=scores, label=str(raw.get("label", "")),
+                active_params_b=(float(raw["active_params_b"]) if "active_params_b" in raw
+                                 else None),
+                architecture=str(raw.get("architecture", "dense")), quant=str(raw.get("quant", "")),
+                tool_calling=str(raw.get("tool_calling", "unverified")),
+                loaded_gb=float(raw["loaded_gb"]) if "loaded_gb" in raw else None,
+                status=str(raw.get("status", "")), verified=str(raw.get("verified", "")),
+                features_off=list(raw.get("features_off", [])), renderer=str(raw.get("renderer", "")),
+                parser=str(raw.get("parser", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Catalogue entry {name!r} in {path.name}: {exc}") from exc
-        if entry.params_b >= MAX_PARAMS_B:
-            raise ValueError(f"Catalogue entry {name!r} has {entry.params_b}B parameters; Vega's "
-                             f"catalogue lists models under {MAX_PARAMS_B:.0f}B only.")
+        if entry.architecture not in ARCHITECTURES:
+            raise ValueError(f"Catalogue entry {name!r}: architecture must be one of "
+                             f"{', '.join(ARCHITECTURES)}.")
+        if entry.tool_calling not in TOOL_CALLING:
+            raise ValueError(f"Catalogue entry {name!r}: tool_calling must be one of "
+                             f"{', '.join(TOOL_CALLING)}.")
+        if entry.default and entry.budget.over:
+            raise ValueError(f"Catalogue entry {name!r} is the default but is "
+                             f"{entry.budget.text}.")
         if entry.scores and not entry.measured_on:
             raise ValueError(f"Catalogue entry {name!r} has scores but no measured_on date.")
         entries[name] = entry
@@ -385,10 +492,19 @@ class ModelRow:
     licence: str = ""
     note: str = ""
     size_estimated: bool = False  # from the parameter count (4-bit), not Ollama or the catalogue
+    loaded_gb: float | None = None  # measured loaded size (catalogue), decides the budget
+
+    @property
+    def budget(self) -> Budget:
+        if self.endpoint:  # another server's weights: not Vega's memory to budget
+            return budget_check()
+        return budget_check(self.size_gb, self.loaded_gb, params_b=self.params_b)
 
     @property
     def over_limit(self) -> bool:
-        return self.params_b is not None and self.params_b >= MAX_PARAMS_B
+        """Over the memory budget (measured, or estimated from the size): out of scope on the
+        minimum-requirements machine."""
+        return self.budget.over
 
 
 @dataclass
@@ -493,7 +609,8 @@ def inventory(*, tags: list[dict[str, Any]] | None = None, total_ram_gb: float |
             active=name == (active or default), default=name == default,
             endpoint=profile.endpoint, scores=score_map(name, same), catalogued=entry is not None,
             shipped_default=bool(same and same.default), params_b=params,
-            licence=entry.licence if entry else "", note=profile.description))
+            licence=entry.licence if entry else "", note=profile.description,
+            loaded_gb=entry.loaded_gb if entry else None))
         used.add(canonical(profile.base))
     for name, entry in catalog.items():
         if name in profiles or canonical(entry.tag) in used:
@@ -503,7 +620,9 @@ def inventory(*, tags: list[dict[str, Any]] | None = None, total_ram_gb: float |
             name=name, tag=entry.tag, kind="catalogue", size_gb=size,
             downloaded=canonical(entry.tag) in by_name, fit=fit(size, total_ram_gb),
             scores=score_map(name, entry), catalogued=True, shipped_default=entry.default,
-            params_b=entry.params_b, licence=entry.licence, note=entry.notes))
+            params_b=entry.params_b, licence=entry.licence,
+            note=(f"{entry.status}. " if entry.status else "") + entry.notes,
+            loaded_gb=entry.loaded_gb))
         used.add(canonical(entry.tag))
     for key, item in by_name.items():
         bare = key.removesuffix(":latest")
@@ -534,6 +653,7 @@ class PullPlan:
     new_profile: CatalogEntry | None = None  # catalogue entry to add as a profile first
     refusal: str = ""
     warnings: list[str] = field(default_factory=list)
+    budget: Budget | None = None
 
     @property
     def free_after_gb(self) -> float:
@@ -568,9 +688,11 @@ def _fetch_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
 
 def plan_pull(target: str, *, tags: list[dict[str, Any]] | None = None,
               catalog: dict[str, CatalogEntry] | None = None, free_gb: float | None = None,
-              size_lookup: Callable[[str], float | None] | None = None) -> PullPlan:
+              size_lookup: Callable[[str], float | None] | None = None,
+              measure: bool = False) -> PullPlan:
     """Resolve a profile, catalogue name or Ollama model name to what will be downloaded, and
-    whether the disk and size rules allow it (refusal is set when they do not)."""
+    whether the disk and memory rules allow it (refusal is set when they do not). `measure`:
+    allow a model the estimate puts over the memory budget, to measure its real loaded size."""
     catalog = catalog if catalog is not None else load_catalog()
     tags = tags if tags is not None else (installed() or [])
     by_name = {canonical(t.get("name", "")): t for t in tags}
@@ -606,9 +728,13 @@ def plan_pull(target: str, *, tags: list[dict[str, Any]] | None = None,
         if not size and entry:
             size, source = entry.download_gb, "catalogue"
     plan = PullPlan(target, tag, name, size, source, free, params, already, new_profile)
-    if params is not None and params >= MAX_PARAMS_B:
-        plan.refusal = (f"{tag} has {params:g}B parameters; Vega uses models under "
-                        f"{MAX_PARAMS_B:.0f}B only.")
+    plan.budget = budget_check(size, entry.loaded_gb if entry else None, params_b=params)
+    if plan.budget.over and not (measure and not plan.budget.measured):
+        plan.refusal = (f"{tag} is {plan.budget.text}. Vega's minimum requirements are a "
+                        f"{MIN_MACHINE}; models over the memory budget are out of scope"
+                        + ("." if plan.budget.measured else
+                           " (--measure downloads it anyway to measure the real loaded size "
+                           "with `vega lab bench model-screen`)."))
     elif not already and size is None:
         plan.refusal = (f"The download size of {tag} is unknown (the registry did not answer and it "
                         "is not in the catalogue), so the 12 GB free-disk rule cannot be checked. "
@@ -617,9 +743,12 @@ def plan_pull(target: str, *, tags: list[dict[str, Any]] | None = None,
         plan.refusal = (f"Downloading {tag} ({size:.1f} GB) would leave {plan.free_after_gb:.1f} GB "
                         f"free; Vega keeps at least {min_free_gb():.0f} GB free. Free space first "
                         "(vega model rm <name>).")
-    if params is None:
-        plan.warnings.append(f"The parameter count of {tag} is unknown; Vega uses models under "
-                             f"{MAX_PARAMS_B:.0f}B only.")
+    if plan.budget.state == "unknown":
+        plan.warnings.append(f"The memory need of {tag} is unknown (size unknown, measure first): "
+                             f"check its loaded size against the {plan.budget.budget_gb:g} GB "
+                             "budget with `vega lab bench model-screen` after the download.")
+    elif plan.budget.over and measure:
+        plan.warnings.append(f"{tag} is {plan.budget.text}; downloading only to measure it.")
     if name is None:
         plan.warnings.append(f"{tag} is not a profile; after the download add one with "
                              f"`vega model add NAME --base {tag}`.")
@@ -677,6 +806,11 @@ def add_catalog_profile(entry: CatalogEntry) -> models.Profile:
     extra = []
     if entry.features_on:
         extra.append(f"features_on = {models._toml_value(entry.features_on)}")
+    if entry.features_off:
+        extra.append(f"features_off = {models._toml_value(entry.features_off)}")
+    for key in ("renderer", "parser"):
+        if getattr(entry, key):
+            extra.append(f"{key} = {models._toml_value(getattr(entry, key))}")
     if entry.temperature is not None:
         extra.append(f"[profiles.{entry.name}.parameters]\ntemperature = {entry.temperature!r}")
     if extra:
@@ -794,21 +928,25 @@ def composite(entry: CatalogEntry) -> float | None:
 
 
 def recommend(total_ram_gb: float | None, *, tags: list[dict[str, Any]] | None = None,
-              catalog: dict[str, CatalogEntry] | None = None) -> Recommendation | None:
+              catalog: dict[str, CatalogEntry] | None = None,
+              allowed: Callable[[CatalogEntry], bool] | None = None) -> Recommendation | None:
     """Best catalogue model for this machine: measured models that fit first (by mean pass rate on
     fixes, goals, HumanEval+ and MBPP+, the shipped default winning ties), then tight ones, then
-    unmeasured ones (the default first, then smallest). Installed models win exact ties. With no
-    scores at all (the public release) that is the default when it fits."""
+    unmeasured ones (the default first, then the fallback, then smallest). Installed models win
+    exact ties. With no scores at all (the public release) that is the default when it fits.
+    `allowed` drops entries for another reason (first-run setup: not enough free disk)."""
     catalog = catalog if catalog is not None else load_catalog()
     have = {canonical(t.get("name", "")) for t in (tags or [])}
     ranked = []
     for entry in catalog.values():
         verdict = fit(entry.download_gb, total_ram_gb)
-        if verdict == "won't fit":
+        if verdict == "won't fit" or (allowed is not None and not allowed(entry)):
+            continue
+        if entry.budget.over or entry.tool_calling == "no":  # out of scope / cannot drive tools
             continue
         score = composite(entry)
         key = (verdict != "fits", score is None, -(score or 0.0), not entry.default,
-               canonical(entry.tag) not in have, entry.download_gb)
+               not entry.fallback, canonical(entry.tag) not in have, entry.download_gb)
         ranked.append((key, entry, verdict))
     if not ranked:
         return None
@@ -849,6 +987,11 @@ class Candidate:
     name: str = ""  # catalogue name / suggested profile name
     note: str = ""
     new: bool = True  # not reported by an earlier online check
+    loaded_gb: float | None = None  # measured loaded size, when known
+
+    @property
+    def budget(self) -> Budget:
+        return budget_check(self.size_gb, self.loaded_gb, params_b=self.params_b)
 
 
 def _watch_file() -> Path:
@@ -870,10 +1013,10 @@ def watch_offline(*, tags: list[dict[str, Any]] | None = None,
     bases = {canonical(p.base) for p in profiles.values()}
     out: list[Candidate] = []
     for entry in catalog.values():
-        if entry.name in profiles or canonical(entry.tag) in bases:
+        if entry.name in profiles or canonical(entry.tag) in bases or entry.budget.over:
             continue
         out.append(Candidate(entry.tag, "catalogue", entry.download_gb, entry.params_b,
-                             entry.name, entry.notes))
+                             entry.name, entry.notes, loaded_gb=entry.loaded_gb))
     known = bases | {canonical(e.tag) for e in catalog.values()}
     for item in tags:
         name = canonical(item.get("name", ""))
@@ -882,23 +1025,37 @@ def watch_offline(*, tags: list[dict[str, Any]] | None = None,
             continue
         detail = item.get("details") or {}
         params = parse_parameter_size(detail.get("parameter_size", "")) or params_from_tag(name)
-        if params is not None and params >= MAX_PARAMS_B:
+        size = float(item.get("size", 0)) / GB or None
+        if budget_check(size, params_b=params).over:
             continue
-        out.append(Candidate(name, "ollama", float(item.get("size", 0)) / GB or None, params,
+        out.append(Candidate(name, "ollama", size, params,
                              suggested_profile_name(name), "installed in Ollama; no profile"))
     return out
 
 
 _LIBRARY_LINK = re.compile(r'href="/library/([a-z0-9][a-z0-9._-]*)(?::([A-Za-z0-9._-]+))?"')
+_PUBLISHED_SIZE = re.compile(r"[\u2022\u00b7]\s*(\d+(?:\.\d+)?)\s*(GB|MB|TB)\s*[\u2022\u00b7]")
+
+
+def published_size_gb(page: str, start: int, window: int = 1500) -> float | None:
+    """The size the library's tags page shows after a tag link (`566b725534ea \u2022 4.2GB \u2022 1M
+    context`), in GB; None when the page does not show one there."""
+    match = _PUBLISHED_SIZE.search(page, start, start + window)
+    if not match:
+        return None
+    return float(match.group(1)) * {"MB": 1e-3, "GB": 1.0, "TB": 1e3}[match.group(2)]
 
 
 def watch_online(families: tuple[str, ...] = WATCH_FAMILIES, *,
                  fetch: Callable[[str], str] | None = None,
                  catalog: dict[str, CatalogEntry] | None = None,
-                 remember: bool = True) -> tuple[list[Candidate], list[str]]:
-    """Opt-in: ask ollama.com's library for each family's models and their tags, keeping tags that
-    name a size under 10B and are not catalogued, profiles or installed. Returns (candidates,
-    errors). Remembers what it saw so the next check marks only newer tags as new."""
+                 remember: bool = True, include_over: bool = False
+                 ) -> tuple[list[Candidate], list[str]]:
+    """Opt-in: ask ollama.com's library for each family's models and their tags, keeping tags
+    within the memory budget (estimated from the size the tags page publishes) or of unknown size
+    (listed as "size unknown, measure first"), and not catalogued, profiles or installed. Returns
+    (candidates, errors). Remembers what it saw so the next check marks only newer tags as new.
+    include_over keeps the tags over the budget too (a caller that classifies them itself)."""
     fetch = fetch or (lambda url: _fetch_bytes(url).decode("utf-8", "replace"))
     catalog = catalog if catalog is not None else load_catalog()
     _, profiles = models.load()
@@ -929,17 +1086,23 @@ def watch_online(families: tuple[str, ...] = WATCH_FAMILIES, *,
                 if match.group(1) != library_name or not match.group(2):
                     continue
                 tag = f"{library_name}:{match.group(2)}"
-                params = params_from_tag(tag)
-                if params is None or params >= MAX_PARAMS_B or canonical(tag) in known:
+                if canonical(tag) in known or tag in found:
                     continue
-                found.setdefault(tag, Candidate(tag, "online", None, params,
-                                                suggested_profile_name(tag), new=tag not in seen))
+                size = published_size_gb(tags_page, match.end())
+                params = params_from_tag(tag)
+                if not include_over and budget_check(size, params_b=params).over:
+                    continue
+                found[tag] = Candidate(tag, "online", size, params,
+                                       suggested_profile_name(tag), new=tag not in seen,
+                                       note="" if size else "size unknown, measure first")
     if remember and found:
         server.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        _watch_file().write_text(json.dumps({
-            "seen": sorted(seen | set(found)),
-            "checked": datetime.now(UTC).isoformat(timespec="seconds"),
-        }, indent=2) + "\n", encoding="utf-8")
+        try:  # keys another reader of the state file keeps there stay
+            state = json.loads(_watch_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        state.update(seen=sorted(seen | set(found)), checked=datetime.now(UTC).isoformat(timespec="seconds"))
+        _watch_file().write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
     return sorted(found.values(), key=lambda c: (not c.new, c.tag)), errors
 
 
@@ -955,6 +1118,11 @@ def queue_comparison(target: str, *, experiments_file: Path | None = None,
 
     catalog = catalog if catalog is not None else load_catalog()
     default, profiles = models.load()
+    base = profiles[target].base if target in profiles else target
+    entry_for = catalog.get(target) or catalog_by_tag(catalog).get(canonical(base))
+    if entry_for is not None and entry_for.budget.over:
+        raise ValueError(f"{target} is {entry_for.budget.text}; Vega compares only models that "
+                         f"run on its minimum-requirements machine ({MIN_MACHINE}).")
     if target in profiles:
         profile = target
     elif target in catalog:
@@ -968,10 +1136,13 @@ def queue_comparison(target: str, *, experiments_file: Path | None = None,
         elif entry:
             profile = add_catalog_profile(entry).name
         else:
-            params = params_from_tag(target)
-            if params is not None and params >= MAX_PARAMS_B:
-                raise ValueError(f"{target} has {params:g}B parameters; Vega compares models "
-                                 f"under {MAX_PARAMS_B:.0f}B only.")
+            size = next((float(t.get("size", 0)) / GB for t in (installed() or [])
+                         if canonical(t.get("name", "")) == canonical(target)), None)
+            check = budget_check(size, params_b=params_from_tag(target))
+            if check.over:
+                raise ValueError(f"{target} is {check.text}; Vega compares only "
+                                 "models that run on its minimum-requirements machine "
+                                 f"({MIN_MACHINE}).")
             profile = suggested_profile_name(target)
             models.add_profile(profile, base=target,
                                description="Queued by vega model watch; not evaluated yet.")
@@ -1003,7 +1174,10 @@ def queue_comparison(target: str, *, experiments_file: Path | None = None,
 
 
 __all__ = [
+    "BUDGET_RULE",
     "FIT_RULE",
+    "MEMORY_BUDGET_GB",
+    "Budget",
     "Candidate",
     "CatalogEntry",
     "Inventory",
@@ -1011,10 +1185,12 @@ __all__ = [
     "PullPlan",
     "RemovePlan",
     "add_catalog_profile",
+    "budget_check",
     "finish_pull",
     "fit",
     "inventory",
     "load_catalog",
+    "memory_budget_gb",
     "plan_pull",
     "plan_remove",
     "pull",

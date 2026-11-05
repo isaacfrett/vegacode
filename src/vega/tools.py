@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from rich.console import Console
 
-from . import data_preview, features, sandbox
+from . import data_preview, extensions, features, sandbox
 from .diagnostics import after_write
 
 console = Console()
@@ -416,6 +416,7 @@ def _read_file(
         shown = data_preview.preview(target, target.relative_to(project).as_posix()
                                      if target.is_relative_to(project) else raw_path)
         if shown:
+            features.mark_acted("data_preview", path=raw_path)
             return resolution_note + shown
     lines = target.read_text(encoding="utf-8").splitlines()
     total = len(lines)
@@ -554,6 +555,7 @@ def _missing_symbol_note(project: Path, query: str) -> str:
                 return ""
         except OSError:
             continue
+    features.mark_acted("missing_symbol_hint", name=name)
     return (f"Note: nothing in this project defines {name} yet. If the task asks you to add it, "
             "stop searching and write it (edit_file or write_file).\n\n")
 
@@ -650,7 +652,9 @@ def plan_write(name: str, args: dict[str, Any], project: Path, *,
       cleaned first, with a note in the result.
     - atomic_writes (with `atomic`, which Vega's own pipeline writes turn off): the whole new file
       is checked and the write refused when it does not parse or adds undefined names or
-      redefinitions (vega/edits.py)."""
+      redefinitions (vega/edits.py).
+    - elision_guard (with `atomic` too): a Python write to an existing file that stands a comment
+      (`# ... rest unchanged`) or `...` in for code the file had is refused (vega/elision.py)."""
     from . import edits
 
     notes: list[str] = []
@@ -660,19 +664,62 @@ def plan_write(name: str, args: dict[str, Any], project: Path, *,
             if isinstance(args.get(key), str):
                 args[key], found = edits.strip_wrapping(args[key], str(args["path"]))
                 notes += [note for note in found if note not in notes]
-    plan = _plan_write(name, args, project)
+        if notes:
+            features.mark_acted("fence_strip", path=str(args["path"]))
+    try:
+        plan = _plan_write(name, args, project)
+    except (KeyError, ValueError, TypeError) as exc:  # arguments it cannot use
+        hooked = extensions.tool_refused(name, args, f"Tool error: {type(exc).__name__}: {exc}",
+                                         project=project, atomic=atomic)
+        if not isinstance(hooked.get("refusal"), str):
+            raise  # tools.execute words it as before
+        plan = hooked["refusal"]
+    else:
+        if isinstance(plan, str):
+            hooked = extensions.tool_refused(name, args, plan, project=project, atomic=atomic)
+            if isinstance(hooked.get("plan"), WritePlan):
+                plan = hooked["plan"]
+            elif isinstance(hooked.get("refusal"), str):
+                plan = hooked["refusal"]
     fence_note = f" Note: Vega {'; '.join(notes)} before checking it." if notes else ""
     if isinstance(plan, str):
         return plan + fence_note if plan.startswith(("Edit not applied", "Write not applied")) \
             else plan
     if atomic and features.on("atomic_writes") and plan.tool in _TEXT_ARG:
-        verdict = edits.check(plan.tool, plan.relative, plan.before, plan.after, project, args)
+        verdict = edits.check(plan.tool, plan.relative, plan.before, plan.after, project, args,
+                              repair=True)
+        if verdict.refusal is not None or verdict.after is not None or verdict.note:
+            features.mark_acted("atomic_writes", path=plan.relative)
         if verdict.refusal is not None:
             return verdict.refusal + fence_note
+        if verdict.after is not None:  # repaired by the extensions.repair_write hook
+            plan = replace(plan, after=verdict.after)
         if verdict.note:
             plan = replace(plan, message=plan.message + verdict.note)
+    if atomic and features.on("elision_guard") and plan.tool in _TEXT_ARG:
+        from . import elision
+
+        sent = args.get(_TEXT_ARG[plan.tool])
+        found = elision.elided(plan.relative, plan.before, plan.after,
+                               sent if isinstance(sent, str) else None,
+                               str(args.get("name") or "") if plan.tool == "replace_definition"
+                               else None)
+        if found is not None:
+            features.mark_acted("elision_guard", path=plan.relative)
+            return elision.refusal(plan.tool, plan.relative, found) + fence_note
     if fence_note:
         plan = replace(plan, message=plan.message + fence_note)
+    return outgoing(plan, project)
+
+
+def outgoing(plan: WritePlan, project: Path) -> WritePlan:
+    """The extensions.outgoing_write hook on a computed write: the text to save instead (e.g. a
+    report or commit message with values from secret files redacted) and its note. Default: the
+    plan unchanged."""
+    hooked = extensions.outgoing_write(plan.tool, plan.relative, plan.after, project=project)
+    after = hooked.get("after")
+    if isinstance(after, str) and after != plan.after:
+        plan = replace(plan, after=after, message=plan.message + str(hooked.get("note") or ""))
     return plan
 
 
@@ -820,6 +867,7 @@ def _plan_write(name: str, args: dict[str, Any], project: Path) -> WritePlan | s
         elif old_text == new_text and features.on("noop_edit_refused"):
             # Granite "fixed" a selfbuild bug with old_text == new_text and was told
             # "Edited (exact match)", then reported the bug fixed (2026-10-21).
+            features.mark_acted("noop_edit_refused")
             return ("Edit not applied: new_text is identical to old_text, so nothing would "
                     "change. Write the corrected code in new_text.")
         else:
@@ -952,6 +1000,7 @@ def validate_plan_started(raw: Any) -> tuple[list[dict[str, str]] | str, int | N
         if features.on("plan_pending_ok"):
             started = next(index for index, item in enumerate(items) if item["status"] == "pending")
             items[started]["status"] = "in_progress"
+            features.mark_acted("plan_pending_ok")
             return items, started + 1
         return (
             "Invalid plan: no item is in_progress. Mark the item you are working on now as "
@@ -1046,10 +1095,12 @@ def execute(
             plan = plan_note(args, project)
             if isinstance(plan, str):
                 return plan
+            plan = outgoing(plan, project)
             if before_write is not None:
                 refusal = before_write(plan)
                 if refusal:
                     return refusal
+            extensions.write_starting(project, tool=name)
             return apply_write(plan, project)
         if name in WRITE_TOOLS:
             if not can_write:
@@ -1061,6 +1112,7 @@ def execute(
                 refusal = before_write(plan)
                 if refusal:
                     return refusal
+            extensions.write_starting(project, tool=name)  # lazy "before" snapshots (lab)
             return apply_write(plan, project, args)
         if name == "git_status":
             result = subprocess.run(
@@ -1096,17 +1148,29 @@ def execute(
                 console.print(f"\n[bold yellow]Agent requests command:[/bold yellow] {command}")
                 if console.input("[yellow]Run this command? \\[y/N] [/yellow]").strip().lower() not in {"y", "yes"}:
                     return "User declined to run the command. Do not retry unless the user asks."
+            if not _is_auto_read_only(command, project):
+                extensions.write_starting(project, tool=name)  # it may change files
+            # A callback with `run_sandboxed` (evals' `commands: "sandbox"` cases) runs the command itself.
+            runner = getattr(approve_command, "run_sandboxed", None)
             try:
-                result = sandbox.run_stoppable(command, shell=True, cwd=project, timeout=120, stop=stop)
+                result = (runner(command, stop) if runner is not None else
+                          sandbox.run_stoppable(command, shell=True, cwd=project, timeout=120, stop=stop))
             except sandbox.StoppedRun:
                 return sandbox.STOPPED_CHECK
             output = f"exit code: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
             return output[-20000:]
-        return f"Unknown tool: {name}"
+        return _refused(name, args, project, f"Unknown tool: {name}")
     except subprocess.TimeoutExpired:
         return "Command timed out after 120 seconds."
     except Exception as exc:
-        return f"Tool error: {type(exc).__name__}: {exc}"
+        return _refused(name, args, project, f"Tool error: {type(exc).__name__}: {exc}")
+
+
+def _refused(name: str, args: dict[str, Any], project: Path, refusal: str) -> str:
+    """execute's refusal of an unknown tool or a call that raised, or the tool_refused hook's."""
+    hooked = extensions.tool_refused(name, args, refusal, project=project)
+    text = hooked.get("refusal")
+    return text if isinstance(text, str) and text else refusal
 
 
 def parse_arguments(raw: str) -> dict[str, Any]:

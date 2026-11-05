@@ -67,11 +67,18 @@ Added 2026-10-17, each behind its own switch, on by default:
 - `project_honest_answer`: the answer names the files actually written (compared with their
   content before the change) and every planned file left unchanged with the reason; with nothing
   written it never says the tests pass.
-- `project_no_tests`: pytest exit code 5 (no tests collected) is no tests, not one failing test
-  (repair rounds were spent on it).
 - `project_run_script`: a script the task runs to produce an output (`python report.py` writes
   out.json) is run in the sandbox after each round's writes and the files it produced are
   saved; the outputs are dropped from the plan, so the writer never hand-writes them.
+
+pytest exit code 5 (no tests collected) is no tests, not one failing test (repair rounds were
+spent on it; a switch, project_no_tests, until 2026-10-22).
+
+Extension hooks (2026-10-27, no-ops without an extension; project-pipeline trims review):
+`planner_request` may change the planner's schema and
+system prompt (the reply is still read for its "files" only); `unchanged_offer` may end a writer
+prompt for an existing file with a way to say it needs no change, and a reply `unchanged_reply`
+accepts keeps the file exactly as it is (the same as a reply repeating it, without its tokens).
 """
 
 from __future__ import annotations
@@ -93,6 +100,7 @@ from . import (
     check_feedback,
     debuglog,
     edits,
+    extensions,
     features,
     sandbox,
     task_checks,
@@ -129,6 +137,13 @@ INPUT_CHARS = 6000  # all inputs together, at most
 INPUT_MIN_CHARS = 1200  # a writer prompt that is already long still gets this much of them
 WRITER_PROMPT_CHARS = 16000  # ~4.5k tokens: the 8k window keeps room for the reply
 NO_TESTS = 5  # pytest's exit code when it collected no tests
+
+
+def _budget(agent: Any, name: str) -> int:
+    """The prompt budget `name` (a constant above) for this agent's context window
+    (extensions.budget; without an extension, the constant)."""
+    return extensions.budget(f"project_pipeline.{name}", globals()[name], agent=agent)
+
 # project_run_script: a script the task runs, and the files it writes
 SCRIPT_MARKER = "<<<VEGA-SCRIPT-OUTPUTS>>>"
 SCRIPT_RUNNER = r'''
@@ -226,9 +241,11 @@ def _test_files(project: Path) -> list[Path]:
             if p.suffix == ".py" and _TEST_FILE.search(p.relative_to(project).as_posix())]
 
 
-def _ask(agent: CodingAgent, messages: list[dict[str, Any]], **extra: Any) -> str:
+def _ask(agent: CodingAgent, messages: list[dict[str, Any]], *, model: str | None = None,
+         **extra: Any) -> str:
+    """`model`: another model for a side job (extensions.side_model; JSON requests only)."""
     if extra.get("response_format"):  # a JSON plan: short, and continuing would break the schema
-        reply = agent.client.chat.completions.create(model=agent.model, messages=messages,
+        reply = agent.client.chat.completions.create(model=model or agent.model, messages=messages,
                                                      **agent.sampling, **extra)
         return reply.choices[0].message.content or ""
     return ask_complete(agent, messages, **extra)
@@ -291,10 +308,14 @@ def _plan(agent: CodingAgent, task: str, repo_map: str, failure: str = "", *, no
                  f"{failure}\n\nList only the files that must change to fix these failures.")
     if note:
         user += f"\n\n{note}"
-    text = _ask(agent, [{"role": "system", "content": with_context(agent, PLANNER_SYSTEM)},
+    schema, system = extensions.planner_request(PLAN_SCHEMA, PLANNER_SYSTEM,
+                                                source="project_pipeline", task=task,
+                                                replan=bool(failure))
+    text = _ask(agent, [{"role": "system", "content": with_context(agent, system)},
                         {"role": "user", "content": user}],
+                model=extensions.side_model("planner", agent=agent),
                 response_format={"type": "json_schema",
-                                 "json_schema": {"name": "plan", "schema": PLAN_SCHEMA}})
+                                 "json_schema": {"name": "plan", "schema": schema}})
     try:
         plan = json.loads(text)
     except ValueError:
@@ -319,6 +340,7 @@ def _plan(agent: CodingAgent, task: str, repo_map: str, failure: str = "", *, no
     if features.on("pipeline_signals"):
         kept = [f for f in files if not no_change(f["change"])]
         if len(kept) < len(files):
+            features.mark_acted("pipeline_signals", where="plan_no_change")
             gone = [f for f in files if f not in kept]
             if dropped is not None:
                 dropped += gone
@@ -698,16 +720,18 @@ def _script_outputs(project: Path, route: dict[str, Any]) -> tuple[list[str], li
     return scripts, outputs
 
 
-def _related(project: Path, path: str, plan: list[dict[str, str]]) -> str:
-    """Short excerpts of the other planned files, so a file is written against their names."""
+def _related(project: Path, path: str, plan: list[dict[str, str]], limit: int = 0) -> str:
+    """Short excerpts of the other planned files (each up to `limit`, default RELATED_CHARS),
+    so a file is written against their names."""
+    limit = limit or RELATED_CHARS
     parts = []
     for item in plan:
         other = project / item["path"]
         if item["path"] == path or not other.is_file():
             continue
         text = other.read_text(encoding="utf-8", errors="replace")
-        if len(text) > RELATED_CHARS:
-            text = text[:RELATED_CHARS] + "\n# … (truncated)"
+        if len(text) > limit:
+            text = text[:limit] + "\n# … (truncated)"
         mark = write_loop.fence_for(text)
         parts.append(f"{item['path']}:\n{mark}\n{text}\n{mark}")
     return "\n\n".join(parts)
@@ -729,14 +753,18 @@ def _write_file(agent: CodingAgent, task: str, item: dict[str, str], plan: list[
     produced = _produce_file(agent, task, item, plan, failure, refusal, extras)
     if not produced.writes:
         return produced.problem
-    return write_loop.save(write_loop.AgentHost(agent), _save_config({}),
+    later = [i["path"] for i in plan[plan.index(item) + 1:]] if item in plan else []
+    return write_loop.save(write_loop.AgentHost(agent), _save_config({}, later),
                            item["path"], produced.writes[item["path"]])
 
 
-def _save_config(originals: dict[str, str | None]) -> write_loop.LoopConfig:
+def _save_config(originals: dict[str, str | None],
+                 targets: list[str] | None = None) -> write_loop.LoopConfig:
     """What write_loop.save needs: the debug-log name (the parse check of the writer's own code is
-    made in _produce_file, against the file as it is now, so no Write carries `code`)."""
-    return write_loop.LoopConfig(name="project_pipeline", title="Project pipeline", targets=[],
+    made in _produce_file, against the file as it is now, so no Write carries `code`) and the
+    planned files still to write after this one (`targets`)."""
+    return write_loop.LoopConfig(name="project_pipeline", title="Project pipeline",
+                                 targets=list(targets or []),
                                  originals=originals, repairs=REPAIRS,
                                  check=lambda _saved: write_loop.Checks())
 
@@ -751,28 +779,36 @@ def _produce_file(agent: CodingAgent, task: str, item: dict[str, str],
     target = project / item["path"]
     current = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
     focused = ""
-    if len(current) > FILE_CHARS:
+    if len(current) > _budget(agent, "FILE_CHARS"):
         large = features.on("large_projects") or features.on("project_large_files")
         if not (large and target.suffix == ".py" and _parses(current)):
             return write_loop.Produced(
                 problem=f"{item['path']} is too large to rewrite whole; left unchanged.")
         wide = features.on("large_projects")
+        if not wide:  # off: the file would be left unchanged as too large
+            features.mark_acted("project_large_files", path=item["path"])
         focused = focused_view(item["path"], current, task, item["change"],
-                               budget=FOCUS_CHARS if wide else WINDOW_FOCUS_CHARS,
-                               outline_chars=OUTLINE_CHARS if wide else WINDOW_OUTLINE_CHARS)
+                               budget=_budget(agent, "FOCUS_CHARS" if wide else "WINDOW_FOCUS_CHARS"),
+                               outline_chars=_budget(agent, "OUTLINE_CHARS" if wide
+                                                     else "WINDOW_OUTLINE_CHARS"),
+                               import_chars=_budget(agent, "IMPORT_CHARS"))
     plan_text = "\n".join(f"- {p['path']}: {p['change']}" for p in plan)
     mark = write_loop.fence_for(current)
     shown = focused or (f"Current content of {item['path']}:\n{mark}\n{current}\n{mark}"
                         if current else f"{item['path']} does not exist yet; create it.")
-    related = _related(project, item["path"], plan)
+    related = _related(project, item["path"], plan, _budget(agent, "RELATED_CHARS"))
     user = (f"Task:\n{task}\n\nPlan:\n{plan_text}\n\nNow write {item['path']}: {item['change']}"
             f"\n\n{shown}")
     if related:
         user += f"\n\nOther files in the plan (for names and signatures):\n{related}"
     if extras is not None and extras.inputs:  # project_inputs: what fits next to the rest
-        budget = min(INPUT_CHARS, max(INPUT_MIN_CHARS, WRITER_PROMPT_CHARS - len(user)))
+        budget = min(_budget(agent, "INPUT_CHARS"), max(_budget(agent, "INPUT_MIN_CHARS"),
+                                                        _budget(agent, "WRITER_PROMPT_CHARS") - len(user)))
         user += inputs_text(project, extras.inputs, budget,
                             exclude={p["path"] for p in plan})
+    user += extensions.writer_context(
+        project, item["path"], task, source="project_pipeline", prompt=user, plan=plan,
+        budget=max(INPUT_MIN_CHARS, WRITER_PROMPT_CHARS - len(user)))
     if features.on("import_grounding"):
         user += ("\n\n" + _modules_line(project) + ". Import only these, the modules in the plan "
                  "and the standard library.")
@@ -780,15 +816,28 @@ def _produce_file(agent: CodingAgent, task: str, item: dict[str, str],
         user += f"\n\nThe project's tests currently fail with:\n{failure}"
     signals = features.on("pipeline_signals")
     if signals:
+        features.mark_acted("pipeline_signals", where="writer_prompt")
         if refusal:  # the last round's write of this file was not saved: its exact reason
             user += f"\n\nYour last reply for {item['path']} was not saved:\n{refusal}"
         user += (f"\n\nReply with {item['path']} only: the line `File: {item['path']}` and then "
                  f"one ```{write_loop.fence_language(item['path'])} code block.")
+    # extensions.unchanged_offer: a writer may answer that an existing file needs no change
+    offer = (extensions.unchanged_offer(
+        project, item["path"], task, source="project_pipeline", current=current,
+        original=extras.originals.get(item["path"], current) if extras is not None else current,
+        failure=failure, change=item["change"]) if current else "")
+    if offer:
+        user += "\n\n" + offer
     system = WRITER_SYSTEM + WRITER_FORMAT if signals else WRITER_SYSTEM
     messages = [{"role": "system", "content": with_context(agent, system)},
                 {"role": "user", "content": user}]
     reply = _ask(agent, messages)
-    if signals:
+    kept = bool(offer) and extensions.unchanged_reply(reply, item["path"],
+                                                      source="project_pipeline")
+    if kept:  # the same result as a reply that repeats the file, without its tokens
+        debuglog.record("stage", stage="project_pipeline.unchanged_reply", path=item["path"])
+        blocks = [current]
+    elif signals:
         plan_paths = [p["path"] for p in plan]
         picked, problem = write_loop.pick_block(reply, item["path"], plan_paths)
         if picked is None:  # told why, one retry
@@ -807,8 +856,9 @@ def _produce_file(agent: CodingAgent, task: str, item: dict[str, str],
         blocks = write_loop.code_blocks(reply) or write_loop.code_blocks(reply, any_language=True)
     if not blocks:
         return write_loop.Produced(problem=f"No code block for {item['path']}; left unchanged.")
-    code = _drop_path_line(max(blocks, key=len), item["path"]).strip("\n") + "\n"
-    if signals and current and _parses(current):
+    code = (current if kept else
+            _drop_path_line(max(blocks, key=len), item["path"]).strip("\n") + "\n")
+    if signals and current and _parses(current) and not kept:
         broken = edits.unparsable_reply(item["path"], code, project)
         if broken is not None:  # merge_code would silently keep the old file
             debuglog.record("stage", stage="project_pipeline.refused", path=item["path"],
@@ -825,14 +875,18 @@ def _produce_file(agent: CodingAgent, task: str, item: dict[str, str],
     if target.suffix == ".py" and features.on("project_auto_imports"):
         forbidden = (forbidden_imports(task, item["path"])
                      if features.on("project_layer_imports") else ())
+        if forbidden:
+            features.mark_acted("project_layer_imports", where="forbidden")
         resolved = resolve_imports(project, item["path"], content, forbidden)
         content, added = resolved.content, resolved.added
         if added:
             debuglog.record("stage", stage="project_pipeline.auto_imports", path=item["path"],
                             added=added)
         if resolved.foreign and signals:  # the write check would refuse with "define or import"
+            later = [i["path"] for i in plan[plan.index(item) + 1:]] if item in plan else []
             refused = edits.check("pipeline", item["path"], current if target.is_file() else None,
-                                  content, project, foreign=resolved.foreign).refusal
+                                  content, project, foreign=resolved.foreign,
+                                  pending=later).refusal
             if refused is not None:
                 debuglog.record("stage", stage="project_pipeline.refused", path=item["path"],
                                 refusal=refused[:600], foreign=resolved.foreign)
@@ -961,7 +1015,8 @@ def _relevant(tree: ast.Module, source: str, path: str, task: str, change: str,
 
 
 def focused_view(path: str, source: str, task: str, change: str,
-                 budget: int = FOCUS_CHARS, outline_chars: int = OUTLINE_CHARS) -> str:
+                 budget: int = FOCUS_CHARS, outline_chars: int = OUTLINE_CHARS,
+                 import_chars: int = 0) -> str:
     """What the writer sees of a Python file too large to show whole: an outline, the file's
     imports and the complete source of the definitions most relevant to the change (whole
     definitions only, up to `budget` characters; one that does not fit is skipped)."""
@@ -991,8 +1046,9 @@ def focused_view(path: str, source: str, task: str, change: str,
             outline = outline[:outline_chars].rsplit("\n", 1)[0] + "\n# … (outline truncated)"
     imports = "\n".join(ast.get_source_segment(source, node) or "" for node in tree.body
                         if isinstance(node, (ast.Import, ast.ImportFrom)))
-    if len(imports) > IMPORT_CHARS:
-        imports = imports[:IMPORT_CHARS].rsplit("\n", 1)[0] + "\n# … (more imports)"
+    import_chars = import_chars or IMPORT_CHARS
+    if len(imports) > import_chars:
+        imports = imports[:import_chars].rsplit("\n", 1)[0] + "\n# … (more imports)"
     parts: list[str] = []
     open_class: ast.ClassDef | None = None
     for owner, node, first, last in sorted(chosen, key=lambda c: c[2]):
@@ -1506,6 +1562,70 @@ def _import_line(relative: str, content: str, source: str, name: str) -> str:
     return f"from {'.' * level}{'.'.join(parts[common:])} import {name}"
 
 
+def import_offers(project: Path, relative: str, content: str,
+                  names: list[str]) -> dict[str, tuple[str, str]]:
+    """import_offer: undefined name -> (the project file defining it, the import line to add to
+    `relative`, in its import style) for each name exactly one other project module defines at
+    module level (else exactly one in the file's own package), and whose module does not import
+    `relative` (a circular import). Names defined nowhere, or in several places, get nothing.
+    A name that is one of the project's own modules used as a module (`tasktracker.errors.X`
+    with no import: bigbuild 10-28, 48 refusals in one turn) gets `import tasktracker.errors`,
+    the longest project module the code's dotted uses name."""
+    wanted = [name for name in dict.fromkeys(names) if name.isidentifier()]
+    if not wanted or not relative.endswith(".py"):
+        return {}
+    homes = _defining_modules(project)
+    own, own_package = _module_of(relative), _package_of(relative)
+    graph: dict[str, set[str]] | None = None
+    offers: dict[str, tuple[str, str]] = {}
+    modules: dict[str, str] | None = None
+    for name in wanted:
+        if not homes.get(name):
+            if modules is None:
+                modules = {}
+                for path in _project_files(project):
+                    rel = path.relative_to(project).as_posix()
+                    if path.suffix == ".py" and not rel.startswith(".vega") and _module_of(rel):
+                        modules[_module_of(rel)] = rel
+            if name in modules:
+                used = _dotted_module(content, name, modules)
+                graph = _import_graph(project, frozenset({own})) if graph is None else graph
+                if used != own and not _reaches(graph, used, own):
+                    offers[name] = (modules[used], f"import {used}")
+            continue
+        sources = [entry for entry in homes.get(name, []) if entry[0] != own]
+        if len(sources) > 1:
+            sources = [entry for entry in sources if _package_of(entry[1]) == own_package]
+        if len(sources) != 1:
+            continue
+        module, source_relative, _ = sources[0]
+        graph = _import_graph(project, frozenset({own})) if graph is None else graph
+        if _reaches(graph, module, own):
+            continue
+        offers[name] = (source_relative, _import_line(relative, content, module, name))
+    return offers
+
+
+def _dotted_module(content: str, name: str, modules: dict[str, str]) -> str:
+    """The longest project module `content` reaches as `name.a.b...` (else `name` itself)."""
+    best = name
+    for match in re.finditer(rf"(?<![\w.]){re.escape(name)}((?:\.\w+)+)", content):
+        parts = [name, *match.group(1).lstrip(".").split(".")]
+        for cut in range(len(parts), 1, -1):
+            dotted = ".".join(parts[:cut])
+            if dotted in modules:
+                if dotted.count(".") > best.count("."):
+                    best = dotted
+                break
+    return best
+
+
+def add_imports(content: str, lines: list[str]) -> str:
+    """`content` with the import lines added after its docstring and `__future__` imports
+    (import_offer_apply)."""
+    return _insert_imports(content, list(dict.fromkeys(lines)))
+
+
 @dataclass
 class AutoImports:
     content: str
@@ -1550,6 +1670,8 @@ def resolve_imports(project: Path, relative: str, content: str,
         return AutoImports(content, [])
     layered = features.on("project_layer_imports")
     table = stdlib_names() if layered else STDLIB_NAMES
+    if layered and any(n in table and n not in STDLIB_NAMES or n == "datetime" for n in undefined):
+        features.mark_acted("project_layer_imports", where="stdlib_table")
     attribute_bases = {node.value.id for node in ast.walk(tree)
                        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)}
     own, own_package = _module_of(relative), _package_of(relative)
@@ -1765,8 +1887,8 @@ def _check(command: str, project: Path) -> str:
 
 
 def _no_tests(output: str) -> bool:
-    """project_no_tests: pytest collected no tests (exit code 5): nothing failed."""
-    return features.on("project_no_tests") and check_feedback.exit_code(output) == NO_TESTS
+    """pytest collected no tests (exit code 5): nothing failed."""
+    return check_feedback.exit_code(output) == NO_TESTS
 
 
 def _passed(output: str) -> bool:
@@ -1778,8 +1900,8 @@ PYTEST = "python -m pytest -q -p no:cacheprovider"
 
 
 def _pytest(project: Path, args: str = "-rfE", runs: list[str] | None = None) -> str:
-    """One sandboxed pytest run: its output, or '' when it passed (or collected no tests with
-    project_no_tests). `runs` gets the raw output."""
+    """One sandboxed pytest run: its output, or '' when it passed or collected no tests.
+    `runs` gets the raw output."""
     output = _check(check_feedback.short_tracebacks(f"{PYTEST} {args}".strip()), project)
     if runs is not None:
         runs.append(output)
@@ -2108,6 +2230,8 @@ def _extras(agent: CodingAgent, task: str) -> _Extras:
     if want_inputs:
         extras.inputs = [p for p in read_only_inputs(agent.project, route)
                          if p not in extras.outputs]
+        if extras.inputs:
+            features.mark_acted("project_inputs", inputs=extras.inputs)
     debuglog.record("stage", stage="project_pipeline.extras", inputs=extras.inputs,
                     scripts=extras.scripts, outputs=extras.outputs)
     return extras
@@ -2156,11 +2280,7 @@ def honest_answer(project: Path, extras: _Extras, project_failing: int, spec_not
     """project_honest_answer: the files written (their content differs from before the change)
     and every planned file left unchanged with the reason; no claim about the tests when nothing
     was written, and none that they pass when no test ran."""
-    written = [p for p, before in extras.originals.items()
-               if write_loop._read(project / p) != before]
-    left = [p for p in extras.originals if p not in written]
-    left_note = ("Left unchanged: " + "; ".join(f"{p} ({_why_left(p, extras.notes.get(p, ''))})"
-                                                for p in left) + ".") if left else ""
+    written, ran, left_note = _written(project, extras)
     if not written:
         answer = "No file was changed, so the task is not done."
         if left_note:
@@ -2170,40 +2290,63 @@ def honest_answer(project: Path, extras: _Extras, project_failing: int, spec_not
         return answer
     answer = _outcome(", ".join(written), project_failing, still, spec_note, open_items,
                       extras.no_tests)
+    return answer + ran + ("\n" + left_note if left_note else "")
+
+
+def _written(project: Path, extras: _Extras) -> tuple[list[str], str, str]:
+    """The files written (their content differs from before the change); a line for each task
+    script that wrote one of them; "Left unchanged: ..." for every planned file not written."""
+    written = [p for p, before in extras.originals.items()
+               if write_loop._read(project / p) != before]
+    left = [p for p in extras.originals if p not in written]
+    left_note = ("Left unchanged: " + "; ".join(f"{p} ({_why_left(p, extras.notes.get(p, ''))})"
+                                                for p in left) + ".") if left else ""
     scripts: dict[str, list[str]] = {}
     for output, script in extras.produced.items():
         if output in written:
             scripts.setdefault(script, []).append(output)
-    for script, outputs in scripts.items():
-        answer += f"\n`python {script}` ran in the sandbox and wrote {', '.join(outputs)}."
-    if left_note:
-        answer += "\n" + left_note
-    return answer
+    ran = "".join(f"\n`python {script}` ran in the sandbox and wrote {', '.join(outputs)}."
+                  for script, outputs in scripts.items())
+    return written, ran, left_note
 
 
-def run(agent: CodingAgent, task: str) -> str | None:
-    """Run a task routing.route_task sent here; None falls back to the agent loop."""
+def run(agent: CodingAgent, task: str, *, handover: dict[str, Any] | None = None) -> str | None:
+    """Run a task routing.route_task sent here; None falls back to the agent loop.
+
+    `handover` (extensions.stalled_round, from the direct pipeline): {"paths", "failure"}: the
+    direct pipeline's rewrite stalled on a failure in a file it cannot write; those files must be
+    in the plan, and the planner and the first round's writers see that failure."""
     from .index import build_index
 
     project = agent.project
     index = build_index(project)
     if features.on("large_projects") and len(index.files) > MAX_PROJECT_FILES:
-        repo_map = large_map(index, task)
+        repo_map = large_map(index, task, _budget(agent, "LARGE_MAP_CHARS"))
     else:
-        repo_map = index.repo_map(max_chars=MAP_CHARS)
+        repo_map = index.repo_map(max_chars=_budget(agent, "MAP_CHARS"))
     agent._emit("notice", message="Project pipeline: plan files, write them, run the tests, repair")
     signals = features.on("pipeline_signals")
     extras = _extras(agent, task)
-    planner_inputs = inputs_text(project, extras.inputs)
+    planner_inputs = inputs_text(project, extras.inputs, _budget(agent, "INPUT_CHARS"))
     required = ([seed for seed in route_targets(project, _route_record(agent, task), task)
                  if seed["path"] not in extras.outputs]
                 if features.on("project_route_targets") else [])
     if features.on("plan_contradicting_tests") and not _ASKS_FOR_TESTS.search(task):
         with contextlib.suppress(Exception):  # no detection is the old behaviour
             extras.call_tests = {test.path: test for test in contradicting_tests(project, task)}
+        if extras.call_tests:
+            features.mark_acted("plan_contradicting_tests", tests=sorted(extras.call_tests))
+    handed_failure = str((handover or {}).get("failure") or "")
+    if handover:
+        listed = {seed["path"] for seed in required}
+        required = required + [{"path": path, "why": "the last attempt's failing check points here"}
+                               for path in dict.fromkeys(handover.get("paths") or [])
+                               if path not in listed]
+        debuglog.record("stage", stage="project_pipeline.handover",
+                        paths=list(handover.get("paths") or []), failure=handed_failure[:600])
     dropped: list[dict[str, str]] = []
     try:
-        plan = _plan(agent, task, repo_map, dropped=dropped, inputs=planner_inputs,
+        plan = _plan(agent, task, repo_map, handed_failure, dropped=dropped, inputs=planner_inputs,
                      outputs=extras.outputs, required=required, call_tests=extras.call_tests)
         if not plan and signals:  # told why, one retry (the planner replied '"files": []')
             note = empty_plan_note(dropped)
@@ -2243,6 +2386,7 @@ def run(agent: CodingAgent, task: str) -> str | None:
     checks = _task_checks(agent, task, repo_map, trace)
     runner = _Rounds(agent, task, repo_map, plan, contract, spec, touched, trace, extras,
                      planner_inputs, checks)
+    runner.failure = handed_failure  # a handover: the first round's writers see its failure
     try:  # the best round (by its rank) is restored at the end
         result = write_loop.run_loop(runner.host, runner.config(), [])
     finally:
@@ -2259,11 +2403,17 @@ def run(agent: CodingAgent, task: str) -> str | None:
     spec_note = (f" {spec_failing} of the {what} still fail (they may be wrong themselves)."
                  if spec_failing else "")
     if features.on("project_honest_answer"):
+        features.mark_acted("project_honest_answer")  # the final answer's wording, every run
         answer = honest_answer(project, extras, project_failing, spec_note, still,
                                kept.open_items)
     else:
         answer = _outcome(", ".join(sorted(touched)) or "no file", project_failing, still,
                           spec_note, kept.open_items)
+    written, ran, left_note = _written(project, extras)
+    answer = extensions.final_answer(answer, source="project_pipeline", result=result,
+                                     project=project, task=task, agent=agent,
+                                     changed=sorted(touched), written=written,
+                                     notes=ran + ("\n" + left_note if left_note else ""))
     if getattr(agent, "teach", False):  # teach mode: a note from the real stages only
         rounds = [entry.split("\n", 1)[0].rstrip(":") for entry in trace
                   if entry.startswith("round ")]
@@ -2309,10 +2459,11 @@ class _Checks(write_loop.Checks):
 
     @property
     def failed(self) -> int:
-        return self.failing + self.spec_failing
+        return self.failing + len(self.added) + self.spec_failing
 
     def score(self) -> tuple[int, int, int, int]:
-        return len(self.loads), self.failing, self.spec_failing, len(self.still)
+        """`added`: an extension's failing checks (checks_recorded), counted like failing tests."""
+        return len(self.loads), self.failing + len(self.added), self.spec_failing, len(self.still)
 
 
 class _Rounds:
@@ -2349,6 +2500,7 @@ class _Rounds:
                 trace.append("failing before the change: " + ", ".join(sorted(self.known)))
         self.previous_still = len(self.known) if self.known else 0
         self.failure = ""  # the last round's failing output, for the writers and the planner
+        self.note = ""  # the unchanged-round note at the head of self.failure, if any
         self.refusals: dict[str, str] = {}  # path -> why its write this round was not saved
         self.last_refusals: dict[str, str] = {}
         self.round = -1  # the round being checked (targets() starts each)
@@ -2362,14 +2514,36 @@ class _Rounds:
             score=lambda checks: checks.score(),  # type: ignore[attr-defined]
             done=self.done, between=self.replan, check_call="pytest",
             snapshot=lambda: _snapshot(self.project, self.touched),
-            on_unchanged=self.unchanged)
+            on_unchanged=self.unchanged, task=self.task, widen=self.widen)
 
     def unchanged(self, note: str) -> None:
         """unchanged_rounds: a round left every file as it was; its writers are told so, ahead of
-        the last check's failing output (still current, since nothing changed)."""
-        self.failure = note + ("\n\n" + self.failure if self.failure else "")
+        the last check's failing output (still current, since nothing changed). A note from the
+        stall before replaces it rather than piling up."""
+        base = self.failure
+        if self.note and base.startswith(self.note):
+            base = base[len(self.note):].lstrip("\n")
+        self.note = note
+        self.failure = note + ("\n\n" + base if base else "")
         self.trace.append(f"round {self.round + 1}: every planned file rewritten unchanged; "
                           "checks not run again")
+
+    def widen(self, paths: list[str], change: str) -> list[str]:
+        """extensions.stalled_round: existing project files a stalled round's failure points
+        at join the plan (with `change`); the paths added."""
+        listed = {item["path"] for item in self.plan}
+        added = []
+        for path in dict.fromkeys(paths):
+            if path in listed or ".." in Path(path).parts or not (self.project / path).is_file():
+                continue
+            self.plan.append({"path": path, "change": change})
+            added.append(path)
+        if added:
+            debuglog.record("stage", stage="project_pipeline.widened", round=self.round + 1,
+                            added=added)
+            self.trace.append(f"round {self.round + 1}: added {', '.join(added)} to the plan "
+                              "(the failing check points there)")
+        return added
 
     def targets(self) -> list[str]:
         self.last_refusals, self.refusals = self.refusals, {}
@@ -2441,6 +2615,8 @@ class _Rounds:
                 self.host.emit("notice", message=f"Dropped from {path}'s re-exports: {listed}")
 
     def check(self, saved: list[str]) -> _Checks:
+        from . import baseline_gate
+
         project, extras, signals = self.project, self.extras, self.signals
         round_number = self.round
         self._grounded_round(saved)
@@ -2468,15 +2644,26 @@ class _Rounds:
                      if "::" not in i and i.endswith(".py")] if signals else []
             test_ids = [i for i in new_ids if "::" in i]
         extras.no_tests = bool(runs) and _no_tests(runs[-1])
+        # each check for extensions.checks_recorded (write_loop.Checks.items)
+        items = [write_loop.item("tests", f"`{PYTEST}`", not failing, failure,
+                                 output=runs[-1] if runs else "", failing=failing,
+                                 ids=loads + test_ids, ran=not extras.no_tests)]
+        items += [write_loop.item("tests", test_id, False, before=True,
+                                  named=bool(baseline_gate.targets(test_id, self.task)))
+                  for test_id in still]
 
         def lead(header: str, items: list[str], after: str = "") -> str:
             return (header + "\n".join(f"- {item}" for item in items) + after
                     + ("\n\n" + failure if failure else ""))
 
+        items += write_loop.counted_items("scripts", "the task's scripts", len(extras.scripts),
+                                          script_problems)
         if script_problems:  # the task's own script is a check too: it must run and write
             failing += len(script_problems)
             failure = lead("The task's script did not produce its output:\n", script_problems)
         missing = _check_contract(project, self.contract)
+        items += write_loop.counted_items("names", "the names the task gives", len(self.contract),
+                                          missing)
         if missing:
             failing += len(missing)
             failure = lead("The task names these, but they do not exist after the change:\n",
@@ -2489,6 +2676,7 @@ class _Rounds:
             accepted = acceptance.run(accept_spec, project, sorted(self.touched), tests=False,
                                       stop=getattr(self.agent, "_stop", None))
             lines = acceptance.pipeline_failures(accepted)
+            items += write_loop.acceptance_items(accepted)
             debuglog.record("stage", stage="project_pipeline.acceptance", round=round_number + 1,
                             checks=len(accepted.items), failing=lines)
             if lines:
@@ -2498,16 +2686,22 @@ class _Rounds:
                 loads += [item.line() for item in accepted.failing if item.kind == "import"]
         unresolved = (unresolved_imports(project, sorted(self.touched))
                       if features.on("import_grounding") else [])
+        items += [write_loop.item("imports", line, False) for line in unresolved]
         if unresolved:
             failing += len(unresolved)
             failure = lead("These imports do not resolve:\n", unresolved,
                            "\n" + _modules_line(project))
         refusals = self.refusals
+        items += [write_loop.item("write", path, False, text.splitlines()[0] if text else "")
+                  for path, text in refusals.items()]
         if refusals:  # never landed: the round failed whatever the tests say about the old file
             failing += len(refusals)
             failure = lead("These planned writes were not saved (the files are unchanged):\n",
                            [f"{path}: {text.splitlines()[0]}" for path, text in refusals.items()])
         spec_failing, spec_output = _run_tests(project, SPEC_DIR) if self.spec else (0, "")
+        if self.spec:
+            items.append(write_loop.item("written tests", "tests written from the task",
+                                         not spec_failing, spec_output))
         if spec_failing:
             failure += ("\n\n" if failure else "") + (
                 "Tests written from the task fail (if one contradicts the task, the task wins):\n"
@@ -2515,7 +2709,10 @@ class _Rounds:
         task_lines: list[str] = []
         if self.task_checks is not None:  # ranked after the project's own checks, like spec tests
             notes = len(self.task_checks.notes)
+            active = self.task_checks.active
             task_lines = self.task_checks.evaluate(project, failing)
+            items += [write_loop.item("task checks", c.claim, not c.last, c.last, kind=c.kind,
+                                      dropped=bool(c.dropped)) for c in active]
             self.trace.extend(self.task_checks.notes[notes:])
             counted = [line for line in task_lines if not line.endswith("(no longer checked)")]
             spec_failing += len(counted)
@@ -2548,12 +2745,16 @@ class _Rounds:
             open_items = lines
         return _Checks(report=summary + (f"\n{failure}" if failure else ""), loads=loads,
                        failing=failing, spec_failing=spec_failing, still=still,
-                       open_items=open_items)
+                       open_items=open_items, items=items)
 
     def done(self, checks: write_loop.Checks, round_number: int) -> bool:
         """All pass; tests that failed before the change too (large_projects) keep the repairs
         going only while they are being fixed: once a repair round fixes none of them, stop."""
         assert isinstance(checks, _Checks)
+        if checks.added:  # an extension's failing checks (checks_recorded): the writers see them
+            added = "\n".join(f"- {line}" for line in checks.added)
+            self.failure += ("\n\n" if self.failure else "") + added
+            checks.open_items += [line for line in checks.added if line not in checks.open_items]
         still = checks.still
         stalled = round_number > 0 and len(still) >= self.previous_still
         self.previous_still = len(still)

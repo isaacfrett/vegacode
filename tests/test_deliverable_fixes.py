@@ -234,8 +234,9 @@ def test_host_inspection_still_works_under_the_guard(tmp_path: Path) -> None:
 
 
 @needs_sandbox
-def test_the_guard_switch_restores_host_reads(tmp_path: Path, monkeypatch) -> None:
+def test_the_guard_has_no_off_switch(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "probe.py").write_text("print(len(open('/etc/hosts').read()) > 0)\n")
     assert "PermissionError" in sandbox.run_check("python probe.py", tmp_path, private_home=True)
-    _off(monkeypatch, "sandbox_read_guard")
-    assert "True" in sandbox.run_check("python probe.py", tmp_path, private_home=True)
+    with pytest.raises(ValueError, match="sandbox_read_guard was retired"):
+        _off(monkeypatch, "sandbox_read_guard")
+        features.disabled()

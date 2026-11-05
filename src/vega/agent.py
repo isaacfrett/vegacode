@@ -18,19 +18,24 @@ from rich.markdown import Markdown
 
 from . import (
     acceptance,
+    baseline_gate,
     check_feedback,
     constraint_docs,
     context,
     debuglog,
+    extensions,
     features,
+    home_start,
     knowledge,
     repro_first,
     teaching,
     web,
     write_guard,
 )
+from .elision import ELIDED_LINE
 from .tools import (
     WritePlan,
+    _is_auto_read_only,
     _project_files,
     _project_path,
     execute,
@@ -83,6 +88,7 @@ _REMEMBER_TEXT = (
     "Use remember to record durable project\nfacts (how to run tests, conventions, gotchas), not task "
     "progress. "
 )
+_DELEGATE_TEXT = "Use delegate_task only for a large read-only investigation. "
 _INDEX_TEXT = (
     "Use repo_map for the project's structure, search_code to find relevant code\n   by "
     "meaning-bearing words, search_text for an exact string, and find_files for a filename."
@@ -152,7 +158,7 @@ def system_prompt(plan_line: bool = True) -> str:
         prompt = prompt.replace(_INDEX_TEXT, _NO_INDEX_TEXT)
     if features.on("edit_by_name"):
         prompt = prompt.replace(_EDIT_RULE, _EDIT_BY_NAME_RULE)
-    return prompt
+    return extensions.system_prompt(prompt)
 
 
 # Sent once per user turn when the model replies without having used any tool. Small models often
@@ -162,9 +168,26 @@ project's code or files, do not ask the user for details you can find yourself: 
 (search_text, read_file, then edit_file) and complete the task. If the request genuinely needs no
 project inspection, give your final answer again."""
 
+# A read-only advice turn (route mode "advise": "what should we do next?"): a shell command that is
+# not read-only inspection is refused; tests run with run_check, in an isolated copy.
+ADVICE_COMMAND = ("This turn gives advice and changes nothing: run_command only runs read-only "
+                  "inspection here (git log, git status, cat, ls, grep). Run the tests with "
+                  "run_check, which uses an isolated copy of the project.")
+
 # Conversation (a question to Vega, small talk, a general question): Granite wrote 30–60 s tables.
 BRIEF_REPLY = ("(Vega harness) This is a conversational question, not a task: answer briefly, in at "
                "most 8 short lines, without tables.")
+
+# Route mode "knowledge" (set only by an extension's route_task hook: a general question nothing in
+# the project bears on, vega_lab.answer_source): the system prompt in place of the agent's tool
+# rules, which tell the model to look the answer up in the project. Close to the model-alone
+# baseline's prompt (the knowledge suite's single_shot_system), which outscored the project-excerpt
+# answer on general questions (harness-vs-model diagnosis).
+KNOWLEDGE_SYSTEM = (
+    "You are Vega, an expert software engineer and machine-learning practitioner. Answer the "
+    "user's question from your own knowledge; nothing in their project bears on it. Give the "
+    "reason behind the answer. If the question assumes something false, say so and correct it. "
+    "If it asks for something you do not know for certain, say so instead of guessing.")
 
 # For a question about the project: look things up, but a question is never a request to change files.
 QUESTION_NUDGE = """(Vega harness) You answered without inspecting the project. If the question is about
@@ -196,6 +219,13 @@ _ATTEMPTED_CALL = re.compile(
 def looks_like_failed_tool_call(content: str) -> bool:
     return bool(_ATTEMPTED_CALL.search(content or ""))
 
+
+# A reply with more completion tokens than this but no text and no tool call is a lost reply: the
+# model wrote something the server dropped. Ollama's tool parser (tools/tools.go, named tags such as
+# Granite's <tool_call>) holds everything after the tag and returns nothing when no call for an
+# offered tool parses from it: invalid JSON in the arguments (a `\$` escape in a shell script) or a
+# tool that was not offered (`git_commit`). Measured 2026-10-27: 256 of 17,564 Granite agent steps.
+LOST_REPLY_TOKENS = 5
 
 CUT_OFF = """(Vega harness) Your last reply hit the length limit and was cut off, so it was discarded.
 Keep replies short: call one tool, or give a brief final answer. To write a long file, write it in
@@ -281,9 +311,31 @@ _FAILED_RESULT_PREFIXES = (
     "Give path (the file", "Give the complete code", "Give name as",
     "Provide words or identifiers", "Provide text or an identifier", "Provide a filename",
 )
-# repeat_stop: guarded repeats of failed calls in a row (nothing else ran in between) that end the
-# turn; a task kept re-sending its refused write after every note
-REPEAT_STOP = 3
+# repeat_stop: guarded repeats of failed calls since the turn last changed project state (a saved
+# write or a command run: `writes`) that end the turn. Reads between repeats do not reset it: tasks
+# looped write_file -> refused -> read_file -> compaction -> the same write_file up to 49 times
+# (generation-tokens report 2026-10-27: 39 attempts since 10-20, 0 passed). 4, not 3: at 3 it would
+# have ended 2 passing attempts in the 10-20..27 debug logs, at 4 none.
+REPEAT_STOP = 4
+REPEAT_STOP_OLD = 3  # features "repeat_stop_reads" off: the rule before 2026-10-27 (A/B arm)
+# noop_write_repeat: a write that would leave the file byte-identical. Bigbuild 2026-10-28: the
+# model rewrote one file unchanged ~36 times in a turn (151 no-op writes, 66.9 model-min), each
+# reported as a saved write, which reset repeat_stop and let a refused write run again.
+NOOP_WRITE = ("Unchanged: {path} already has this content, so nothing was written (a repeat). "
+              "Do not send it again: change what is still wrong (a refused write names what), "
+              "or finish.")
+NOOP_WRITE_PREFIX = "Unchanged: "
+# A read-only advice turn ends its tool phase (step limit, or a repeated call) with this marker
+# instead of a "Stopped ..." answer; _run_advice then asks for the answer with no tools on offer.
+# Night A/B 2026-10-27-r2127: 34 of 48 advice turns hit the step limit alternating the same two
+# calls, and "Stopped after reaching the tool-step limit" was the whole reply.
+ADVICE_TOOLS_DONE = "\x00advice: tool phase over\x00"
+ADVICE_ANSWER_NOW = ("(Vega harness) No more tool calls this turn: answer the user now, from the "
+                     "project review above and what your calls showed.")
+ANSWER_NOW = ("(Vega harness) No more tool calls this turn: answer the user now, from what your "
+              "calls and the notes above showed.")
+ADVICE_TOOL_CHARS = 2400  # this turn's tool results, as text, in the forced answer's request
+
 REPEAT_STOP_ANSWER = (
     "Stopped: the model kept repeating a call that had already failed ({failure}), so the turn "
     "was ended instead of spending more steps on it. Send a follow-up prompt to continue."
@@ -416,7 +468,8 @@ class FinishGate:
             files = set()
         only = routing._only_paths(masked, files)
         gate.protected = routing._protected(masked)
-        gate.scoped = bool(routing.read_only(task) or _OTHER_SCOPE.search(masked) or only)
+        gate.scoped = bool(routing.read_only(task) or _OTHER_SCOPE.search(masked) or only
+                           or extensions.read_only_task(task))
         gate.allowed = set(named) | helpers | only
         gate.task = task
         gate.change = asks_for_change(route, task)
@@ -468,6 +521,7 @@ class FinishGate:
 
 
 NO_EDIT_ROUNDS = 1  # finish_gate_no_edit: send-backs per turn for a change with no write
+FINISH_PROBLEM_ROUNDS = 2  # extensions.finish_problems: send-backs per turn
 NO_EDIT_NOTE = (
     "The task asks for a change to the project's code, but no file was written or edited this "
     "turn: an answer in prose changes nothing. Find the file responsible (search_code / "
@@ -494,10 +548,14 @@ def asks_for_change(route: dict[str, Any], task: str) -> bool:
     verb that edits ("fix", "build", "add"; not only "run"/"install"), or "must" requirements.
     A change only by the router's fallback ("no question form: treated as a change": "read
     a.txt", "Look up how widget 2.0 sets a timeout", "Say hi.") or by "run" counts only when the
-    task reads like a bug report ("/help ... doesn't mention /undo ... /help should list")."""
+    task reads like a bug report ("/help ... doesn't mention /undo ... /help should list").
+    Never for a task an extension reads as read-only (extensions.read_only_task: "Do not change,
+    move or delete any file", whatever the change verbs of its intro)."""
     from . import routing
 
     if not route.get("change") or route.get("question"):
+        return False
+    if extensions.read_only_task(task):
         return False
     if any(str(r).startswith("states requirements") for r in route.get("reasons") or []):
         return True
@@ -551,7 +609,8 @@ _HASH_COMMENT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".rb", ".r", ".pl", ".y
                           ".dockerfile", ""}
 _DASH_COMMENT_SUFFIXES = {".sql", ".lua", ".hs"}
 # a line standing for elided code: "...", "…", "// ... existing code ...", "# ... rest unchanged"
-_ELIDED = re.compile(r"^\s*(?:(?://|#|/\*|<!--|--)\s*)?(?:\.\.\.|…)")
+# (shared with the elision_guard write check)
+_ELIDED = ELIDED_LINE
 # a one-line block that states a value: a dependency pin (`requests==2.32.3`, `numpy>=2.0`) or
 # an assignment (`API_VERSION = "v2"`, `timeout: 30`)
 _PIN_LINE = re.compile(r"^[A-Za-z0-9][\w.\-\[\],]*\s*(?:===|==|>=|<=|~=|!=|>|<)\s*[\w.*+!-]+"
@@ -706,6 +765,7 @@ def unwritten_details(answer: str, project: Path, task: str = "") -> list[tuple[
         if shown_json is not None and not (names and names[-1].strip("`*").endswith(".json")):
             template = _template_file(shown_json, templates)
             names = [template] if template else names
+            features.mark_acted("finish_gate_answer_file", where="json_block")
         if not names:
             continue
         path = names[-1].strip("`*")
@@ -739,13 +799,16 @@ def unwritten_details(answer: str, project: Path, task: str = "") -> list[tuple[
                     or _OLD_LABEL.search(before.rstrip().rsplit("\n", 1)[-1]):
                 continue
             wanted = _squeezed(one, suffix)
+            features.mark_acted("finish_gate_answer_file", where="one_line")
             if wanted and wanted not in {_squeezed(line, suffix) for line in text.splitlines()}:
                 found.append((path, f"the file has no line `{one}`"))
             continue
         current = {line.strip() for line in text.splitlines()}
-        if sum(line in current for line in code) < 0.8 * len(code) and not (
-                normalised and _shown_in_file(body, text, suffix)):
-            found.append((path, ""))
+        if sum(line in current for line in code) < 0.8 * len(code):
+            if normalised and _shown_in_file(body, text, suffix):
+                features.mark_acted("finish_gate_normalised", path=path)
+            else:
+                found.append((path, ""))
     return found
 
 
@@ -1260,6 +1323,8 @@ class CodingAgent:
         self.project = project.resolve()
         self.can_write = can_write
         self.can_delegate = can_delegate
+        # whether delegate_task is offered to the model (False: one agent does the whole turn)
+        self.offer_delegate = True
         self.allow_commands = allow_commands
         self.max_steps = max_steps
         self.stream = stream
@@ -1271,6 +1336,8 @@ class CodingAgent:
                     else web.WebSession(self.project, backend=web.NoBackend()))
         self.approve_web: web.Approver | None = None
         self._stop = threading.Event()  # set by request_stop(); checked between steps
+        self._child: CodingAgent | None = None  # a running delegate_task sub-agent
+        self._parent_stop: threading.Event | None = None  # the delegating agent's stop flag
         self.undo_depth = undo_depth
         self.checkpoints: list[dict[Path, FileSnapshot]] = []
         self._turn: dict[Path, FileSnapshot] = {}
@@ -1280,6 +1347,10 @@ class CodingAgent:
         route = connection(self.model)  # an endpoint profile's own server, else VEGA_BASE_URL
         self.base_url = route.base_url
         self.client = OpenAI(base_url=self.base_url, api_key=os.getenv("VEGA_API_KEY", "ollama"))
+        # a reply whose prompt reached the server's window: the server cut the prompt
+        self.truncated_prompts = 0
+        self._served_window: int | None = None
+        self.client = context.TruncationWatch(self.client, self.served_window, self._prompt_truncated)
         if route.model != self.model:  # requests carry Vega's name; that server expects its own
             self.client = ServedName(self.client, self.model, route.model)
         if debuglog.enabled():  # VEGA_DEBUG: log every request and reply for `vega debug watch`
@@ -1297,6 +1368,12 @@ class CodingAgent:
         self.messages: list[dict[str, Any]] = []
         self.plan: list[dict[str, str]] = []
         self._last_prompt_tokens: int | None = None
+        # lab grow_context: the switch to a larger-window alias ({step, from, to, ...}); once
+        # grown the agent keeps that model and window for the rest of its life (never back)
+        self.grew_context: dict[str, Any] | None = None
+        self._keep_tokens: int | None = None  # cap on history kept by a compaction after growing
+        self._grow_timing_pending = False  # the first request after growing: record its time
+        self._turn_compactions = 0
         self._context_signature: tuple[tuple[str, int, int], ...] | None = None
         self._notice_checked = False  # the one-time project_context notice, on the first turn
         # verify_before_finish and claim_check (autopilot runs its own check after every round)
@@ -1312,6 +1389,11 @@ class CodingAgent:
         self.last_acceptance: Any = None  # the last full acceptance Result (the Release checklist)
         self._acceptance_changed: list[str] = []
         self._gate_originals: dict[str, str | None] = {}  # finish_gate: files written this turn
+        # baseline_aware_gate: the tests failing before the session's first edit, and whether
+        # that moment has passed (a baseline is taken only before it)
+        self._test_baseline: baseline_gate.Baseline | None = None
+        self._baseline_closed = False
+        self._baseline_report = ""  # pre-existing failures to report once at the finish
         self.reset()
 
     @property
@@ -1321,6 +1403,25 @@ class CodingAgent:
             self._num_ctx, self.num_ctx_source = context.resolve_num_ctx(self.model)
         return self._num_ctx
 
+    def served_window(self) -> int:
+        """The window the server runs this model with (Ollama /api/show), else num_ctx; the
+        smaller of the two decides where a prompt is cut. Discovered once per agent."""
+        if self._served_window is None:
+            served = None
+            from . import server
+
+            if server._endpoint_profile(self.model) is None:
+                try:
+                    served = server.context_length(self.model)
+                except Exception:  # noqa: BLE001 - unknown: the budget is the best guess
+                    served = None
+            self._served_window = min(served, self.num_ctx) if served else self.num_ctx
+        return self._served_window
+
+    def _prompt_truncated(self, prompt_tokens: int, window: int) -> None:
+        self.truncated_prompts += 1
+        self._emit("truncated_prompt", prompt_tokens=prompt_tokens, window=window)
+
     def reset(self) -> None:
         """Start a fresh conversation while keeping the current project and settings."""
         self.messages = [{"role": "system", "content": self._system_content()}]
@@ -1328,6 +1429,33 @@ class CodingAgent:
         self.work_log = context.WorkLog()
         self._budget: context.Budget | None = None
         self._clarify_pending: str | None = None  # the request Vega last asked questions about
+        self._clarify_defaults = ""  # the recommended options of those questions ("defaults")
+        self._clarify_assumptions: list[str] = []  # what Vega assumed for this turn's request
+        # the questions this turn's answer asks the user, as (question, options) items (clarify);
+        # None on a turn that asks none. The final event carries them for the UIs.
+        self.questions_asked: list[Any] | None = None
+
+    def change_project(self, project: Path) -> None:
+        """Work in another folder from now on, keeping the conversation: the per-project state
+        (undo checkpoints, the turn's acceptance and test baseline, the project-context notice)
+        starts over and the system message is rebuilt for the new folder (a one-off change of the
+        cached prompt prefix). The earlier messages stay, so a request made before the switch
+        can be carried out in the new project."""
+        self.project = Path(project).resolve()
+        self.web.project = self.project
+        self.checkpoints = []
+        self._turn = {}
+        self._notice_checked = False
+        self._acceptance = None
+        self.last_acceptance = None
+        self._acceptance_changed = []
+        self._gate_originals = {}
+        self._test_baseline = None
+        self._baseline_closed = False
+        self._baseline_report = ""
+        self.plan = []
+        self.work_log = context.WorkLog()
+        self.messages[0] = {**self.messages[0], "content": self._system_content()}
 
     def _system_content(self) -> str:
         system = (
@@ -1344,13 +1472,15 @@ class CodingAgent:
             self._context_signature = project_context.signature(self.project)
             self.context_section = project_context.section(
                 self.project, include_notes=features.on("remember"),
-                remember=self.can_write and features.on("remember"))[0]
+                # the remember tool is offered only while the system prompt says how to use it
+                remember=(self.can_write and features.on("remember")
+                          and _REMEMBER_TEXT in system))[0]
             system += self.context_section
         else:
             notes = load_notes(self.project, NOTES_CHARS) if features.on("remember") else None
             if notes:
                 system += notes_section(notes)
-        if self.can_write and features.on("manage_gitignore"):
+        if self.can_write:
             from . import gitignore
 
             if gitignore.in_work_tree(self.project):
@@ -1396,12 +1526,13 @@ class CodingAgent:
         cached, so the first real request only has to read the user's message. Also loads the model
         if it was unloaded. Meant to run in a background thread at chat start; never raises."""
         tools = tool_specs(
-            include_delegate=self.can_delegate,
+            include_delegate=self.can_delegate and self.offer_delegate,
             include_remember=self.can_write and features.on("remember"),
             include_plan=self.planning == "on" and features.on("plan"),
             include_index=features.on("code_index"), include_knowledge=knowledge_available(),
             include_definition=features.on("edit_by_name"),
         ) + (web.tool_specs() if self.web.available() else [])
+        tools = extensions.tool_list(tools, "", agent=self)  # as a turn that asks for none of them
         self.refresh_context_files()
         sampling = {key: value for key, value in self.sampling.items() if key != "max_tokens"}
         probe = {"role": "user", "content": "Reply OK."}
@@ -1433,13 +1564,18 @@ class CodingAgent:
     def _emit(self, kind: str, **data: Any) -> None:
         if kind not in {"text", "text_end"}:  # streamed tokens are in the logged reply
             debuglog.record("event", event=kind, data=data)
+            extensions.agent_event(self, kind, data)
         if self.on_event is not None:
             self.on_event(kind, data)
 
     def request_stop(self) -> None:
         """Ask a running turn to stop after its current step (thread-safe, cooperative). The turn
-        then ends with STOPPED; every tool call already in the history gets a result."""
+        then ends with STOPPED; every tool call already in the history gets a result. A running
+        delegate_task sub-agent is stopped too."""
         self._stop.set()
+        child = self._child
+        if child is not None:
+            child.request_stop()
 
     @property
     def stop_requested(self) -> bool:
@@ -1447,13 +1583,20 @@ class CodingAgent:
 
     def run(self, task: str) -> str:
         self._turn = {}
+        self.questions_asked = None
+        self._clarify_assumptions = []
         self._repro = None
         self._stop.clear()
+        if self._parent_stop is not None and self._parent_stop.is_set():
+            self._stop.set()  # a delegated sub-agent whose parent was stopped before it began
+        features.new_turn()
         if debuglog.enabled():
             debuglog.record("turn", task=task, model=self.model, project=str(self.project),
                             features_off=sorted(features.disabled()),
                             features_on=sorted(features.enabled()))
         self.refresh_context_files()
+        if features.on("project_context") and getattr(self, "context_section", ""):
+            features.mark_acted("project_context")  # the system message carries the section
         if features.on("project_context") and not getattr(self, "_notice_checked", False):
             self._notice_checked = True
             from . import project_context
@@ -1471,6 +1614,10 @@ class CodingAgent:
                 if clarified == task:
                     direct = clarify.run(self, task)
                 task = clarified
+                if direct is None and self._clarify_assumptions:  # a clear request, choices open
+                    task = f"{task}\n\n{clarify.assumptions_note(self._clarify_assumptions)}"
+                    self._emit("notice", message=clarify.assumptions_text(
+                        self._clarify_assumptions).replace("\n", " "))
             self._start_acceptance(task)
             self.last_route = {"name": "clarify", "reasons": ["clarify_first asked questions"]} \
                 if direct is not None else None
@@ -1484,14 +1631,30 @@ class CodingAgent:
                 debuglog.record("stage", stage="route", **self.last_route)
             elif direct is None:
                 direct = self._run_routed(task)
-            answer, streamed = (direct, False) if direct is not None else self._run(task)
+            answer, streamed = (direct, False) if direct is not None else self._run_advice(task)
+            addendum = ""
+            if direct is None:  # the agent loop's answer (a pipeline's went through its own)
+                given = answer
+                answer = extensions.final_answer(
+                    answer, source="agent", agent=self, task=task, spec=self._acceptance,
+                    written=list(self._acceptance_changed), stop=self._stop,
+                    baseline=self._test_baseline)
+                if answer != given:  # a streamed answer is on screen already: show what was added
+                    addendum = answer.removeprefix(given)
             if direct is None and self._repro is not None:
                 self._repro_finish()
+            assumed = getattr(self, "_clarify_assumptions", [])
+            if assumed and not answer.lstrip().startswith("Assumptions:"):
+                from . import clarify
+
+                answer = f"{clarify.assumptions_text(assumed)}\n\n{answer}"
         finally:
             self._save_checkpoint()
         if self.teach:  # shown to the user, kept out of the model's later context
             teaching.strip_history(self.messages)
-        self._emit("final", text=answer, streamed=streamed)
+        self._emit("final", text=answer, streamed=streamed,
+                   **({"addendum": addendum.strip()} if addendum.strip() else {}),
+                   **({"questions": self.questions_asked} if self.questions_asked else {}))
         return answer
 
     def _run_routed(self, task: str) -> str | None:
@@ -1501,7 +1664,7 @@ class CodingAgent:
 
         try:
             route = routing.route_task(task, self.project, num_ctx=self.num_ctx,
-                                       can_write=self.can_write)
+                                       can_write=self.can_write, agent=self)
         except Exception as exc:  # noqa: BLE001 - routing never fails a turn
             route = routing.Route(routing.AGENT, [f"routing failed: {exc}"])
         switch = {routing.QUESTION: "question_pipeline", routing.DIRECT: "direct_pipeline",
@@ -1514,6 +1677,7 @@ class CodingAgent:
         self.last_route = record
         debuglog.record("stage", stage="route", **record)
         answer = None
+        before = len(self.messages)
         if route.name == routing.QUESTION:
             from . import question_pipeline
 
@@ -1537,6 +1701,118 @@ class CodingAgent:
         if answer is None and route.name != routing.AGENT:
             record["fell_back"] = True  # the pipeline declined at run time: the agent loop ran
             debuglog.record("stage", stage="route.fell_back", route=route.name)
+        elif answer is not None:  # the question and project pipelines record their exchange
+            extensions.routed_answer(self, task, answer, before=before, route=route.name)
+        return answer
+
+    def _run_advice(self, task: str) -> tuple[str, bool]:
+        """The agent loop; for a read-only advice turn (route mode "advise", set only by an
+        extension's route_task hook: "what should we do next?") with no write tool on offer,
+        writes refused (can_write off for the turn), a shell command only when it is read-only
+        inspection, and at most the route's `steps` tool steps. The session's settings are
+        restored afterwards. Mode "answer" (vega_lab.request_position: a question, or "run X and
+        show me" after the harness ran it) is the same read-only turn; mode "reply" is one
+        answer with no tools (_reply_answer)."""
+        route = self.last_route if isinstance(self.last_route, dict) else {}
+        if route.get("mode") in ("reply", "knowledge"):
+            return self._reply_answer(task, knowledge=route.get("mode") == "knowledge"), False
+        if route.get("mode") not in ("advise", "answer"):
+            return self._run(task)
+        saved = self.can_write, self.max_steps
+        steps = route.get("steps")
+        if isinstance(steps, int) and steps > 0:
+            self.max_steps = min(self.max_steps, steps)
+        self.can_write, self._advice_turn = False, True
+        try:
+            answer, streamed = self._run(task)
+            if answer == ADVICE_TOOLS_DONE:  # the tool steps are used up: answer without tools
+                answer, streamed = self._advice_answer(task), False
+            return answer, streamed
+        finally:
+            (self.can_write, self.max_steps), self._advice_turn = saved, False
+
+    def _reply_answer(self, task: str, *, knowledge: bool = False) -> str:
+        """Route mode "reply" (set only by an extension's route_task hook: an acknowledgement, or
+        a question with nothing in the project to look up, vega_lab.request_position): one model
+        request with no tools on offer, holding the system prompt, the conversation's last text
+        exchanges, the request, the extension's answer context and BRIEF_REPLY. Nothing is read,
+        run or written; the exchange is kept in the history. Mode "knowledge"
+        (vega_lab.answer_source): the same request with KNOWLEDGE_SYSTEM as the system prompt and
+        no BRIEF_REPLY cap."""
+        messages = self.messages
+        earlier = [m for m in messages[1:] if m.get("role") in ("user", "assistant")
+                   and isinstance(m.get("content"), str) and m["content"].strip()
+                   and not m.get("tool_calls")][-4:]
+        note = home_start.answer_note(self, task,
+                                      extensions.answer_context(self, task, route=self.last_route))
+        system = {"role": "system", "content": KNOWLEDGE_SYSTEM} if knowledge else messages[0]
+        tail = "\n\n".join(p for p in (note, "" if knowledge else BRIEF_REPLY) if p)
+        request = [system, *[{"role": m["role"], "content": m["content"][:1500]}
+                             for m in earlier],
+                   {"role": "user", "content": task},
+                   *([{"role": "user", "content": tail}] if tail else [])]
+        messages.append({"role": "user", "content": task})
+        self._emit("request", step=0)
+        debuglog.record("stage", stage="reply.answer", chars=sum(len(m["content"]) for m in request),
+                        knowledge=knowledge)
+        try:
+            response = self.client.chat.completions.create(model=self.model, messages=request,
+                                                           **self.sampling)
+            answer = (response.choices[0].message.content or "").strip()
+        except Exception as exc:  # noqa: BLE001 - reported like a failed request in the loop
+            if self._stop.is_set():
+                return STOPPED
+            return (f"Model request failed: {exc}\nCheck that the model server is running and "
+                    "supports tool calling.")
+        answer = strip_harness_echo(answer)[0] or answer or "(The model returned no text.)"
+        messages.append({"role": "assistant", "content": answer})
+        return answer
+
+    def _advice_answer(self, task: str) -> str:
+        """The forced answer step of an advice turn: one model request with no tools on offer,
+        holding the system prompt, the conversation's earlier text exchanges, the request, the
+        extension's answer context (the project review and the answer rules) and this turn's tool
+        results as plain text. The reply is the turn's answer."""
+        messages = self.messages
+        start = next((n for n in range(len(messages) - 1, -1, -1)
+                      if messages[n].get("role") == "user" and messages[n].get("content") == task),
+                     len(messages))
+        earlier = [m for m in messages[1:start] if m.get("role") in ("user", "assistant")
+                   and isinstance(m.get("content"), str) and m["content"].strip()
+                   and not m.get("tool_calls")][-4:]
+        seen: list[str] = []
+        names: dict[str, str] = {}
+        for message in messages[start + 1:]:
+            for call in message.get("tool_calls") or []:
+                function = call.get("function", {})
+                names[call.get("id", "")] = f"{function.get('name')}({function.get('arguments')})"
+            if message.get("role") == "tool" and not str(message.get("content") or "") \
+                    .startswith("(Vega harness)"):  # a repeat note adds nothing here
+                label = names.get(message.get("tool_call_id", ""), "a tool call")
+                seen.append(f"{label}:\n{str(message.get('content') or '')[:800]}")
+        shown = "\n\n".join(seen)[-ADVICE_TOOL_CHARS:]
+        note = home_start.answer_note(self, task,
+                                      extensions.answer_context(self, task, route=self.last_route))
+        parts = [note, f"What your tool calls showed this turn:\n{shown}" if shown else "",
+                 ANSWER_NOW if (self.last_route or {}).get("mode") == "answer" else ADVICE_ANSWER_NOW]
+        request = [messages[0], *[{"role": m["role"], "content": m["content"][:1500]}
+                                  for m in earlier],
+                   {"role": "user", "content": task},
+                   {"role": "user", "content": "\n\n".join(p for p in parts if p)}]
+        self._emit("request", step=self.max_steps)
+        debuglog.record("stage", stage="advice.answer", tool_results=len(seen),
+                        chars=sum(len(m["content"]) for m in request))
+        try:
+            response = self.client.chat.completions.create(model=self.model, messages=request,
+                                                           **self.sampling)
+            answer = (response.choices[0].message.content or "").strip()
+        except Exception as exc:  # noqa: BLE001 - reported like a failed request in the loop
+            if self._stop.is_set():
+                return STOPPED
+            return (f"Model request failed: {exc}\nCheck that the model server is running and "
+                    "supports tool calling.")
+        answer = strip_harness_echo(answer)[0] or answer or "(The model returned no text.)"
+        messages.append({"role": "assistant", "content": answer})
         return answer
 
     def _likely_places(self, task: str) -> str:
@@ -1581,25 +1857,38 @@ class CodingAgent:
             self.plan = []  # a finished plan from an earlier turn is no longer useful context
         messages = self.messages  # compaction rewrites this list in place
         available_tools = tool_specs(
-            include_delegate=self.can_delegate,
+            include_delegate=self.can_delegate and self.offer_delegate,
             include_remember=self.can_write and features.on("remember"),
             include_plan=self._plan_turn, include_index=features.on("code_index"),
             include_knowledge=knowledge_available(),
             include_definition=features.on("edit_by_name"),
         )
+        available_tools = extensions.tool_list(available_tools, task, agent=self)
+        if features.on("code_index"):  # the system prompt's index lines (and repo_map/search_code) differ
+            features.mark_acted("code_index", where="agent_turn")
         self.web.start_turn(task)
         if self.web.available():
             available_tools += web.tool_specs()
+        advise = getattr(self, "_advice_turn", False)  # a read-only advice turn (_run_advice)
+        if advise:
+            available_tools = [spec for spec in available_tools
+                               if spec.get("function", {}).get("name") not in _WRITE_TOOLS]
         budget = self._get_budget(available_tools)
         constrained = features.on("constrained")
         actions_text = actions_section(available_tools) if constrained else ""
         response_format = action_response_format(available_tools) if constrained else None
         if constrained:  # the tool list travels in the system prompt instead of as tool specs
             budget.fixed_tokens = context.estimate_text_tokens(actions_text)
-        result_chars = (
-            context.tool_result_budget(self.num_ctx) if features.on("result_cap") else 10**9
-        )
+        result_chars = context.tool_result_budget(self.num_ctx)
+        self._turn_compactions = 0
+        # an extension's context for answering this turn: a trailing message on each request
+        answer_note = home_start.answer_note(
+            self, task, extensions.answer_context(self, task, route=getattr(self, "last_route", None)))
         used_tools = nudged = claim_checked = parse_checked = plan_checked = False
+        # an advice turn whose extension gathered the project (its answer_context): the harness
+        # has looked, so an answer without a tool call is not sent back to inspect
+        used_tools = bool(advise and answer_note)
+        advice_repeated = False  # an advice turn repeated a call: its tool phase is over
         cite_rounds = 0  # web_citations send-backs this turn
         facet_checked = False  # web_facet_fetch: the uncovered-facet send-back (once per turn)
         write_called = False  # web_fetch_first: a write tool was called this turn
@@ -1609,6 +1898,10 @@ class CodingAgent:
             else None
 
         def loop_before_write(plan: WritePlan) -> str | None:
+            if (features.on("noop_write_repeat") and plan.tool in _WRITE_TOOLS
+                    and plan.before is not None and plan.before == plan.after):
+                debuglog.record("stage", stage="noop_write", tool=plan.tool, path=plan.relative)
+                return NOOP_WRITE.format(path=plan.relative)
             if guard is not None and plan.tool in _WRITE_TOOLS:
                 note = guard.check(plan.tool, plan.relative, plan.before, plan.after)
                 if note is not None:
@@ -1617,6 +1910,7 @@ class CodingAgent:
                     self._emit("discarded", reason="write would lose what the file held",
                                retry=True)
                     return note
+            self._baseline_before_change(task)  # baseline_aware_gate: before the first edit
             return self._before_write(plan)
 
         malformed = 0
@@ -1625,7 +1919,8 @@ class CodingAgent:
         plan_from_text = False
         failed_calls: dict[tuple[str, str], str] = {}  # (tool, args) -> first line of its error
         refused_at: dict[tuple[str, str], int] = {}  # a refused write's call -> writes then
-        repeat_fires = 0  # repeat_stop: guarded repeats since a call last ran without failing
+        repeat_fires = 0  # repeat_stop: guarded repeats since project state last changed
+        repeat_writes = 0  # `writes` when repeat_fires was last counted
         repeat_stop: str | None = None  # the failure repeated REPEAT_STOP times: end the turn
         writes = 0  # successful edits, and commands run (they may change files)
         # (tool, args) of a read-only call made this turn -> (writes when it ran, its ledger line);
@@ -1637,6 +1932,7 @@ class CodingAgent:
         asked_checked = False
         review_checked = False
         empty_checked = False
+        lost_replies = 0  # replies with tokens but no text and no call (see LOST_REPLY_TOKENS)
         wrote = False
         # verify_before_finish / claim_check: tool calls run so far, the call that made the last
         # successful write, and each check or command run with an exit code: (call, command, result)
@@ -1655,6 +1951,7 @@ class CodingAgent:
         # finish_gate: what the task asks for, read before the first write; final answers sent
         # back this turn; the last per-write acceptance line
         self._gate_originals = {}
+        self._baseline_report = ""  # baseline_aware_gate: pre-existing failures to report once
         gate: FinishGate | None = None
         if (features.on("finish_gate") and self.can_write and self.finish_checks
                 and not question_pipeline.is_conversation(task)
@@ -1664,9 +1961,13 @@ class CodingAgent:
                 gate = FinishGate.for_task(task, self.project, route)
             except Exception as exc:  # noqa: BLE001 - the gate never fails a turn
                 debuglog.record("stage", stage="finish_gate.error", error=str(exc))
+        if self.can_write:
+            extensions.turn_started(self, task, spec=self._acceptance,  # before the first write
+                                    stop=self._stop)
         gate_rounds = 0
         gate_states: set[tuple[int, str]] = set()
         no_edit_rounds = 0  # finish_gate_no_edit: change task with no write, sent back
+        problem_rounds = 0  # extensions.finish_problems: sent back this turn
         tie_checked = False  # localize_ties: the first source write was checked (once a turn)
         commands_run: list[str] = []  # finish_gate_no_edit: this turn's run_command commands
         # constraint_docs: the documents the task names as its rules, read this turn or not;
@@ -1703,14 +2004,18 @@ class CodingAgent:
 
         # A question to Vega or small talk: no act/content nudges, which are for work on the project
         # (the live "what can you do" answer was sent back and replaced by a 2-minute search).
-        conversation = question_pipeline.is_conversation(task)
+        conversation = question_pipeline.is_conversation(task) and not advise
+        # extensions: text added to this turn's requests (a trailing message, never in the history)
+        turn_context = extensions.system_context(
+            self, task, conversation=conversation,
+            route=self.last_route if isinstance(getattr(self, "last_route", None), dict) else None)
 
         def sent_back_at_end(content: str | None) -> bool:
             """End-of-turn checks on a would-be final answer: True if it was sent back."""
             nonlocal nudged, parse_checked, claim_checked, plan_checked, plan_from_text, echo_checked
             nonlocal asked_checked, review_checked, verify_rounds, contradiction_checked, calls_run
             nonlocal grounding_sent, accept_rounds, accept_full, cite_rounds, gate_rounds, facet_checked
-            nonlocal constraint_quoted, no_edit_rounds
+            nonlocal constraint_quoted, no_edit_rounds, problem_rounds
             cleaned, echoed = strip_harness_echo(content or "")
             if echoed and len(cleaned) < 20 and not echo_checked:
                 echo_checked = True  # nothing of its own left: ask once for a real answer
@@ -1720,6 +2025,9 @@ class CodingAgent:
                 extract_text_plan(content or "")
                 if self._plan_turn and not plan_from_text and not wrote else None
             )
+            if text_plan and extensions.keep_answer(content or "", reason="plan written as text",
+                                                    agent=self, task=task, wrote=bool(wrote)):
+                return False  # e.g. the plan the request asked for before any code
             if text_plan:
                 # The 7B tends to write its plan out instead of calling update_plan. Keep the
                 # plan and move it on to acting, rather than accepting the plan as the answer.
@@ -1728,25 +2036,34 @@ class CodingAgent:
                 send_back(PLAN_RECORDED, "plan written as text")
                 return True
             if (not used_tools and not nudged and features.on("nudge_act")
-                    and not question_pipeline.is_conversation(task)):
+                    and not conversation):
                 nudged = True
-                send_back(QUESTION_NUDGE if question_pipeline.is_question(task) else ACT_NUDGE,
+                features.mark_acted("nudge_act", where="no_tools")
+                send_back(QUESTION_NUDGE if advise or question_pipeline.is_question(task)
+                          else ACT_NUDGE,
                           RETRY_REASONS[ACT_NUDGE])
                 return True
             if (not wrote and not asked_checked and features.on("nudge_act") and not conversation
                     and asks_for_project_content(content or "")):
                 # Seen in chat: after one search the 7B asked the user to paste the function.
                 asked_checked = True
-                send_back(ASK_FOR_CONTENT, "asked the user for project content")
+                reason = "asked the user for project content"
+                if extensions.keep_answer(content or "", reason=reason, agent=self, task=task,
+                                          wrote=bool(wrote)):
+                    return False
+                features.mark_acted("nudge_act", where="asked_for_content")
+                send_back(ASK_FOR_CONTENT, reason)
                 return True
             still_broken = [path for path, bad in broken.items() if bad]
             if still_broken and not parse_checked and features.on("nudge_parse"):
                 parse_checked = True
+                features.mark_acted("nudge_parse", paths=still_broken)
                 send_back(broken_files_note(still_broken), "edited files fail to parse")
                 return True
             if (not wrote and not claim_checked and features.on("nudge_claim")
                     and claims_change(content)):
                 claim_checked = True
+                features.mark_acted("nudge_claim")
                 send_back(UNSAVED_CLAIM, RETRY_REASONS[UNSAVED_CLAIM])
                 return True
             unfinished = [item for item in self.plan if item["status"] != "done"]
@@ -1754,7 +2071,20 @@ class CodingAgent:
                 plan_checked = True
                 send_back(unfinished_plan_note(self.plan), "plan has unfinished items")
                 return True
-            if (wrote and self._acceptance is not None and self.finish_checks
+            # extensions.finish_check: one check run of the whole turn and one note, in place of
+            # the acceptance finish gate, verify_before_finish and claim_check below
+            owned = False
+            if (wrote and self.finish_checks and not conversation
+                    and not question_pipeline.is_question(task)):
+                checked = extensions.finish_check(
+                    self, task, written=list(self._acceptance_changed), answer=content or "",
+                    writes=writes, stop=self._stop, baseline=self._test_baseline)
+                if checked is not None:
+                    owned = True
+                    if checked.get("note"):
+                        send_back(checked["note"], "checked against the task")
+                        return True
+            if (wrote and self._acceptance is not None and self.finish_checks and not owned
                     and accept_rounds < acceptance.FEEDBACK_ROUNDS
                     and not conversation and not question_pipeline.is_question(task)):
                 # Vega's own check against the task, as the gate (it also runs the task's
@@ -1774,6 +2104,25 @@ class CodingAgent:
                     accept_states.add(accepted.state())
                     accept_rounds += 1
                     send_back(acceptance.finish_note(accepted), "checked against the task")
+                    return True
+                if self._baseline_report:  # baseline_aware_gate: reported once, not as work
+                    note, self._baseline_report = self._baseline_report, ""
+                    send_back(note, "pre-existing test failures")
+                    return True
+            if (problem_rounds < FINISH_PROBLEM_ROUNDS and self.can_write and self.finish_checks
+                    and not conversation and not question_pipeline.is_question(task)):
+                # extensions: what the turn still owes (e.g. a file the request names, not written)
+                owed = extensions.finish_problems(self, task, wrote=wrote, answer=content or "",
+                                                  round=problem_rounds + 1)
+                if owed:
+                    problem_rounds += 1
+                    debuglog.record("stage", stage="finish_problems", round=problem_rounds,
+                                    problems=owed)
+                    reason = "the task is not done yet"
+                    if extensions.keep_answer(content or "", reason=reason, agent=self,
+                                              task=task, wrote=bool(wrote)):
+                        return False  # e.g. a question about the user's intent stands
+                    send_back(finish_gate_note(owed), reason)
                     return True
             if gate is not None and gate_rounds < FINISH_GATE_ROUNDS:
                 problems = gate.problems(self.project, self._gate_originals)
@@ -1803,14 +2152,19 @@ class CodingAgent:
                         else None)
                     if missing:
                         no_edit_rounds += 1
+                        features.mark_acted("finish_gate_no_edit")
                         problems.append(missing)
                 if problems:
                     gate_rounds += 1
                     debuglog.record("stage", stage="finish_gate", round=gate_rounds,
                                     problems=problems)
-                    send_back(finish_gate_note(problems), "the task is not done yet")
+                    reason = "the task is not done yet"
+                    if extensions.keep_answer(content or "", reason=reason, agent=self,
+                                              task=task, wrote=bool(wrote)):
+                        return False
+                    send_back(finish_gate_note(problems), reason)
                     return True
-            if (wrote and verify_rounds < VERIFY_ROUNDS and self.finish_checks
+            if (wrote and verify_rounds < VERIFY_ROUNDS and self.finish_checks and not owned
                     and features.on("verify_before_finish")
                     and not conversation and not question_pipeline.is_question(task)):
                 command = check_feedback.project_command(self.project, task)
@@ -1818,16 +2172,17 @@ class CodingAgent:
                                        for at, ran, _ in check_runs):
                     verify_rounds += 1
                     calls_run += 1  # the harness's run comes after the last write
-                    note = self._verify(command, check_runs, calls_run)
+                    note = self._verify(command, check_runs, calls_run, task)
                     if note:
                         send_back(note, "checked before finishing")
                         return True
             if (features.on("claim_check") and self.finish_checks and not contradiction_checked
-                    and (wrote or check_runs)):
+                    and not owned and (wrote or check_runs)):
                 claim = check_feedback.success_claim(content or "")
                 after = [run for run in check_runs if run[0] > last_write_at]
                 if claim and (not after or check_feedback.exit_code(after[-1][2]) != 0):
                     contradiction_checked = True
+                    features.mark_acted("claim_check")
                     send_back(check_feedback.claim_note(claim, after[-1] if after else None),
                               "answer claims a check the last run contradicts")
                     return True
@@ -1839,6 +2194,7 @@ class CodingAgent:
                 note = self.web.citation_note(content or "", sources)
                 if note:
                     cite_rounds += 1
+                    features.mark_acted("web_citations")
                     send_back(note, "answer used the web but cites no page it read")
                     return True
             if not facet_checked and features.on("web_facet_fetch") and self.web.turn_urls:
@@ -1876,18 +2232,36 @@ class CodingAgent:
         for _ in range(self.max_steps):
             if self._stop.is_set():
                 return STOPPED, False
+            if advise and (advice_repeated or repeat_stop is not None):
+                debuglog.record("stage", stage="advice.tools_done", reason="repeated call", step=_)
+                return ADVICE_TOOLS_DONE, False
             if repeat_stop is not None:  # after the step's tool results were all stored
                 debuglog.record("stage", stage="repeat_stop", repeats=repeat_fires,
                                 failure=repeat_stop)
                 return REPEAT_STOP_ANSWER.format(failure=repeat_stop[:120]), False
             lesson = lesson_role = ""  # teach mode: this step's teaching line and its role
-            self._fit_context(goal, budget, ledger_summary())
+            self._fit_context(goal, budget, ledger_summary(), step=_)
+            result_chars = context.tool_result_budget(self.num_ctx)  # grow_window may change it
+            if self._stop.is_set():  # stopped while the history was compacted: send nothing
+                return STOPPED, False
             request = self._with_plan(messages, actions_text)
+            if turn_context:
+                request = [*request, {"role": "user", "content": turn_context}]
+            memory = extensions.memory_context(self, task, step=_)
+            if memory:  # extensions: kept outside the history, so compaction never drops it
+                request = [*request, {"role": "user", "content": memory}]
+            if answer_note:
+                request = [*request, {"role": "user", "content": answer_note}]
             if conversation:  # only the request, not the history: a short reply reads faster
                 request = [*request, {"role": "user", "content": BRIEF_REPLY}]
             if constrained:
                 request = to_action_messages(request)
             self._emit("request", step=_)
+            if debuglog.enabled():  # names the window's parts for its debug record (window_log)
+                from . import window_log
+
+                window_log.hint(task=task, project_context=getattr(self, "context_section", ""),
+                                memory=[memory, turn_context], notes=[answer_note], step=_)
             started = time.monotonic()
             try:
                 message, streamed = self._request(request, available_tools, _, response_format)
@@ -1905,13 +2279,15 @@ class CodingAgent:
                 "prompt_tokens": self._last_prompt_tokens,
                 "finish": self._last_finish_reason,
             })
+            if self._grow_timing_pending:
+                self._grown_request_timed(self.request_log[-1])
             sent_estimate = context.estimate_tokens(request) + budget.fixed_tokens
             budget.observe(self._last_prompt_tokens, len(messages), sent_estimate)
             calls = None if constrained else message.tool_calls
             if self._last_finish_reason == "length" and not calls:
                 # A runaway reply: never treat the truncated text as an answer or a tool call.
                 cut_off += 1
-                if cut_off > 1 or not features.on("nudge_length"):
+                if cut_off > 1:
                     return CUT_OFF_ANSWER, False
                 cut = {"role": "assistant", "content": (message.content or "")[:2000]}
                 messages.append({**cut, RAW_REPLY: True} if constrained else cut)
@@ -1957,7 +2333,23 @@ class CodingAgent:
                 fallback = _parse_text_tool_calls(message.content or "")
                 if not fallback:
                     messages.append(message.model_dump(exclude_none=True))
-                    if (features.on("nudge_malformed") and looks_like_failed_tool_call(message.content)
+                    reply_tokens = getattr(self, "_last_reply_tokens", None) or 0
+                    if not (message.content or "").strip() and reply_tokens > LOST_REPLY_TOKENS:
+                        # The model generated tokens but the server returned neither text nor a
+                        # call: Ollama dropped a tool call it could not parse (invalid JSON in
+                        # the arguments, or a tool that was not offered). Not a final answer.
+                        lost_replies += 1
+                        offered = [spec["function"]["name"] for spec in available_tools]
+                        debuglog.record("stage", stage="lost_reply", reply_tokens=reply_tokens,
+                                        finish=self._last_finish_reason, count=lost_replies,
+                                        tools=len(offered))
+                        note = extensions.lost_reply(
+                            self, task, reply_tokens=reply_tokens, count=lost_replies,
+                            finish=self._last_finish_reason, tools=offered)
+                        if note:
+                            send_back(note, "lost reply")
+                            continue
+                    if (looks_like_failed_tool_call(message.content)
                             and malformed < MAX_MALFORMED_RETRIES):
                         malformed += 1
                         send_back(MALFORMED_CALL, RETRY_REASONS[MALFORMED_CALL])
@@ -1967,6 +2359,7 @@ class CodingAgent:
                     if (not (message.content or "").strip() and not empty_checked
                             and features.on("empty_final")):
                         empty_checked = True  # once; a second empty reply ends as before
+                        features.mark_acted("empty_final")
                         send_back(EMPTY_FINAL, "empty final reply")
                         continue
                     answer = message.content or "(The model returned no text.)"
@@ -1996,6 +2389,7 @@ class CodingAgent:
                     continue
                 self._emit("tool_call", name=name, args=args)
                 call_key = (name, json.dumps(args, sort_keys=True, default=str))
+                ran: tuple[str, str] | None = None  # extensions.check_call: (command run, result)
                 first_write = name in _WRITE_TOOLS and not write_called
                 write_called = write_called or name in _WRITE_TOOLS
                 fetch_first = (self.web.fetch_first_note()
@@ -2032,6 +2426,7 @@ class CodingAgent:
                             tie_hold = localize.tie_hold_note(target, unread, self._likely_tied)
                             debuglog.record("stage", stage="localize_ties.hold", tool=name,
                                             path=target, unread=unread, tied=self._likely_tied)
+                executed = False  # the tool itself ran (extensions.tool_shown)
                 if "_error" in args:
                     result = args["_error"]
                 elif tie_hold is not None:
@@ -2066,13 +2461,23 @@ class CodingAgent:
                         and refused_at.get(call_key, writes) == writes):
                     # The same call already failed; running it again cannot help (the constrained
                     # 7B repeated failing edits up to 14 times, 2026-10-13).
+                    features.mark_acted("repeat_guard", tool=name)
                     result = repeated_failure_note(failed_calls[call_key], name)
+                    advice_repeated = advise
+                    if writes != repeat_writes:  # a write saved or a command ran since: progress
+                        repeat_fires, repeat_writes = 0, writes
                     repeat_fires += 1
-                    if repeat_fires >= REPEAT_STOP and features.on("repeat_stop"):
+                    stop_at = REPEAT_STOP if features.on("repeat_stop_reads") else REPEAT_STOP_OLD
+                    if repeat_fires >= REPEAT_STOP_OLD and features.on("repeat_stop_reads"):
+                        # the old rule's count is never higher (it also resets on calls that
+                        # ran): below 3 neither rule stops, from 3 on they may differ
+                        features.mark_acted("repeat_stop_reads", fires=repeat_fires)
+                    if repeat_fires >= stop_at and features.on("repeat_stop"):
                         repeat_stop = failed_calls[call_key]
                     if features.on("turn_ledger"):
                         ledger_repeats += 1
                         if ledger_repeats >= LEDGER_STUCK:
+                            features.mark_acted("turn_ledger", where="stuck_note")
                             result += "\n" + stuck_note(ledger_repeats)
                     self._emit("discarded", reason="repeated a failing call", retry=True)
                 elif (features.on("turn_ledger") and name in _READ_TOOLS
@@ -2082,16 +2487,32 @@ class CodingAgent:
                     # (live session 2026-10-15: after compaction the model re-ran the searches it
                     # had made before it, then started the whole test suite).
                     ledger_repeats += 1
+                    features.mark_acted("turn_ledger", where="repeat")
                     result = ledger_repeat_note(ledger[call_key][1], ledger_repeats)
+                    advice_repeated = advise
                     self._emit("discarded", reason="repeated an unchanged call", retry=True)
-                elif name == "delegate_task" and self.can_delegate:
+                elif (guarded := extensions.tool_guard(self, name, args, task=task)) is not None:
+                    result = guarded  # an extension refused the call (e.g. another user's files)
+                elif name == "delegate_task" and self.can_delegate and self.offer_delegate:
                     child = CodingAgent(
                         self.project, can_write=False, can_delegate=False,
                         allow_commands=self.allow_commands, max_steps=8, num_ctx=self.num_ctx,
                         approve_command=self.approve_command, teach=False,
                     )
-                    result = child.run(str(args.get("task", "")))
-                elif name == "run_command" and not self.allow_commands:
+                    if self.grew_context:  # the grown window's model, not VEGA_MODEL's 8K one
+                        child.model = self.model
+                    child._parent_stop = self._stop
+                    self._child = child  # request_stop() reaches it while it runs
+                    try:
+                        result = child.run(str(args.get("task", "")))
+                    finally:
+                        self._child = None
+                elif (name == "run_command" and advise
+                        and not _is_auto_read_only(str(args.get("command", "")), self.project)):
+                    result = ADVICE_COMMAND
+                elif (name == "run_command" and not self.allow_commands
+                        and not extensions.allow_command(str(args.get("command", "")), self.project,
+                                                         agent=self)):
                     result = (
                         "run_command is disabled in this session. Use the file tools, and run_check "
                         "to run tests or checks."
@@ -2099,12 +2520,23 @@ class CodingAgent:
                 elif name == "update_plan":
                     result = self._update_plan(args)
                 else:
-                    result = self.web.call(name, args, self.approve_web) \
-                        if name in web.TOOL_NAMES else execute(
+                    executed = True
+                    if name == "run_command" and command_writes(str(args.get("command", ""))):
+                        self._baseline_before_change(task)  # baseline_aware_gate
+                    if name == "run_check":  # e.g. a large suite: the related tests instead
+                        ran = extensions.check_call(
+                            self, str(args.get("command", "")), task=task,
+                            changed=list(self._acceptance_changed), read=sorted(docs_read))
+                    result = ran[1] if ran is not None else self.web.call(
+                        name, args, self.approve_web) if name in web.TOOL_NAMES else execute(
                         name, args, self.project, can_write=self.can_write,
                         before_write=loop_before_write, max_result_chars=result_chars,
                         approve_command=self.approve_command, stop=self._stop,
                     )
+                    if name == "run_check" and ran is None:  # the core ran it: e.g. a timeout's hint
+                        result = extensions.check_result(
+                            self, str(args.get("command", "")), result,
+                            changed=list(self._acceptance_changed), read=sorted(docs_read))
                     if name == "read_file" and not result.startswith(_FAILED_RESULT_PREFIXES):
                         self.web.add_context(result)  # web_facet_fetch: the docs read
                         relative = self._relative(args.get("path"))
@@ -2121,9 +2553,24 @@ class CodingAgent:
                     if name in _WRITE_TOOLS and isinstance(args.get("path"), str):
                         self._edit_targets.append((name, dict(args)))  # pin_editing_target
                     calls_run += 1
-                    if not result.startswith(_FAILED_RESULT_PREFIXES):
-                        repeat_fires = 0  # repeat_stop counts repeats with nothing else between
-                    if name in _WRITE_TOOLS and result.startswith(_WRITE_OK):
+                    if (not features.on("repeat_stop_reads")
+                            and not result.startswith(_FAILED_RESULT_PREFIXES)):
+                        repeat_fires = 0  # the old rule: any call that ran resets the count
+                    if (name in _WRITE_TOOLS and result.startswith(NOOP_WRITE_PREFIX)
+                            and features.on("noop_write_repeat")):
+                        # counts like a guarded repeat: no saved write since, so no reset
+                        if writes != repeat_writes:
+                            repeat_fires, repeat_writes = 0, writes
+                        repeat_fires += 1
+                        features.mark_acted("noop_write_repeat", fires=repeat_fires,
+                                            path=self._relative(args.get("path")))
+                        stop_at = REPEAT_STOP if features.on("repeat_stop_reads") \
+                            else REPEAT_STOP_OLD
+                        if repeat_fires >= stop_at and features.on("repeat_stop"):
+                            repeat_stop = result.split(" (a repeat)")[0]
+                        self._emit("discarded", reason="rewrote a file with the content it has",
+                                   retry=True)
+                    elif name in _WRITE_TOOLS and result.startswith(_WRITE_OK):
                         wrote = True
                         writes += 1
                         last_write_at = calls_run
@@ -2168,14 +2615,25 @@ class CodingAgent:
                     self._plan_streak = 0  # real work since the last plan update
                 self._emit("tool_result", name=name, args=args, result=result)
                 shown = result
+                if executed:
+                    replaced = extensions.tool_shown(self, name, args, result, calls=calls_run,
+                                                     writes=writes, goal=goal)
+                    if replaced is not None and replaced != result:
+                        debuglog.record("stage", stage="tool_shown", tool=name,
+                                        chars=len(result), shown=len(replaced))
+                        shown = replaced
                 if name in _CHECK_TOOLS and check_feedback.exit_code(result) is not None:
-                    command = str(args.get("command", ""))
+                    command = ran[0] if ran is not None else str(args.get("command", ""))
                     check_runs.append((calls_run, command, result))
-                    if features.on("repair_feedback") and check_feedback.failed(result):
+                    if (features.on("repair_feedback") and check_feedback.failed(result)
+                            and shown is result):
                         shown = check_feedback.condense(result, command)
                         if shown != result:
                             debuglog.record("stage", stage="repair_feedback", command=command,
                                             chars=len(result), condensed=len(shown))
+                    pre = self._baseline_seen(command, result, task)
+                    if pre:
+                        shown += "\n" + pre
                 content = context.cap_tool_result(name, shown, result_chars)
                 if self.teach:
                     seen_parts += [args, result]
@@ -2194,10 +2652,15 @@ class CodingAgent:
                     messages[-1]["content"] += "\n\n" + teaching.grounding_note(missing, "why")
                     self._emit("discarded", reason="teaching note named something this turn "
                                "never showed", retry=True)
+        if advise:
+            debuglog.record("stage", stage="advice.tools_done", reason="step limit",
+                            step=self.max_steps)
+            return ADVICE_TOOLS_DONE, False
         limit = "Stopped after reaching the tool-step limit. Send a follow-up prompt to continue."
         return limit, False
 
-    def _verify(self, command: str, check_runs: list[tuple[int, str, str]], at: int) -> str | None:
+    def _verify(self, command: str, check_runs: list[tuple[int, str, str]], at: int,
+                task: str = "") -> str | None:
         """verify_before_finish: run the project's check once in the sandbox (stoppable) and
         return the note that gives the model its result; None when it could not run (no sandbox,
         no tests collected), so the answer stands."""
@@ -2210,7 +2673,115 @@ class CodingAgent:
         debuglog.record("stage", stage="verify_before_finish", command=command, exit=code)
         if code is not None:
             check_runs.append((at, command, result))
-        return check_feedback.verify_note(command, result)
+        note = check_feedback.verify_note(command, result)
+        split = self._baseline_split(result, task)
+        if note and split is not None and split.pre:
+            assert self._test_baseline is not None
+            if split.only_pre:
+                note = baseline_gate.finish_report(self._test_baseline, split, f"`{command}`")
+            else:
+                note += "\n" + baseline_gate.note(self._test_baseline, split)
+        return note
+
+    # -- baseline_aware_gate ----------------------------------------------------------------------
+
+    def _baseline_before_change(self, task: str) -> None:
+        """baseline_aware_gate: just before the session's first edit (or a shell command that may
+        write files), fix the baseline: the model's own whole-suite run made before it, else one
+        sandboxed run of the project's pytest command (the sandbox's usual timeout)."""
+        if self._baseline_closed or not self.can_write or not self._baseline_on():
+            return
+        self._baseline_closed = True
+        spec = self._acceptance
+        command = getattr(spec, "tests", None) or check_feedback.project_command(self.project)
+        lazy = self._lazy_baseline()
+        if lazy is not None:  # e.g. a suite too slow to run now: failing tests checked on demand
+            self._test_baseline = lazy
+            debuglog.record("stage", stage="baseline_gate.lazy", command=lazy.command,
+                            how=lazy.how, failing=sorted(lazy.failing))
+            return
+        if self._test_baseline is not None:
+            return
+        if not command or not baseline_gate.suite_command(command):
+            return  # only pytest results name their failures
+        from . import sandbox
+
+        result = sandbox.run_check(check_feedback.short_tracebacks(command), self.project,
+                                   stop=self._stop, harness=True)
+        self._test_baseline = baseline_gate.from_output(command, result, "run")
+        debuglog.record("stage", stage="baseline_gate.run", command=command,
+                        exit=check_feedback.exit_code(result),
+                        failing=sorted(self._test_baseline.failing) if self._test_baseline
+                        else None)
+
+    def _baseline_split(self, result: str, task: str) -> baseline_gate.Split | None:
+        """baseline_aware_gate: a test result after the first edit, split against the baseline."""
+        if not self._baseline_closed or not self._baseline_on():
+            return None
+        return baseline_gate.classify(self._test_baseline, result, task)
+
+    def _lazy_baseline(self) -> baseline_gate.Baseline | None:
+        """baseline_aware_gate: an extension's baseline instead of running the whole suite now
+        (None: the switch's own behaviour)."""
+        command = getattr(self._acceptance, "tests", None) \
+            or check_feedback.project_command(self.project)
+        return extensions.test_baseline(self, command or "", existing=self._test_baseline)
+
+    def _baseline_on(self) -> bool:
+        """baseline_aware_gate: the switch, or an extension turning the gate on for this agent's
+        project (asked once per agent)."""
+        if features.on("baseline_aware_gate"):
+            return True
+        cached = self.__dict__.get("_baseline_ext")
+        if cached is None:
+            cached = self.__dict__["_baseline_ext"] = extensions.baseline_gate(self)
+        return cached
+
+    def _baseline_seen(self, command: str, result: str, task: str) -> str:
+        """baseline_aware_gate: a test run the model made; the note to append ('' for none).
+        Before the first edit a whole-suite pytest run becomes the baseline."""
+        if not self.can_write or not self._baseline_on():
+            return ""
+        before_edit = not self._baseline_closed
+        if before_edit and self._test_baseline is None and baseline_gate.suite_command(command):
+            self._test_baseline = baseline_gate.from_output(command, result, "reused")
+            if self._test_baseline is not None:
+                debuglog.record("stage", stage="baseline_gate.reused", command=command,
+                                failing=sorted(self._test_baseline.failing))
+        elif before_edit and self._test_baseline is None:  # a part of the suite, before any edit
+            self._test_baseline = self._lazy_baseline()
+        split = baseline_gate.classify(self._test_baseline, result, task)
+        if split is None or self._test_baseline is None:
+            return ""
+        return baseline_gate.note(self._test_baseline, split, before_edit=before_edit)
+
+    def _baseline_items(self, result: Any, task: str) -> str:
+        """baseline_aware_gate: a full acceptance result's test items, split against the baseline.
+        An item whose only failures are pre-existing (a complete whole-suite run) passes, noted;
+        a mixed one names what is new first. Returns the once-only report of pre-existing
+        failures ('' when there is nothing new to report)."""
+        baseline = self._test_baseline
+        if baseline is None or not self._baseline_closed or not self._baseline_on():
+            return ""
+        report = ""
+        for item in result.items:
+            if item.kind != "tests" or item.ok or not item.output:
+                continue
+            split = baseline_gate.classify(baseline, item.output, task)
+            if split is None:
+                continue
+            # targeted_tests: a related-tests run that fails stops before the whole suite, so
+            # its pre-existing failures say nothing about the rest: it stays failing
+            if split.only_pre and "related to your changes" not in item.label:
+                fresh = any(i not in baseline.reported for i in split.pre)
+                text = baseline_gate.finish_report(baseline, split, item.label)
+                report = text if fresh else report
+                item.ok = item.note = True
+                item.detail = (f"only tests that already failed before the first edit fail "
+                               f"({len(split.pre)}: {baseline_gate.listed(split.pre)}); none is new")
+            else:
+                item.detail = baseline_gate.item_detail(baseline, split, item.detail)
+        return report
 
     def _start_repro(self, task: str, gate: FinishGate | None) -> repro_first.Repro | None:
         """repro_first: this turn's repro step when the task is a bug report it applies to."""
@@ -2291,13 +2862,18 @@ class CodingAgent:
             self._emit("tool_call", name="run_check", args={"command": "vega acceptance"})
         result = acceptance.run(spec, self.project, changed, stop=self._stop,
                                 commands=full, tests=full)
+        if result.items:  # checks the turn would not have run without the switch
+            features.mark_acted("acceptance", where="accept", full=full)
         debuglog.record("stage", stage="acceptance.result", full=full, checks=len(result.items),
                         failing=[item.line() for item in result.failing])
         if shown:
             self._emit("tool_result", name="run_check", args={"command": "vega acceptance"},
                        result=result.as_run())
         if full and result.items:
+            report = self._baseline_items(result, spec.task)
+            self._baseline_report = report or self._baseline_report
             self.last_acceptance = result
+            extensions.checks_recorded("acceptance", agent=self, result=result, changed=changed)
         return result if result.items else None
 
     # -- context budget and plan ------------------------------------------------------------------
@@ -2331,12 +2907,24 @@ class CodingAgent:
         return request
 
     def _fit_context(self, goal: dict[str, Any], budget: context.Budget,
-                     ledger: list[str] | None = None) -> None:
-        """Compact the history when the next request would pass COMPACT_AT of the window."""
+                     ledger: list[str] | None = None, step: int | None = None) -> None:
+        """Compact the history when the next request would pass COMPACT_AT of the window.
+        step (the agent loop's): first ask extensions.larger_window whether to switch to a larger
+        window instead (grow_window); the request is then measured against the new window."""
         if not features.on("compaction"):
             return
         plan_tokens = context.estimate_text_tokens(self._plan_section())
-        if not budget.over(self.messages, plan_tokens):
+        over = budget.over(self.messages, plan_tokens)
+        if step is not None and self.grew_context is None:
+            grow = extensions.larger_window(
+                self, step=step, budget=budget, over=over, compactions=self._turn_compactions,
+                projected=budget.projected(self.messages, plan_tokens),
+                threshold=int(context.compact_at(budget.num_ctx) * budget.num_ctx))
+            if grow is not None:
+                self.grow_window(grow["model"], grow["num_ctx"], reason=grow["reason"], step=step,
+                                 keep_tokens=grow["keep_tokens"])
+                over = budget.over(self.messages, plan_tokens)
+        if not over:
             return
         goal_index = next((i for i, m in enumerate(self.messages) if m is goal), None)
         if goal_index is None:
@@ -2348,15 +2936,27 @@ class CodingAgent:
             from .edits import pinned_text
 
             pinned = pinned_text(targets, self.project)
-        result = context.compact(
-            self.messages, goal_index, self.num_ctx, self.work_log,
-            extra_tokens=budget.fixed_tokens + plan_tokens, scale=budget.scale, ledger=ledger,
-            pinned=pinned,
-        )
+        own_pins = bool(pinned)
+        kept = extensions.compaction_pins(self, goal=goal)  # e.g. lab file_memory's file cards
+        if kept:
+            pinned = f"{pinned}\n\n{kept}" if pinned else kept
+        options = {"extra_tokens": budget.fixed_tokens + plan_tokens, "scale": budget.scale,
+                   "ledger": ledger, "pinned": pinned}
+        if self._keep_tokens is not None:
+            options["keep_tokens"] = self._keep_tokens
+        result = extensions.compact_history(
+            self.messages, goal_index, self.num_ctx, self.work_log, agent=self, **options,
+        ) or context.compact(self.messages, goal_index, self.num_ctx, self.work_log, **options)
         if result is None:
             return
+        features.mark_acted("compaction", dropped=result.dropped)
+        if own_pins:
+            features.mark_acted("pin_editing_target")
+        if ledger:
+            features.mark_acted("turn_ledger", where="compaction")
         self.messages[:] = result.messages
         budget.forget()
+        self._turn_compactions += 1
         self._emit(
             "notice",
             message=(
@@ -2364,6 +2964,46 @@ class CodingAgent:
                 f"(~{before:,} → ~{result.after_tokens:,} tokens; window {self.num_ctx:,})."
             ),
         )
+
+    def grow_window(self, model: str, num_ctx: int, *, reason: str = "", step: int | None = None,
+                    keep_tokens: int | None = None) -> None:
+        """Switch to `model`, the same weights served with a num_ctx-token window (a window alias,
+        models.window_alias), for the rest of this agent's life: every budget that follows the
+        window (compaction trigger and kept history, tool-result cap, the truncation tripwire's
+        window) follows. The next request loads that model: one reload and a cold prefill of the
+        whole prompt (recorded as the `grow_context.first_request` stage). keep_tokens caps the
+        recent history a later compaction keeps (context.compact)."""
+        before_model, before_ctx = self.model, self.num_ctx
+        self.model = model
+        self._num_ctx, self.num_ctx_source = num_ctx, "grow_context"
+        self._served_window = num_ctx
+        self.web.adapter_model_name = model
+        if self._budget is not None:
+            self._budget.num_ctx = num_ctx
+        self._keep_tokens = keep_tokens
+        self.grew_context = {"step": step, "from": before_ctx, "to": num_ctx,
+                             "from_model": before_model, "to_model": model, "reason": reason}
+        if keep_tokens is not None:
+            self.grew_context["keep_tokens"] = keep_tokens
+        self._grow_timing_pending = True
+        debuglog.record("stage", stage="grow_context", step=step, reason=reason,
+                        from_ctx=before_ctx, to_ctx=num_ctx, from_model=before_model,
+                        to_model=model, keep_tokens=keep_tokens)
+        self._emit("notice", message=(
+            f"Context window grown: {before_ctx:,} → {num_ctx:,} tokens "
+            f"({reason or 'grow_context'}); the next request loads {model}."))
+
+    def _grown_request_timed(self, timing: dict[str, Any]) -> None:
+        """The first request after grow_window: its seconds include the model load and the cold
+        prefill of the whole prompt."""
+        self._grow_timing_pending = False
+        if self.grew_context is None:
+            return
+        self.grew_context["first_request_seconds"] = timing.get("seconds")
+        self.grew_context["first_request_prompt_tokens"] = timing.get("prompt_tokens")
+        debuglog.record("stage", stage="grow_context.first_request",
+                        step=self.grew_context["step"], seconds=timing.get("seconds"),
+                        prompt_tokens=timing.get("prompt_tokens"), model=self.model)
 
     def _update_plan(self, args: dict[str, Any]) -> str:
         items, started = validate_plan_started(args.get("items"))
@@ -2395,6 +3035,7 @@ class CodingAgent:
         Sets self._last_prompt_tokens from the server's usage report (None when it sends none).
         """
         self._last_prompt_tokens = None
+        self._last_reply_tokens = None
         self._last_finish_reason = None
         if response_format is not None:
             response = self.client.chat.completions.create(
@@ -2403,6 +3044,7 @@ class CodingAgent:
             )
             self._last_finish_reason = getattr(response.choices[0], "finish_reason", None)
             self._last_prompt_tokens = _prompt_tokens(response)
+            self._last_reply_tokens = _reply_tokens(response)
             return response.choices[0].message, False
         if self.stream:
             emitted: list[bool] = []
@@ -2421,12 +3063,14 @@ class CodingAgent:
             self._emit("notice", message=notice)
             self._last_finish_reason = getattr(response.choices[0], "finish_reason", None)
             self._last_prompt_tokens = _prompt_tokens(response)
+            self._last_reply_tokens = _reply_tokens(response)
             return response.choices[0].message, False
         response = self.client.chat.completions.create(
             model=self.model, messages=messages, tools=tools, tool_choice="auto", **self.sampling,
         )
         self._last_finish_reason = getattr(response.choices[0], "finish_reason", None)
         self._last_prompt_tokens = _prompt_tokens(response)
+        self._last_reply_tokens = _reply_tokens(response)
         return response.choices[0].message, False
 
     def _stream_request(
@@ -2448,6 +3092,8 @@ class CodingAgent:
             usage = _prompt_tokens(chunk)
             if usage is not None:
                 self._last_prompt_tokens = usage
+            if _reply_tokens(chunk) is not None:
+                self._last_reply_tokens = _reply_tokens(chunk)
             if not getattr(chunk, "choices", None):
                 continue  # e.g. a trailing usage-only chunk
             delta = chunk.choices[0].delta
@@ -2484,6 +3130,8 @@ class CodingAgent:
                 from .ui import ask_approval as approve
             if not approve(plan):
                 return DECLINED
+        if self._baseline_on():
+            self._baseline_closed = True  # a write without a baseline (pipelines): none taken
         if plan.relative not in self._gate_originals:  # finish_gate: the file before the turn
             self._gate_originals[plan.relative] = plan.before
         if self._acceptance is not None:  # the static gate compares with the file before the turn
@@ -2631,6 +3279,12 @@ def _prompt_tokens(response: Any) -> int | None:
     """usage.prompt_tokens from a response or stream chunk, if the server reported it."""
     value = getattr(getattr(response, "usage", None), "prompt_tokens", None)
     return value if isinstance(value, int) and value > 0 else None
+
+
+def _reply_tokens(response: Any) -> int | None:
+    """usage.completion_tokens from a response or stream chunk, if the server reported it."""
+    value = getattr(getattr(response, "usage", None), "completion_tokens", None)
+    return value if isinstance(value, int) and value >= 0 else None
 
 
 def display_result(text: str) -> None:

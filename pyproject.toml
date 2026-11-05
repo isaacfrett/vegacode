@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 # The distribution is `vegacode` (`vega` on PyPI is the Vega visualization grammar); the import
 # package and the command stay `vega`.
 name = "vegacode"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local coding agent that runs on your laptop: an offline AI coding assistant for the terminal, powered by open-weight LLMs through Ollama. Your code never leaves your machine. Vega writes, runs your tests in a sandbox and repairs what fails. Python CLI and TUI, built for small models (under 10B) on 16 GB."
 readme = "README.md"
 # >=3.9 so that macOS's own pip3 (Python 3.9) installs something: on 3.9/3.10 only the `vega`

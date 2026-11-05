@@ -63,6 +63,13 @@ def test_a_missing_third_party_module_is_not_checkable(tmp_path: Path,
     [item] = [i for i in acceptance.run(spec, tmp_path, ["shop/cart.py"]).items
               if i.kind == "import"]
     assert not item.ok
+    # a submodule the code invents in a package that IS installed is a failure too
+    # (`from textual.bindings import bind` in a 2026-10-24 eval: the import check went quiet)
+    (tmp_path / "ui.py").write_text("from json.no_such_submodule import bind\n\n\ndef show():\n"
+                                    "    return 1\n")
+    spec = acceptance.extract(tmp_path, "Fix `show` in ui.py.")
+    [item] = [i for i in acceptance.run(spec, tmp_path, ["ui.py"]).items if i.kind == "import"]
+    assert not item.ok and "No module named 'json.no_such_submodule'" in item.detail
     monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance_uninstalled")
     spec = acceptance.extract(tmp_path, "Fix `connect` in store.py.")
     [item] = [i for i in acceptance.run(spec, tmp_path, ["store.py"]).items if i.kind == "import"]

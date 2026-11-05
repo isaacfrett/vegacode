@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import features
+from . import extensions, features
 
 # -- fence_strip ----------------------------------------------------------------------------------
 
@@ -271,6 +271,7 @@ class Verdict:
 
     refusal: str | None
     note: str = ""
+    after: str | None = None  # the text to write instead (a repair from extensions.repair_write)
 
 
 def _retry_hint(tool: str, args: dict[str, Any], region: tuple[int, int], relative: str,
@@ -315,10 +316,17 @@ def unparsable_reply(relative: str, code: str, project: Path) -> str | None:
 
 
 def check(tool: str, relative: str, before: str | None, after: str, project: Path,
-          args: dict[str, Any] | None = None, foreign: dict[str, str] | None = None) -> Verdict:
+          args: dict[str, Any] | None = None, foreign: dict[str, str] | None = None,
+          pending: list[str] | None = None, repair: bool = False) -> Verdict:
     """The atomic_writes rule for one computed write. `foreign`: undefined names the file must not
     import as-is (project_layer_imports), name -> where it lives and what to do; the refusal says
-    so instead of "define or import"."""
+    so instead of "define or import". A write that passes is then given to the
+    extensions.write_findings hook (`pending`: files the same pipeline may still write).
+
+    With `repair` (a caller that writes Verdict.after when it is set), a write that adds a parse
+    error goes to the extensions.repair_write hook first: a repaired text that parses is checked
+    like any write and, when it passes, returned as Verdict.after with the hook's note; the hook
+    may instead replace the refusal text."""
     args = args or {}
     region = changed_lines(before, after)
     problem = parse_error(relative, after)
@@ -333,11 +341,69 @@ def check(tool: str, relative: str, before: str | None, after: str, project: Pat
                          if problem.line else f"{problem.kind}: {problem.message}")
             return Verdict(None, f"\n(It did not parse before this write either; this write added "
                                  f"no new parse error. Still: {remaining}.)")
-        return Verdict(_parse_refusal(tool, relative, after, problem, region, args, before))
+        refusal = _parse_refusal(tool, relative, after, problem, region, args, before)
+        if repair:
+            return _repaired(tool, relative, before, after, project, args, foreign, pending,
+                             problem, region, refusal)
+        return Verdict(refusal)
     new = new_static_findings(project, relative, before, after)
     if new:
-        return Verdict(_static_refusal(tool, relative, after, new, region, args, before, foreign))
-    return Verdict(None)
+        offers = _import_offers(project, relative, after, new, foreign)
+        if (offers and repair and features.on("import_offer_apply")
+                and all(code == "F821" and _backticked(message) in offers
+                        for _, code, message in new)):
+            # every new finding is an undefined name with one home: import it instead
+            lines = list(dict.fromkeys(line for _, line in offers.values()))
+            from .project_pipeline import add_imports
+
+            patched = add_imports(after, lines)
+            verdict = check(tool, relative, before, patched, project, args, foreign, pending)
+            if verdict.refusal is None:
+                features.mark_acted("import_offer", applied=lines)
+                return Verdict(None, f"\n(Vega added {'; '.join(lines)}: defined in "
+                                     f"{', '.join(dict.fromkeys(p for p, _ in offers.values()))}"
+                                     f".){verdict.note}", after=patched)
+        if repair and all(code == "F821" for _, code, _ in new):
+            names = list(dict.fromkeys(_backticked(message) for _, _, message in new))
+            if not any(name in (foreign or {}) for name in names):
+                # an extension may resolve the names (e.g. import them) instead of refusing
+                fix = extensions.resolve_undefined(tool, relative, before, after, project=project,
+                                                   names=names, offers=offers, args=args)
+                patched = fix.get("after")
+                if isinstance(patched, str) and patched != after:
+                    verdict = check(tool, relative, before, patched, project, args, foreign,
+                                    pending)
+                    if verdict.refusal is None:
+                        return Verdict(None, str(fix.get("note") or "") + verdict.note,
+                                       after=patched)
+        return Verdict(_static_refusal(tool, relative, after, new, region, args, before, foreign,
+                                       offers))
+    refusal, note = extensions.write_findings(tool, relative, before, after, project=project,
+                                              pending=list(pending or []))
+    if refusal:
+        return Verdict(f"Write not applied: {refusal.rstrip()}\n"
+                       + _retry_hint(tool, args, region, relative, before))
+    return Verdict(None, note)
+
+
+def _repaired(tool: str, relative: str, before: str | None, after: str, project: Path,
+              args: dict[str, Any], foreign: dict[str, str] | None, pending: list[str] | None,
+              problem: Problem, region: tuple[int, int], refusal: str) -> Verdict:
+    """check's answer to a write that adds a parse error, given the extensions.repair_write hook:
+    its repaired text (only one that parses, then checked like any write), its refusal text, or
+    the plain refusal."""
+    fix = extensions.repair_write(tool, relative, before, after, project=project,
+                                  problem=problem, region=region, refusal=refusal, args=args)
+    repaired, note = fix.get("after"), str(fix.get("note") or "")
+    if isinstance(repaired, str) and repaired != after and parse_error(relative, repaired) is None:
+        verdict = check(tool, relative, before, repaired, project, args, foreign, pending)
+        if verdict.refusal is None:
+            return Verdict(None, note + verdict.note, after=repaired)
+        return Verdict(verdict.refusal + (f"\n(The text above is after Vega's repair of a parse "
+                                          f"error in your write:{note})" if note else ""))
+    replacement = fix.get("refusal")
+    return Verdict(replacement if isinstance(replacement, str) and replacement.strip()
+                   else refusal)
 
 
 def _added_parse_error(relative: str, before: str, after: str, problem: Problem,
@@ -377,9 +443,28 @@ def _parse_refusal(tool: str, relative: str, after: str, problem: Problem,
     return head + shown + outside + "\n" + _retry_hint(tool, args, region, relative, before)
 
 
+def _import_offers(project: Path, relative: str, after: str, new: list[tuple[int, str, str]],
+                   foreign: dict[str, str] | None) -> dict[str, tuple[str, str]]:
+    """import_offer: the new undefined names (not already explained by `foreign`) that exactly
+    one project module defines -> (that file, the import line); {} when off or none."""
+    if not features.on("import_offer"):
+        return {}
+    names = [_backticked(message) for _, code, message in new
+             if code == "F821" and _backticked(message) not in (foreign or {})]
+    if not names:
+        return {}
+    from .project_pipeline import import_offers
+
+    try:
+        return import_offers(project, relative, after, names)
+    except (OSError, ValueError, RecursionError):
+        return {}
+
+
 def _static_refusal(tool: str, relative: str, after: str, new: list[tuple[int, str, str]],
                     region: tuple[int, int], args: dict[str, Any], before: str | None,
-                    foreign: dict[str, str] | None = None) -> str:
+                    foreign: dict[str, str] | None = None,
+                    offers: dict[str, tuple[str, str]] | None = None) -> str:
     lines = after.split("\n")
     parts = []
     for line, code, message in new[:3]:
@@ -400,8 +485,18 @@ def _static_refusal(tool: str, relative: str, after: str, new: list[tuple[int, s
     foreign = {name: why for name, why in (foreign or {}).items() if name in undefined}
     for name, why in foreign.items():
         advice.append(f"`{name}` {why}")
-    if [name for name in undefined if name not in foreign]:
-        advice.append(("for the other undefined names: " if foreign else "")
+    offers = {name: offer for name, offer in (offers or {}).items()
+              if name in undefined and name not in foreign}
+    if offers:
+        features.mark_acted("import_offer", names=sorted(offers))
+        where = ("at the top of the file in the same write" if tool in ("write_file", "pipeline")
+                 else
+                 f"to the imports at the top of {relative} (edit_file), then send this write "
+                 "again")
+        for name, (source, line) in offers.items():
+            advice.append(f"`{name}` is defined in {source}: add `{line}` {where}")
+    if [name for name in undefined if name not in foreign and name not in offers]:
+        advice.append(("for the other undefined names: " if foreign or offers else "")
                       + "define or import each undefined name in the same write (or write the "
                       "helper first), or use the name the code already has")
     if redefined:
@@ -678,7 +773,17 @@ def plan_definition(target: Path, relative: str, name: str, code: str):
         what = f"defines {', '.join(defined)}" if defined else "defines no function or class"
         return (f"Edit not applied: your code {what}, not {name.split('.')[-1]}. Send the "
                 f"complete definition of {name} (starting with `def` or `class`).")
-    original = target.read_text(encoding="utf-8") if target.is_file() else ""
+    disk = target.read_text(encoding="utf-8") if target.is_file() else None
+    # a rejected draft of this file the extension keeps (repair_write's targeted re-ask): the
+    # definition goes into the draft, and the whole draft is checked and written
+    root = target
+    for _ in Path(relative).parts:
+        root = root.parent
+    draft = extensions.write_base("replace_definition", relative, project=root, definition=name,
+                                  disk=disk)
+    original = draft if draft is not None else (disk or "")
+    if draft is not None:
+        notes.append(f"put into your draft of {relative} from the refused write")
     spans = definitions(original)
     span, resolved = resolve(spans, name)
     if resolved:
@@ -753,8 +858,7 @@ def plan_definition(target: Path, relative: str, name: str, code: str):
         verb += (", now " if verb.endswith(tuple("0123456789")) else "") + \
             f"lines {final.start}-{final.end}"
     message = verb.removesuffix(" (") + ")" + (f"; {'; '.join(notes)}" if notes else "") + "."
-    before = original if target.is_file() else None
-    return WritePlan("replace_definition", target, relative, before, updated, message)
+    return WritePlan("replace_definition", target, relative, disk, updated, message)
 
 
 def _member_names(node: ast.ClassDef) -> set[str]:

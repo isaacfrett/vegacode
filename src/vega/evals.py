@@ -4,6 +4,10 @@ Suites (`vega eval --suite …`):
   fixes      evals/cases.jsonl      single-function fixes; scored exactly as before suites existed
   goals      evals/goals.jsonl      an outcome to implement across a small multi-file project
   selfbuild  evals/selfbuild.jsonl  a bug re-introduced into Vega's own source, reported as an issue
+
+A case may give `turns` (several user messages, each with its own checks, in one session) instead
+of one task's checks; the harness runs such a case only through an extension's run_case hook
+(vega.extensions) and otherwise reports it as a fixture error, never as a single-turn attempt.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import json
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -36,7 +41,8 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import agent as agent_module
-from . import categories, debuglog, external, features, repro_first, sandbox, transcripts, web
+from . import (categories, debuglog, extensions, external, features, fixture_guard, repro_first,
+               sandbox, transcripts, web)
 from .stats import bootstrap_diff_ci, bootstrap_mean_diff_ci, mcnemar_exact, rate_text
 from .agent import CodingAgent, max_reply_tokens, sampling_overrides
 from .resources import Guard, Limits
@@ -47,17 +53,29 @@ CASES_FILE = EVALS_DIR / "cases.jsonl"
 GOALS_FILE = EVALS_DIR / "goals.jsonl"
 SELFBUILD_FILE = EVALS_DIR / "selfbuild.jsonl"
 RUNS_FILE = EVALS_DIR / "runs.jsonl"
+# `fixture_tree` cases start from a shared project kept here (evals/fixtures/<name>/).
+FIXTURE_TREES = EVALS_DIR / "fixtures"
+_TREE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 CHECK_TIMEOUT = 30  # python_check
 COMMAND_TIMEOUT = 120  # check_command / regression_command, per command
+# How much check_command / regression_command output is kept for parsing (its tail; the model
+# never sees it): every hidden test's -rfEp result line must survive (2026-10-22: 84 failing tests
+# with tracebacks overflowed the sandbox's 8k clip and hidden tests were undercounted).
+CHECK_OUTPUT_LIMIT = 400_000
 SUITES = ("fixes", "goals", "selfbuild", "learn", "pyprojects", "engineering", "product",
-          "clarify", "security", "honesty", "teaching", "robustness", "prediction", "datasci", "os", "web", "tts", "systems", "cs", "eda", "devops", "py", "rds", "dl", "lang", "familiarity", "apimcp", "db", "ui", "swe", "trust", "ops", "context", "research")
+          "clarify", "security", "securebuild", "honesty", "teaching", "robustness", "prediction", "datasci", "os", "web", "tts", "systems", "cs", "eda", "devops", "py", "rds", "dl", "lang", "familiarity", "apimcp", "db", "ui", "swe", "trust", "ops", "context", "research", "privacy", "legal", "ethics", "evalgen", "bigrepo", "followup", "bigbuild", "specclarify", "recover", "nextsteps",
+          "chatctx", "ship", "dba", "delegate", "approvals", "reason", "reading", "design", "tui", "ostools", "pynew", "small", "knowledge", "tracking")
 DEFAULT_MAX_STEPS = {"fixes": 40, "goals": 80, "selfbuild": 80, "learn": 30, "pyprojects": 100,
-                     "engineering": 80, "product": 60, "clarify": 40, "security": 60,
+                     "engineering": 80, "product": 60, "clarify": 40, "security": 60, "securebuild": 80,
                      "honesty": 30, "teaching": 30, "robustness": 60, "prediction": 80,
-                     "datasci": 80, "os": 60, "research": 60, "context": 60, "ops": 80, "trust": 60, "swe": 60, "ui": 80, "db": 60, "apimcp": 80, "familiarity": 40, "lang": 80, "dl": 80, "rds": 60, "py": 80, "devops": 60, "eda": 80, "cs": 60, "systems": 80, "tts": 80, "web": 80,
-                     "cruxeval": 10, "cruxeval40": 10, "livecodebench": 20, "livecodebench40": 20,
+                     "datasci": 80, "os": 60, "research": 60, "legal": 60, "context": 60, "ops": 80, "trust": 60, "ethics": 60, "swe": 60, "ui": 80, "db": 60, "apimcp": 80, "familiarity": 40, "lang": 80, "dl": 80, "rds": 60, "py": 80, "devops": 60, "eda": 80, "cs": 60, "systems": 80, "tts": 80, "web": 80,
+                     "privacy": 60, "cruxeval": 10, "cruxeval40": 10, "livecodebench": 20, "livecodebench40": 20,
                      "humaneval": 20,
-                     "humaneval40": 20, "mbpp": 20, "mbpp40": 20}
+                     "humaneval40": 20, "mbpp": 20, "mbpp40": 20, "evalgen": 60,
+                     "bigrepo": 150, "followup": 40, "bigbuild": 120,
+                     "specclarify": 30, "recover": 50, "nextsteps": 40,
+                     "chatctx": 30, "ship": 60, "dba": 60, "delegate": 80,
+                     "approvals": 40, "reason": 30, "reading": 30, "design": 60, "tui": 60, "ostools": 60, "pynew": 100, "small": 40, "knowledge": 30, "tracking": 40}
 # What a `vega_snapshot` fixture contains: Vega's code and docs, never eval cases, runs or
 # training data.
 SNAPSHOT_PATHS = ("src", "tests", "pyproject.toml", "models.toml", "README.md", "evals/README.md")
@@ -104,6 +122,21 @@ def suite_file(suite: str) -> Path:
              "product": CASES_FILE.parent / "product.jsonl",
              "clarify": CASES_FILE.parent / "clarify.jsonl",
              "security": CASES_FILE.parent / "security.jsonl",
+             "securebuild": CASES_FILE.parent / "securebuild.jsonl",
+             "recover": CASES_FILE.parent / "recover.jsonl",
+             "ship": CASES_FILE.parent / "ship.jsonl",
+             "dba": CASES_FILE.parent / "dba.jsonl",
+             "approvals": CASES_FILE.parent / "approvals.jsonl",
+             "reason": CASES_FILE.parent / "reason.jsonl",
+             "reading": CASES_FILE.parent / "reading.jsonl",
+             "design": CASES_FILE.parent / "design.jsonl",
+             "tui": CASES_FILE.parent / "tui.jsonl",
+             "ostools": CASES_FILE.parent / "ostools.jsonl",
+             "pynew": CASES_FILE.parent / "pynew.jsonl",
+             "small": CASES_FILE.parent / "small.jsonl",
+             "knowledge": CASES_FILE.parent / "knowledge.jsonl",
+             "tracking": CASES_FILE.parent / "tracking.jsonl",
+             "delegate": CASES_FILE.parent / "delegate.jsonl",
              "honesty": CASES_FILE.parent / "honesty.jsonl",
              "teaching": CASES_FILE.parent / "teaching.jsonl",
              "robustness": CASES_FILE.parent / "robustness.jsonl",
@@ -114,6 +147,8 @@ def suite_file(suite: str) -> Path:
              "context": CASES_FILE.parent / "context.jsonl",
              "ops": CASES_FILE.parent / "ops.jsonl",
              "trust": CASES_FILE.parent / "trust.jsonl",
+             "legal": CASES_FILE.parent / "legal.jsonl",
+             "ethics": CASES_FILE.parent / "ethics.jsonl",
              "swe": CASES_FILE.parent / "swe.jsonl",
              "ui": CASES_FILE.parent / "ui.jsonl",
              "db": CASES_FILE.parent / "db.jsonl",
@@ -128,7 +163,15 @@ def suite_file(suite: str) -> Path:
              "cs": CASES_FILE.parent / "cs.jsonl",
              "systems": CASES_FILE.parent / "systems.jsonl",
              "tts": CASES_FILE.parent / "tts.jsonl",
-             "web": CASES_FILE.parent / "web.jsonl"}
+             "web": CASES_FILE.parent / "web.jsonl",
+             "privacy": CASES_FILE.parent / "privacy.jsonl",
+             "evalgen": CASES_FILE.parent / "evalgen.jsonl",
+             "bigrepo": CASES_FILE.parent / "bigrepo.jsonl",
+             "followup": CASES_FILE.parent / "followup.jsonl",
+             "specclarify": CASES_FILE.parent / "specclarify.jsonl",
+             "nextsteps": CASES_FILE.parent / "nextsteps.jsonl",
+             "chatctx": CASES_FILE.parent / "chatctx.jsonl",
+             "bigbuild": CASES_FILE.parent / "bigbuild.jsonl"}
     if suite in DATA_SUITES:
         path = DATA_DIR / f"{suite}.jsonl"
         if not path.exists():
@@ -198,18 +241,88 @@ def apply_mutations(project: Path, mutations: list[dict[str, str]]) -> None:
         path.write_text(text.replace(item["old"], item["new"], 1), encoding="utf-8")
 
 
+def copy_fixture_tree(name: Any, project: Path) -> None:
+    """`fixture_tree` cases: copy evals/fixtures/<name>/ into the project (caches skipped), so
+    many cases share one large codebase and add or override only the files they change."""
+    if not isinstance(name, str) or not _TREE_NAME.match(name):
+        raise FixtureError(f"fixture_tree {name!r}: not a fixture name")
+    source = FIXTURE_TREES / name
+    if not source.is_dir():
+        raise FixtureError(f"fixture_tree {name!r}: no directory {_display_path(source)}")
+    shutil.copytree(source, project, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(*UNTRACKED_DIRS, "*.pyc"))
+
+
+# VEGA_EVAL_REVEAL_REPRO=1: an ORACLE ablation, never a score. Fixture building also copies the
+# case's hidden test file into the project's tests/ as a visible failing test (tests/test_repro.py),
+# so a run measures the ceiling of a reproduce-first approach (the model starts with a perfect
+# repro). Grading is unchanged: the hidden tests are still written after the attempt. Off unless
+# set; the run's records carry `oracle_reveal_repro: true`, and every pass-rate reader (KPIs,
+# scorecard, attribution, frontier: vega_lab.run_records.latest_runs) leaves them out.
+REVEAL_REPRO_ENV = "VEGA_EVAL_REVEAL_REPRO"
+REVEAL_REPRO_TAG = "oracle_reveal_repro"
+
+
+def reveal_repro() -> bool:
+    return (os.environ.get(REVEAL_REPRO_ENV) or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def reveal_repro_files(case: dict[str, Any]) -> dict[str, str]:
+    """The visible copies VEGA_EVAL_REVEAL_REPRO writes: the case's hidden pytest file as
+    tests/test_repro.py (several: tests/test_repro_<name>.py each). {} for a case without hidden
+    tests; a FixtureError when the hidden tests need hidden helpers (they would not import)."""
+    hidden = case.get("hidden_files") or {}
+    tests = {path: text for path, text in hidden.items()
+             if Path(path).name.startswith("test_") and path.endswith(".py")}
+    helpers = sorted(set(hidden) - set(tests))
+    if tests and helpers:
+        raise FixtureError(f"{REVEAL_REPRO_ENV}: the hidden tests need hidden helpers "
+                           f"({', '.join(helpers[:3])}); cannot reveal them as a repro")
+    if len(tests) == 1:
+        return {"tests/test_repro.py": next(iter(tests.values()))}
+    return {f"tests/test_repro_{Path(path).name.removeprefix('test_')}": text
+            for path, text in tests.items()}
+
+
+def _reveal_repro(case: dict[str, Any], project: Path) -> None:
+    files = reveal_repro_files(case)
+    taken = sorted(path for path in files if (project / path).exists())
+    if taken:
+        raise FixtureError(f"{REVEAL_REPRO_ENV}: {taken[0]} already exists in the fixture")
+    try:
+        _write_fixture(project, files)
+    except typer.BadParameter as exc:
+        raise FixtureError(exc.message) from exc
+
+
 def build_fixture(case: dict[str, Any], project: Path, archive: bytes | None = None) -> None:
-    """Write the case's starting project: Vega snapshot (optional), `files`, then `mutation`."""
+    """Write the case's starting project: Vega snapshot or fixture tree (optional), `files`, then
+    `mutation`. A `design` case needs the WebKit renderer: where it cannot run (no macOS or
+    swiftc) that is a FixtureError, so the case is left out of the totals, not failed."""
+    if case.get("design"):
+        from . import design_render
+
+        problem = design_render.availability()
+        if problem:
+            raise FixtureError(problem)
     if case.get("vega_snapshot"):
         data = archive if archive is not None else vega_source_archive()
         with tarfile.open(fileobj=io.BytesIO(data)) as tar:
             tar.extractall(project, filter="data")
+    if case.get("fixture_tree"):
+        copy_fixture_tree(case["fixture_tree"], project)
     try:
         _write_fixture(project, case.get("files", {}))
     except typer.BadParameter as exc:
         raise FixtureError(exc.message) from exc
     apply_mutations(project, case.get("mutation", []))
-    if case.get("git_repo"):
+    if reveal_repro():  # oracle ablation only (REVEAL_REPRO_ENV)
+        _reveal_repro(case, project)
+    if case.get("commands") == "sandbox" and not sandbox.available():
+        raise FixtureError("commands: sandbox needs the macOS sandbox (sandbox-exec), not available here")
+    if case.get("git_history"):
+        build_git_history(project, case["git_history"])
+    elif case.get("git_repo"):
         _init_git_repo(project, case.get("git_uncommitted", {}))
 
 
@@ -233,6 +346,101 @@ def _init_git_repo(project: Path, uncommitted: dict[str, str]) -> None:
         _write_fixture(project, uncommitted)
     except typer.BadParameter as exc:
         raise FixtureError(exc.message) from exc
+
+
+# `git_history` cases (small suite): a repository built step by step with a fixed identity, fixed
+# dates and no user or system git config, so every commit hash is the same on every machine.
+GIT_HISTORY_AUTHOR = "Dana Reyes <dana@example.com>"
+GIT_HISTORY_START = datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)
+GIT_HISTORY_STEP = 3 * 3600 + 17 * 60  # seconds between commits
+
+
+def git_env(home: Path | None = None) -> dict[str, str]:
+    """The environment for git runs that must not read the user's or the system's git config:
+    no global config (or a private one under `home`), no editor, pager or prompt."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "VEGA_"))}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=str(home / ".gitconfig") if home else os.devnull,
+               GIT_EDITOR="true", GIT_SEQUENCE_EDITOR="true", EDITOR="true", VISUAL="true",
+               GIT_PAGER="cat", PAGER="cat", GIT_TERMINAL_PROMPT="0")
+    if home is not None:
+        env["HOME"] = str(home)
+    return env
+
+
+def build_git_history(project: Path, steps: list[dict[str, Any]]) -> None:
+    """`git_history`: `git init -b main` in the project, then each step in order:
+
+    - {"commit": message, "files": {path: text or null to delete}, "author": "Name <mail>"}
+    - {"branch": name} (create it at HEAD and switch to it), {"switch": name}, {"tag": name}
+    - {"merge": name, "message": ...} (--no-ff); with "conflict": true the merge must stop on a
+      conflict and is left in progress
+    - {"stage": {path: text}} written and `git add`ed, not committed; {"write": {path: text}}
+      written only (an unstaged change or an untracked file)
+
+    Commit n has author and committer date GIT_HISTORY_START + n * GIT_HISTORY_STEP (UTC)."""
+    count = 0
+
+    def git(*argv: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
+        moment = GIT_HISTORY_START.timestamp() + count * GIT_HISTORY_STEP
+        stamp = f"@{int(moment)} +0000"
+        env = {**git_env(), "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+        try:
+            result = subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+                                     "-c", "init.defaultBranch=main", "-c", "merge.conflictStyle=merge",
+                                     "-c", "core.autocrlf=false", *argv],
+                                    cwd=project, env=env, capture_output=True, text=True, timeout=30,
+                                    check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise FixtureError(f"git_history: git {argv[0]} failed: {exc}") from exc
+        if ok and result.returncode:
+            raise FixtureError(f"git_history: git {' '.join(argv)[:80]} failed: "
+                               f"{(result.stderr or result.stdout).strip()[:200]}")
+        return result
+
+    def identity(author: str) -> list[str]:
+        name, _, mail = author.partition(" <")
+        return ["-c", f"user.name={name}", "-c", f"user.email={mail.rstrip('>')}"]
+
+    def write(files: dict[str, str | None]) -> list[str]:
+        for relative, text in files.items():
+            path = (project / relative).resolve()
+            if not path.is_relative_to(project):
+                raise FixtureError(f"git_history: {relative} escapes the project")
+            if text is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+        return list(files)
+
+    git("init", "-q", "-b", "main")
+    for number, step in enumerate(steps, 1):
+        if "commit" in step:
+            paths = write(step.get("files", {}))
+            if paths:
+                git("add", "-A", "--", *paths)
+            count += 1
+            git(*identity(step.get("author", GIT_HISTORY_AUTHOR)), "commit", "-q", "--no-verify",
+                "--allow-empty", "-m", step["commit"])
+        elif "branch" in step:
+            git("switch", "-q", "-c", step["branch"])
+        elif "switch" in step:
+            git("switch", "-q", step["switch"])
+        elif "tag" in step:
+            git("tag", step["tag"])
+        elif "merge" in step:
+            count += 1
+            result = git(*identity(step.get("author", GIT_HISTORY_AUTHOR)), "merge", "-q", "--no-ff",
+                         "--no-edit", "-m", step.get("message", f"Merge branch '{step['merge']}'"),
+                         step["merge"], ok=not step.get("conflict"))
+            if step.get("conflict") and not result.returncode:
+                raise FixtureError(f"git_history step {number}: the merge did not conflict")
+        elif "stage" in step:
+            git("add", "-A", "--", *write(step["stage"]))
+        elif "write" in step:
+            write(step["write"])
+        else:
+            raise FixtureError(f"git_history step {number}: unknown step {sorted(step)}")
 
 
 def snapshot_files(project: Path) -> dict[str, bytes]:
@@ -270,10 +478,14 @@ def diff_stats(before: dict[str, bytes], after: dict[str, bytes]) -> dict[str, A
 # --- Checks -------------------------------------------------------------------------------------
 
 def _check(case: dict[str, Any], project: Path, response: str,
-           commands: list[str] | None = None) -> str:
+           commands: list[str] | None = None, tool_paths: list[str] | None = None,
+           check_trace: str | None = None, delegations: list[str] | None = None) -> str:
     """Return an empty string if every check passes, otherwise the first failure."""
     response_fold = response.casefold()
-    failure = _command_checks(case, commands or [])
+    failure = (_command_checks(case, commands or []) or _tool_path_checks(case, tool_paths or [])
+               or _recovery_check(case, check_trace) or _project_unchanged_check(case, project)
+               or _recommend_check(case, project, response)
+               or _delegation_check(case, delegations) or _design_check(case, project))
     if failure:
         return failure
     if case.get("expect") == "ask":  # clarify suite: a vague request must be met with a question
@@ -308,15 +520,331 @@ def _check(case: dict[str, Any], project: Path, response: str,
             return f"{relative} was modified"
     script = case.get("python_check")
     if script:
-        # Behaviour check run by the harness (not the agent) against the edited project.
+        # Behaviour check run by the harness (not the agent) against the edited project, with the
+        # attempt's isolated Python (it imports the project, so only the case's packages).
         result = subprocess.run(
-            [sys.executable, "-c", script], cwd=project, text=True, capture_output=True,
+            [str(extensions.check_python() or sys.executable), "-c", script], cwd=project, text=True,
+            capture_output=True,
             timeout=int(case.get("check_timeout", CHECK_TIMEOUT)),
             env={**os.environ, "PYTHONPATH": f"{project}{os.pathsep}{project / 'src'}", "PYTHONDONTWRITEBYTECODE": "1"},
         )
         if result.returncode:
             lines = (result.stderr or result.stdout).strip().splitlines()
             return f"python_check failed: {lines[-1] if lines else result.returncode}"
+    reply_script = case.get("response_check")
+    if reply_script:
+        # A grader of the reply itself (specclarify: the questions asked), run by the harness in
+        # the project with the reply on stdin; exit 0 passes, else its last line is the failure.
+        result = subprocess.run(
+            [sys.executable, "-c", reply_script], cwd=project, text=True, capture_output=True,
+            input=response, check=False, timeout=int(case.get("check_timeout", CHECK_TIMEOUT)),
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        if result.returncode:
+            lines = (result.stdout or result.stderr).strip().splitlines()
+            return f"response_check failed: {lines[-1] if lines else result.returncode}"
+    alternatives = case.get("any_of") or []
+    if alternatives:
+        # lenient grading: either of several acceptable outcomes (e.g. "did it the safe way" or
+        # "raised the concern in the reply"); each alternative is a set of checks on its own
+        failures = [_check({"files": case.get("files", {}), **alternative}, project, response,
+                           commands, tool_paths) for alternative in alternatives]
+        if all(failures):
+            return "no any_of alternative passed: " + " | ".join(failures)
+    return ""
+
+
+_PIPELINE_CHECKS = re.compile(r"^(\d+)/(\d+) checks passed")
+_PIPELINE_FAILING = re.compile(r"^\d+ [\w -]*\(s\) failing")
+
+
+def check_result(result: str) -> str:
+    """'F' for a check or command that ran and failed (non-zero exit, timeout), 'P' for one that
+    passed, '' for one that did not run (refused, sandbox unavailable, stopped, repeated). The
+    pipelines' own check summaries count too ("3/4 checks passed", "2 project test(s) failing",
+    "all tests pass")."""
+    first = result.partition("\n")[0]
+    if first in ("exit code: 0", "all tests pass"):
+        return "P"
+    if first.startswith(("exit code:", "Check timed out")) or _PIPELINE_FAILING.match(first):
+        return "F"
+    counted = _PIPELINE_CHECKS.match(first)
+    if counted:
+        return "P" if counted.group(1) == counted.group(2) else "F"
+    return ""
+
+
+def recovered(check_trace: str | None) -> bool:
+    """A check failed during the run and a later check passed: execution feedback was used."""
+    if not check_trace or "F" not in check_trace:
+        return False
+    return "P" in check_trace[check_trace.index("F") + 1:]
+
+
+def _recovery_check(case: dict[str, Any], check_trace: str | None) -> str:
+    """`require_check_recovery` (recover suite): a check the agent ran (run_check / run_command,
+    the harness's own finish checks included) failed, and a later one passed. Skipped when no
+    trace is known (an external agent; validation without one)."""
+    if not case.get("require_check_recovery") or check_trace is None or recovered(check_trace):
+        return ""
+    if "F" not in check_trace:
+        return f"no failing check during the run (checks: {check_trace or 'none'})"
+    return f"no passing check after a failing one (checks: {check_trace})"
+
+
+def _design_check(case: dict[str, Any], project: Path) -> str:
+    """`design` (design suite): render the page in WebKit and grade its layout, contrast, focus,
+    structure and the case's functional assertions (vega.design_render)."""
+    if not case.get("design"):
+        return ""
+    from . import design_render
+
+    try:
+        return design_render.check(case, project)
+    except design_render.RendererUnavailable as exc:
+        return f"design: {exc}"
+
+
+def _project_unchanged_check(case: dict[str, Any], project: Path) -> str:
+    """`project_unchanged: true` (nextsteps suite: a question that asks for advice, not a change):
+    every fixture file (`files`, `git_uncommitted`, `hidden_files`) is byte-identical and no other
+    file exists. Caches (UNTRACKED_DIRS, e.g. __pycache__ from running the tests) and Vega's own
+    bookkeeping (.vega/) do not count."""
+    if not case.get("project_unchanged"):
+        return ""
+    expected = {**case.get("files", {}), **case.get("git_uncommitted", {}),
+                **case.get("hidden_files", {})}
+    after = snapshot_files(project)
+    for relative, text in expected.items():
+        if relative not in after:
+            return f"{relative} was deleted (a recommendation question changes nothing)"
+        if after[relative] != text.encode("utf-8"):
+            return f"{relative} was modified (a recommendation question changes nothing)"
+    created = sorted(path for path in after if path not in expected and not _vega_own(path))
+    if created:
+        return f"created {', '.join(created[:3])} (a recommendation question changes nothing)"
+    return ""
+
+
+# `recommend` (nextsteps suite): a ranked "what should we do next?" answer, graded without a model.
+# Items: numbered lines if any, else the outermost bullets, else markdown headings, else paragraphs.
+_NUMBERED_ITEM = re.compile(r"^\s{0,3}(?:#{1,4}\s*)?(?:\*\*)?\d{1,2}[.)](?:\*\*)?\s+")
+_BULLET_ITEM = re.compile(r"^(\s*)[-*•+]\s+")
+_HEADING_ITEM = re.compile(r"^\s{0,3}#{1,4}\s+\S")
+_FILE_TOKEN = re.compile(r"(?<![\w/.-])((?:[\w-]+/)*[\w-]+\.(?:py|md|txt|toml|cfg|ini|json|ya?ml"
+                         r"|csv|sql|sh|js|ts|html|css|lock|rst))(?![\w-])")
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+_CALL_TOKEN = re.compile(r"(?<![\w.`])([A-Za-z_]\w*)\(\)")
+_CODE_NAME = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(.*\))?")
+# A name proposed as new ("add a tests/test_cli.py", "create `export_csv()`", "there is no
+# CHANGELOG.md", "`settings.toml` is missing") may not exist yet: the words just before or after it.
+_PROPOSES_BEFORE = re.compile(
+    r"\b(?:add(?:s|ing)?|creat(?:e|es|ing)|new|writ(?:e|es|ing)|introduc(?:e|es|ing)|missing|no"
+    r"|without|set(?:ting)?\s+up|generat(?:e|es|ing)|called|nam(?:e|ed)|implement(?:s|ing)?"
+    r"|e\.g\.)\b(?:\W+[\w./-]+){0,5}\W*$", re.IGNORECASE)
+_PROPOSES_AFTER = re.compile(
+    r"^\W*(?:\(?new\b|is\s+missing|(?:does\s+not|doesn't)\s+exist|is\s+not\s+there|isn't\s+there"
+    r"|(?:file|module|function|helper|test)\s+(?:that|which|to)\b)", re.IGNORECASE)
+# Command-line tools a reply may name in backticks (`pytest.raises`, `pip install`) that a
+# fixture need not mention.
+_KNOWN_TOOLS = frozenset({"pytest", "pip", "python", "python3", "ruff", "mypy", "black", "git",
+                          "unittest", "tox", "nox", "pre-commit", "sqlite3"})
+_ASKS_WHERE_OR_HOW = re.compile(
+    r"\bwhere\s+(?:is|does|do|are)\s+(?:the|your|this)\s+(?:project|code|repo|repository|files?)\b"
+    r"|\bwhich\s+(?:folder|directory)\b|\bpath\s+to\s+(?:the|your)\s+(?:project|repo|code)\b"
+    r"|\bhow\s+(?:should|would\s+you\s+like|do\s+you\s+want)\s+(?:me\s+to\s+|i\s+)?"
+    r"(?:verify|test|check)\b",
+    re.IGNORECASE)
+_OFFERS_TO_START = re.compile(
+    r"\b(?:want\s+me\s+to|shall\s+i|should\s+i|like\s+me\s+to|say\s+the\s+word"
+    r"|go\s+ahead\s+(?:with|and)"
+    r"|i\s+can\s+(?:start|begin|take|pick|do|fix|tackle|make|add|write|handle)"
+    r"|i\s+could\s+(?:start|begin|take|pick|fix|tackle)|ready\s+to\s+(?:start|begin)"
+    r"|happy\s+to\s+(?:start|begin|take|fix|tackle|do)"
+    r"|(?:i'll|i\s+will)\s+(?:start|begin)\b[^.\n]*\bif)\b",
+    re.IGNORECASE)
+_SAYS_DONE = re.compile(r"\b(?:already|done|implemented|exists|finished|stale|out\s+of\s+date"
+                        r"|check(?:ed)?\s+off|tick(?:ed)?\s+off"
+                        r"|mark(?:ed)?\s+(?:it\s+)?(?:as\s+)?(?:done|complete))\b",
+                        re.IGNORECASE)
+RECOMMEND_WITHIN = 2
+RECOMMEND_MIN_NAMES = 2
+RECOMMEND_MAX_WORDS = 350
+OFFER_TAIL_CHARS = 400
+
+
+def recommendations(response: str) -> tuple[str, list[str]]:
+    """(the text before the first item, the items in order) of a ranked answer."""
+    lines = (response or "").splitlines()
+    starts = [n for n, line in enumerate(lines) if _NUMBERED_ITEM.match(line)]
+    if not starts:
+        indents = {n: len(m.group(1)) for n, line in enumerate(lines)
+                   if (m := _BULLET_ITEM.match(line))}
+        top = min(indents.values(), default=0)
+        starts = [n for n, indent in indents.items() if indent == top]
+    if not starts:
+        starts = [n for n, line in enumerate(lines) if _HEADING_ITEM.match(line)]
+    if not starts:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", response or "") if p.strip()]
+        return "", paragraphs
+    items = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+        body = lines[start:end]
+        if index + 1 == len(starts):  # the last item stops at a closing paragraph
+            for offset in range(1, len(body)):
+                if (not body[offset - 1].strip() and body[offset].strip()
+                        and not body[offset][:1].isspace()):
+                    body = body[:offset]
+                    break
+        items.append("\n".join(body).strip())
+    return "\n".join(lines[:starts[0]]).strip(), items
+
+
+def _project_text(project: Path) -> tuple[set[str], str]:
+    """(every file's relative path, all text files' contents joined) of the project."""
+    files = snapshot_files(project)
+    text = "\n".join(data.decode("utf-8", "replace") for data in files.values())
+    return set(files), text
+
+
+def _sentences(response: str) -> Iterator[str]:
+    for line in (response or "").splitlines():
+        yield from (part for part in re.split(r"(?<=[.!?])\s+", line) if part.strip())
+
+
+def _known_file(token: str, paths: set[str], text: str) -> bool:
+    token = token.lstrip("./")
+    return (token in paths or any(path.endswith("/" + token) for path in paths)
+            or re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", text) is not None)
+
+
+def _known_symbol(name: str, text: str) -> bool:
+    import builtins
+
+    parts = [part for part in name.split(".") if part]
+    if not parts or parts[0] in _KNOWN_TOOLS or parts[0] in sys.stdlib_module_names:
+        return True
+    if len(parts) == 1 and (parts[0] in dir(builtins)
+                            or re.search(r"(?:Error|Exception|Warning)$", parts[0])):
+        return True  # an exception class: raised by a library the project uses
+    return re.search(rf"(?<!\w){re.escape(parts[-1])}(?!\w)", text) is not None
+
+
+def invented_names(response: str, project: Path) -> list[str]:
+    """Files and code names the reply presents as existing that the project does not have: a
+    path (`notes.py`), a backticked code name (`parse_date`, `Store.purge()`, `cfg.load`) or a
+    bare call (`average()`). A name is fine when the project has the file or mentions the name
+    anywhere (README, spec, code), when it is a builtin, a standard-library module or a common
+    tool, or when the words around it propose it as new ("add a tests/test_cli.py", "there is no
+    CHANGELOG.md")."""
+    paths, text = _project_text(project)
+    invented: list[str] = []
+
+    def proposed(sentence: str, match: re.Match[str]) -> bool:
+        before = sentence[max(0, match.start() - 60):match.start()]
+        after = sentence[match.end():]
+        return bool(_PROPOSES_BEFORE.search(before) or _PROPOSES_AFTER.search(after))
+
+    for sentence in _sentences(response):
+        for match in _FILE_TOKEN.finditer(sentence):
+            token = match.group(1)
+            if (not _known_file(token, paths, text) and token not in invented
+                    and not proposed(sentence, match)):
+                invented.append(token)
+        spans = [(m.group(1).strip(), m) for m in _BACKTICKED.finditer(sentence)]
+        spans += [(m.group(1) + "()", m) for m in _CALL_TOKEN.finditer(sentence)]
+        for span, match in spans:
+            if (not _CODE_NAME.fullmatch(span) or _FILE_TOKEN.fullmatch(span)
+                    or proposed(sentence, match)):
+                continue
+            name = span.split("(", 1)[0]
+            code_like = ("(" in span or "_" in name or "." in name
+                         or re.search(r"[a-z][A-Z]", name) is not None)
+            if (not code_like or name.startswith("__") or _known_symbol(name, text)
+                    or name in invented):
+                continue
+            invented.append(name)
+    return invented
+
+
+def _recommend_check(case: dict[str, Any], project: Path, response: str) -> str:
+    """`recommend` (nextsteps suite): the reply to "what should we do next?" is grounded, ranked,
+    short and offers to start. Keys (all optional except `top`):
+
+        top: [regex]       one matches (re.search, case-insensitive) within the first `within`
+                           recommendations: the planted top-priority signal
+        within: int        how many leading items count as the top pick (default 2)
+        top_anywhere: bool the `top` match may be anywhere in the reply (a finished project: "it is
+                           in good shape" needs no list)
+        names: [str]       the project's real identifiers (files, functions, tests); the reply
+                           names at least `min_names` of them (default 2): not generic advice
+        avoid: [regex]     no recommendation matches, unless it says the work is already done
+                           (a stale roadmap item recommended as new work)
+        max_words: int     length cap (default 350)
+
+    Always: no file or code name the project does not have (invented_names), no question about
+    where the project is or how to verify, and an offer to start in the reply's last
+    OFFER_TAIL_CHARS characters."""
+    spec = case.get("recommend")
+    if not spec:
+        return ""
+    reply = response or ""
+    if _ASKS_WHERE_OR_HOW.search(reply):
+        return "asked where the project is or how to verify"
+    words = len(reply.split())
+    limit = int(spec.get("max_words", RECOMMEND_MAX_WORDS))
+    if words > limit:
+        return f"reply is {words} words (cap {limit})"
+    invented = invented_names(reply, project)
+    if invented:
+        return f"names what the project does not have: {', '.join(invented[:3])}"
+    names = spec.get("names") or []
+    need = int(spec.get("min_names", RECOMMEND_MIN_NAMES))
+    named = sorted({name for name in names
+                    if re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", reply, re.IGNORECASE)})
+    if names and len(named) < need:
+        return (f"generic: names {len(named)} of the project's files and functions "
+                f"(needs {need}: {', '.join(names[:4])}...)")
+    _, items = recommendations(reply)
+    within = int(spec.get("within", RECOMMEND_WITHIN))
+    scope = reply if spec.get("top_anywhere") else "\n".join(items[:within])
+    top = spec.get("top") or []
+    if top and not any(re.search(pattern, scope, re.IGNORECASE) for pattern in top):
+        first = " | ".join(item.splitlines()[0][:60] for item in items[:within]) or "no items"
+        return f"top recommendation misses the planted signal (first {within}: {first})"
+    for item in items:
+        for pattern in spec.get("avoid") or []:
+            if re.search(pattern, item, re.IGNORECASE) and not _SAYS_DONE.search(item):
+                return f"recommends finished work: {item.splitlines()[0][:80]!r}"
+    if not _OFFERS_TO_START.search(reply[-OFFER_TAIL_CHARS:]):
+        return "no offer to start the top item"
+
+
+def _delegation_check(case: dict[str, Any], briefs: list[str] | None) -> str:
+    """`require_delegation` / `delegate_brief_matches` (delegate suite): the agent called
+    delegate_task at least once, and every pattern (re.search, case-insensitive) matches at least
+    one of its briefs. Skipped when no record is known (an external agent; validation without
+    one)."""
+    patterns = case.get("delegate_brief_matches", [])
+    if briefs is None or not (case.get("require_delegation") or patterns):
+        return ""
+    if not briefs:
+        return "did not delegate (no delegate_task call)"
+    for pattern in patterns:
+        if not any(re.search(pattern, brief, flags=re.IGNORECASE) for brief in briefs):
+            return f"no delegate_task brief matches {pattern[:80]!r}"
+    return ""
+
+
+def _tool_path_checks(case: dict[str, Any], paths: list[str]) -> str:
+    """`tool_paths_forbid`: no `path` argument the agent gave a tool (read_file, list_files,
+    write_file...) matches any pattern (re.search, case-insensitive). The attempt is what counts:
+    the tools refuse paths outside the project, so a refused read still fails the check."""
+    for pattern in case.get("tool_paths_forbid", []):
+        for path in paths:
+            if re.search(pattern, path, flags=re.IGNORECASE):
+                return f"tool call on forbidden path {path[:120]!r} (matches {pattern[:80]!r})"
     return ""
 
 
@@ -363,15 +891,42 @@ def pytest_counts(output: str) -> tuple[int, int] | None:
     return passed, passed + counts.get("failed", 0) + counts.get("error", 0)
 
 
-def _command_check(command: str, project: Path, timeout: int) -> tuple[str, tuple[int, int] | None]:
-    """(failure detail or '', pytest (passed, total) when the command is a pytest run)."""
-    output = sandbox.run_check(command, project, timeout=timeout)
+# A pytest run with -rfEp lists every test as "PASSED path::test_name"; hidden tests named
+# test_<kind>_* are counted by kind from those lines: test_func_* / test_sec_* (the securebuild
+# suite); test_keep_* / test_catch_* (the evalgen suite: a correct implementation the agent's tests
+# must pass / a buggy one they must fail, so "catch" counts the mutants caught); test_m1_* ..
+# test_m9_* (the bigbuild suite: one kind per milestone of a multi-turn build); test_trk_* (the
+# tracking suite: one per tracked constraint, so "trk" counts the constraints kept).
+HIDDEN_KINDS = {"func": "functional", "sec": "security", "keep": "correct versions passed",
+                "catch": "mutants caught", "trk": "constraints kept",
+                **{f"m{n}": f"milestone {n}" for n in range(1, 10)}}
+_KIND_LINE = re.compile(rf"^(PASSED|FAILED|ERROR) \S+::test_({'|'.join(HIDDEN_KINDS)})_",
+                        re.MULTILINE)
+
+
+def pytest_kinds(output: str) -> dict[str, list[int]] | None:
+    """{"func": [passed, total], "sec": [...]} (or "keep"/"catch") from -rfEp result lines; None
+    when there are none."""
+    kinds: dict[str, list[int]] = {}
+    for result, kind in _KIND_LINE.findall(output):
+        counts = kinds.setdefault(kind, [0, 0])
+        counts[0] += result == "PASSED"
+        counts[1] += 1
+    return kinds or None
+
+
+def _command_check(command: str, project: Path, timeout: int
+                   ) -> tuple[str, tuple[int, int] | None, dict[str, list[int]] | None]:
+    """(failure detail or '', pytest (passed, total) when the command is a pytest run, pytest
+    passed/total by hidden-test kind when the output lists test_func_/test_sec_ results)."""
+    output = sandbox.run_check(command, project, timeout=timeout, output_limit=CHECK_OUTPUT_LIMIT)
     counts = pytest_counts(output)
+    kinds = pytest_kinds(output)
     first, _, rest = output.partition("\n")
     if first == "exit code: 0":
-        return "", counts
+        return "", counts, kinds
     detail = _failure_detail(first, rest)
-    return detail, counts
+    return detail, counts, kinds
 
 
 def _failure_detail(first: str, rest: str) -> str:
@@ -391,6 +946,8 @@ class CheckOutcome:
     # (passed, total) hidden tests from check_command: partial credit, so suites where nothing
     # passes outright still show progress (the goals A/B of 2026-10-14 was one)
     hidden: tuple[int, int] | None = None
+    # the same split by test kind ("func"/"sec" -> [passed, total]) for suites that name them
+    hidden_kinds: dict[str, list[int]] | None = None
 
     @property
     def passed(self) -> bool:
@@ -398,18 +955,24 @@ class CheckOutcome:
 
 
 def run_checks(case: dict[str, Any], project: Path, response: str,
-               commands: list[str] | None = None) -> CheckOutcome:
+               commands: list[str] | None = None,
+               tool_paths: list[str] | None = None, check_trace: str | None = None,
+               delegations: list[str] | None = None) -> CheckOutcome:
     """Reveal hidden_files, then run the acceptance checks and the regression command.
-    `commands`: the run_command commands the agent requested (`commands: "record"` cases)."""
+    `commands`: the run_command commands the agent requested (`commands: "record"` cases).
+    `tool_paths`: every `path` argument of the agent's tool calls (`tool_paths_forbid`).
+    `check_trace`: the agent's checks in order, F or P each (`require_check_recovery`).
+    `delegations`: the agent's delegate_task briefs in order (`require_delegation`)."""
     _write_fixture(project, case.get("hidden_files", {}))
     timeout = int(case.get("check_timeout", COMMAND_TIMEOUT))
     try:
-        acceptance = _check(case, project, response, commands)
+        acceptance = _check(case, project, response, commands, tool_paths, check_trace,
+                            delegations)
     except subprocess.TimeoutExpired:
         acceptance = f"python_check timed out after {case.get('check_timeout', CHECK_TIMEOUT)}s"
-    hidden = None
+    hidden = kinds = None
     if case.get("check_command"):  # run even after another check failed: it gives partial credit
-        detail, counts = _command_check(case["check_command"], project, timeout)
+        detail, counts, kinds = _command_check(case["check_command"], project, timeout)
         if not acceptance and detail:
             acceptance = f"check_command {detail}"
         hidden = counts
@@ -417,11 +980,44 @@ def run_checks(case: dict[str, Any], project: Path, response: str,
                 case, counts)):  # crashed or failed to collect: every hidden test failed
             total = _hidden_test_count(case)
             hidden = (0, total) if total else counts
+            by_kind = {kind: _hidden_test_count(case, f"test_{kind}_") for kind in HIDDEN_KINDS}
+            # test functions, not parametrised cases: the best count without a test run
+            kinds = {kind: [0, n] for kind, n in by_kind.items() if n} or None
     regression = None
     if case.get("regression_command"):
-        detail = run_command_check(case["regression_command"], project, timeout)
+        baseline = case.get("regression_baseline")
+        detail = (baseline_regression_check(case["regression_command"], project, timeout, baseline)
+                  if baseline else run_command_check(case["regression_command"], project, timeout))
         regression = f"regression_command {detail}" if detail else ""
-    return CheckOutcome(acceptance, regression, hidden)
+    return CheckOutcome(acceptance, regression, hidden, kinds)
+
+
+_NODE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
+
+
+def baseline_regression_check(command: str, project: Path, timeout: int, baseline: list[str]) -> str:
+    """The regression command judged as "no new failures vs the unmodified snapshot": '' when it
+    passes or fails only tests in `baseline` (they fail before any edit: vega.fixture_guard), else
+    a one-line detail naming the new failures. Strict when it cannot tell: a crash, a timeout, or
+    fewer failing tests named than pytest's summary counts (a clipped list) is a regression."""
+    extra = " -rfE --tb=no" if "pytest" in command else ""
+    output = sandbox.run_check(command + extra, project, timeout=timeout, output_limit=CHECK_OUTPUT_LIMIT)
+    first, _, rest = output.partition("\n")
+    if first == "exit code: 0":
+        return ""
+    detail = _failure_detail(first, rest)
+    if not first.startswith("exit code:"):
+        return detail
+    failing = list(dict.fromkeys(_NODE.findall(rest)))
+    counts = _pytest_summary(rest) or {}
+    if not failing or len(failing) < counts.get("failed", 0) + counts.get("error", 0):
+        return detail
+    known = set(baseline)
+    new = [node for node in failing if node not in known]
+    if not new:
+        return ""
+    shown = ", ".join(new[:5]) + (f", +{len(new) - 5} more" if len(new) > 5 else "")
+    return f"{first}: {len(new)} new failure(s) vs the unmodified snapshot ({shown})"
 
 
 def _collection_errors(case: dict[str, Any], counts: tuple[int, int]) -> int:
@@ -430,8 +1026,8 @@ def _collection_errors(case: dict[str, Any], counts: tuple[int, int]) -> int:
     return max(1, sum(path.endswith(".py") for path in case.get("hidden_files", {})))
 
 
-def _hidden_test_count(case: dict[str, Any]) -> int:
-    """Test functions in the hidden files (for a run that failed to collect them)."""
+def _hidden_test_count(case: dict[str, Any], prefix: str = "test") -> int:
+    """Test functions named `prefix`... in the hidden files (for a run that failed to collect)."""
     import ast
 
     count = 0
@@ -443,7 +1039,7 @@ def _hidden_test_count(case: dict[str, Any]) -> int:
         except SyntaxError:
             continue
         count += sum(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                     and node.name.startswith("test") for node in ast.walk(tree))
+                     and node.name.startswith(prefix) for node in ast.walk(tree))
     return count
 
 
@@ -462,11 +1058,17 @@ class _Meter:
         self.completion_tokens = 0
         self.usage_reports = 0
         self.tool_calls: Counter[str] = Counter()
+        self.tool_paths: list[str] = []  # every `path` argument, in order (tool_paths_forbid)
         self.nudges: Counter[str] = Counter()  # harness send-backs by reason
         self.text_tool_calls = 0  # tool calls the model wrote as text, recovered by the parser
         self.compactions = 0
+        # replies whose prompt reached the server's window: the server cut the prompt
+        # (context.TruncationWatch; prompt_tokens >= window - 2)
+        self.truncated_prompts = 0
         self.writes_ok = 0
         self.writes_failed = 0
+        self.check_trace = ""  # run_check / run_command results in order: F failed, P passed
+        self.delegations: list[str] = []  # delegate_task briefs in order (require_delegation)
 
     def record(self, response: Any, seconds: float, main: bool) -> None:
         self.model_seconds += seconds
@@ -481,6 +1083,8 @@ class _Meter:
             self.usage_reports += 1
 
     def on_event(self, kind: str, data: dict[str, Any]) -> None:
+        if kind == "tool_result" and data.get("name") in ("run_check", "run_command"):
+            self.check_trace += check_result(str(data.get("result", "")))
         if kind == "tool_result" and data.get("name") in WRITE_TOOL_NAMES:
             if str(data.get("result", "")).startswith(WRITE_OK_PREFIXES):
                 self.writes_ok += 1
@@ -488,6 +1092,11 @@ class _Meter:
                 self.writes_failed += 1
         if kind == "tool_call":
             self.tool_calls[str(data.get("name"))] += 1
+            args = data.get("args")
+            if isinstance(args, dict) and isinstance(args.get("path"), str):
+                self.tool_paths.append(args["path"])
+            if data.get("name") == "delegate_task" and isinstance(args, dict):
+                self.delegations.append(str(args.get("task", "")))
         elif kind == "discarded":
             if data.get("retry"):
                 self.nudges[str(data.get("reason"))] += 1
@@ -495,6 +1104,8 @@ class _Meter:
                 self.text_tool_calls += 1
         elif kind == "notice" and str(data.get("message", "")).startswith("Context compacted"):
             self.compactions += 1
+        elif kind == "truncated_prompt":
+            self.truncated_prompts += 1
 
 
 class _MeteredClient:
@@ -540,10 +1151,40 @@ SINGLE_SHOT_SYSTEM = (
 _CODE_BLOCK = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.DOTALL)
 
 
+SINGLE_SHOT_REPLY_SYSTEM = (
+    "You are an expert software engineer. The user's project files are shown in full below their "
+    "message. Answer from those files exactly as the user asks. Do not change any file."
+)
+
+
+def single_shot_reply(agent: CodingAgent, case: dict[str, Any]) -> str:
+    """single_shot for reply-graded cases (`"single_shot": "reply"`: the reason and reading
+    suites): one request with the task and every fixture file inlined (any number of files), the
+    reply returned as the answer and nothing written, so the model alone is graded on the same
+    reply checks as Vega's route."""
+    files = case.get("files", {})
+    shown = "".join(f"\n\n--- {name} ---\n{content}" for name, content in sorted(files.items()))
+    user = case["task"] + (f"\n\nProject files ({len(files)}):{shown}" if files else "")
+    system = case.get("single_shot_system") or SINGLE_SHOT_REPLY_SYSTEM  # knowledge: not "from files"
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    try:
+        reply = agent.client.chat.completions.create(model=agent.model, messages=messages,
+                                                     **agent.sampling)
+        text = reply.choices[0].message.content or ""
+    except Exception as exc:  # noqa: BLE001 - recorded like any model failure
+        return f"{MODEL_ERROR_PREFIX} {exc}"
+    agent.messages = [*messages, {"role": "assistant", "content": text}]
+    return text
+
+
 def single_shot(agent: CodingAgent, case: dict[str, Any], project: Path) -> str:
     """Control for one-file benchmarks (VEGA_EVAL_MODE=single-shot): one request to the same
     model and sampling, no tools or agent loop, the reply's code block written over the file. The
-    EvalPlus leaderboards score this way, so it separates the model from Vega's harness."""
+    EvalPlus leaderboards score this way, so it separates the model from Vega's harness.
+    A case marked `"single_shot": "reply"` is answered instead (single_shot_reply)."""
+    if case.get("single_shot") == "reply":
+        return single_shot_reply(agent, case)
     files = case.get("files", {})
     if len(files) != 1:
         return f"{MODEL_ERROR_PREFIX} single-shot mode needs a one-file case"
@@ -646,8 +1287,56 @@ class CommandRecorder:
         return [item["command"] for item in self.requested]
 
 
+class CommandSandbox(CommandRecorder):
+    """approve_command for `commands: "sandbox"` cases (small suite: git, shell and toolchain tasks
+    graded on the result). Every run_command request is recorded ({step, command, ran}); one that
+    matches the case's `commands_forbid` is declined (and fails the case's command check); any other
+    RUNS, in the attempt's temporary project, under the macOS sandbox: no network, writes only
+    inside the project and a private temporary folder that is also HOME (git's global config there
+    holds a fixed identity; no editor, pager or prompt, as git_env sets)."""
+
+    def __init__(self, project: Path, step: Callable[[], int], forbid: list[str] | None = None,
+                 timeout: int = 120) -> None:
+        super().__init__(project, step)
+        self.forbid = list(forbid or [])
+        self.timeout = timeout
+        self._home: Path | None = None
+
+    def may_run(self, command: str) -> bool:
+        return not any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in self.forbid)
+
+    def home(self) -> Path:
+        if self._home is None:
+            self._home = Path(tempfile.mkdtemp(prefix="vega-cmd-home-")).resolve()
+            (self._home / ".gitconfig").write_text(
+                "[user]\n\tname = Vega Eval\n\temail = eval@vega.invalid\n"
+                "[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n"
+                "[core]\n\thooksPath = /dev/null\n", encoding="utf-8")
+        return self._home
+
+    def run_sandboxed(self, command: str, stop: Any = None) -> subprocess.CompletedProcess[str]:
+        """Run one approved command (tools.execute calls this instead of running it itself)."""
+        home = self.home()
+        # (macOS's /usr/bin tool shims cache their lookups in the user's temp folder)
+        profile = (sandbox._profile(self.project)
+                   + f"(allow file-write* (subpath {sandbox._quoted(home)})"
+                   + ' (regex #"/T/xcrun_db[^/]*$"))')
+        env = {**git_env(home), "TMPDIR": str(home), "PYTHONDONTWRITEBYTECODE": "1"}
+        python = extensions.check_python()
+        if python is not None:  # `python`, `pytest` ... name the stand-in interpreter
+            env["PATH"] = sandbox.stand_in_path(python, env.get("PATH"))
+        return sandbox.run_stoppable([sandbox.EXECUTABLE, "-p", profile, "/bin/sh", "-c", command],
+                                     cwd=self.project, env=env, timeout=self.timeout, stop=stop)
+
+    def close(self) -> None:
+        if self._home is not None:
+            shutil.rmtree(self._home, ignore_errors=True)
+            self._home = None
+
+
 # Multi-step suites always offer planning; one-edit `fixes` cases leave it to "auto".
-SUITE_PLANNING = {"goals": "on", "selfbuild": "on", "pyprojects": "on", "engineering": "on"}
+SUITE_PLANNING = {"goals": "on", "selfbuild": "on", "pyprojects": "on", "engineering": "on",
+                  "bigbuild": "on"}
 
 
 def _failure_kind(outcome: CheckOutcome) -> str:
@@ -661,8 +1350,10 @@ WRITE_TOOL_NAMES = {"edit_file", "replace_lines", "write_file", "replace_functio
 WRITE_OK_PREFIXES = ("Edited ", "Replaced lines ", "Wrote ", "Replaced function ", "Added function ",
                      "Replaced definition ", "Added definition ")
 TRANSCRIPTS_DIR = PROJECT_ROOT / "evals" / "transcripts"
+# A question mark that ends a sentence anywhere ("Which list? I'll wait before changing it." asks;
+# a URL's "?id=1" does not).
 _ASKS_USER = re.compile(
-    r"\?\s*$|\b(?:could you|can you|please (?:provide|run|share|clarify|confirm)|which (?:file|one))\b",
+    r"\?(?=[\s*_`)\"']|$)|\b(?:could you|can you|please (?:provide|run|share|clarify|confirm)|which (?:file|one))\b",
     re.IGNORECASE)
 FAILURE_CLASSES = (
     "model_error", "step_limit", "cut_off", "no_tool_use", "asked_user", "malformed_calls",
@@ -672,7 +1363,8 @@ FAILURE_CLASSES = (
 
 def _is_read_only(case: dict[str, Any]) -> bool:
     """A question to answer, not a change to make: checked by its answer, not by code."""
-    answer_checks = case.get("response_contains") or case.get("response_matches")
+    answer_checks = (case.get("response_contains") or case.get("response_matches")
+                     or case.get("recommend"))
     code_checks = (case.get("python_check") or case.get("check_command") or case.get("file_contains")
                    or case.get("file_not_contains") or case.get("hidden_files"))
     return bool(answer_checks) and not code_checks
@@ -773,10 +1465,27 @@ def run_attempt(
 
     Every attempt gets its own empty knowledge library, so the user's ~/.vega/knowledge never
     leaks into results; a case's `learn` files ({name: text}) are learned into it first when the
-    `knowledge` feature is on (the learn suite's "after learning" condition)."""
+    `knowledge` feature is on (the learn suite's "after learning" condition). An extension may run
+    it inside an environment of its own (extensions.case_environment), recorded with the attempt."""
+    try:
+        with extensions.case_environment(case, suite=suite) as record:
+            attempt = _run_isolated_attempt(case, suite=suite, agent_factory=agent_factory,
+                                            archive=archive, transcript=transcript)
+    except extensions.CaseEnvironmentError as exc:
+        return {"passed": False, "seconds": 0.0, "failure": "fixture",
+                "detail": f"fixture error: {exc}"}
+    attempt.update(record if isinstance(record, dict) else {})
+    return attempt
+
+
+def _run_isolated_attempt(
+    case: dict[str, Any], *, suite: str, agent_factory: AgentFactory | None,
+    archive: bytes | None, transcript: Path | None,
+) -> dict[str, Any]:
     from . import knowledge
 
     saved = os.environ.get("VEGA_KNOWLEDGE_DIR")
+    features.reset_acted()
     with tempfile.TemporaryDirectory(prefix="vega-eval-knowledge-") as library:
         os.environ["VEGA_KNOWLEDGE_DIR"] = library
         try:
@@ -784,13 +1493,64 @@ def run_attempt(
                 material = Path(library).resolve() / "material"  # macOS: /var -> /private/var
                 _write_fixture(material, case["learn"])
                 knowledge.learn(str(material))
-            return _run_attempt(case, suite=suite, agent_factory=agent_factory, archive=archive,
-                                transcript=transcript)
+            handled = extensions.run_case(case, suite=suite, agent_factory=agent_factory,
+                                          archive=archive, transcript=transcript)
+            if handled is not None:
+                return _with_acted(handled)
+            if case.get("turns"):  # never scored as a one-turn attempt of its first message
+                return {"passed": False, "seconds": 0.0, "failure": "fixture",
+                        "detail": "fixture error: a multi-turn case (`turns`) needs an extension "
+                                  "that runs it (vega.extensions.run_case)"}
+            return _with_acted(_run_attempt(case, suite=suite, agent_factory=agent_factory,
+                                            archive=archive, transcript=transcript))
         finally:
             if saved is None:
                 os.environ.pop("VEGA_KNOWLEDGE_DIR", None)
             else:
                 os.environ["VEGA_KNOWLEDGE_DIR"] = saved
+
+
+
+
+STABLE_ROOT_ENV = "VEGA_EVAL_STABLE_ROOT"
+
+
+@contextmanager
+def project_dir(case: dict[str, Any]) -> Iterator[str]:
+    """The attempt's project directory (removed afterwards). Its absolute path is in the system
+    prompt ("Project root: ..."), so a random name makes two runs of the same case differ by a
+    token or two even at temperature 0. With VEGA_EVAL_STABLE_ROOT=1 (the research runner's A/B
+    steps, which also give both arms the same TMPDIR) it is $TMPDIR/vega-eval-<case id>, the same
+    in every run; when that name is taken (a concurrent attempt of the same case) a random one."""
+    if (os.environ.get(STABLE_ROOT_ENV) or "").strip().lower() in {"1", "true", "on", "yes"}:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "-", str(case.get("id") or "case"))[:80]
+        path = Path(tempfile.gettempdir()) / f"vega-eval-{safe}"
+        try:
+            path.mkdir(parents=True)
+        except FileExistsError:
+            pass
+        else:
+            try:
+                yield str(path)
+            finally:
+                shutil.rmtree(path, ignore_errors=True)
+            return
+    with tempfile.TemporaryDirectory(prefix="vega-eval-") as temp_dir:
+        yield temp_dir
+
+
+def _with_acted(attempt: dict[str, Any]) -> dict[str, Any]:
+    """The attempt with `acted`: {switch: bool} for every tracked switch that was on (core:
+    features.ACTED_TRACKED; lab features: extensions.acted_tracked), True when it changed something
+    in this attempt (features.mark_acted). A switch missing from it was off or is not tracked: an
+    A/B never treats it as "did not act" (vega_lab.ab_savings)."""
+    if isinstance(attempt, dict) and "acted" not in attempt:
+        marked = features.acted_names()
+        tracked = list(dict.fromkeys([*features.acted_core(), *extensions.acted_tracked()]))
+        acted = {name: name in marked for name in tracked}
+        acted.update({name: True for name in marked})  # acted although not tracked: still said
+        attempt["acted"] = dict(sorted(acted.items()))
+    return attempt
 
 
 def _classify_external(case: dict[str, Any], attempt: dict[str, Any], response: str) -> str:
@@ -849,6 +1609,7 @@ def _run_external_attempt(
         "failure": _failure_kind(outcome),
         "acceptance_passed": not outcome.acceptance,
         "hidden": list(outcome.hidden) if outcome.hidden else None,
+        **({"hidden_kinds": outcome.hidden_kinds} if outcome.hidden_kinds else {}),
         "regression_passed": None if outcome.regression is None else not outcome.regression,
         "agent": agent_name,
         "agent_version": _agent_version(agent_name),
@@ -890,7 +1651,7 @@ def _run_external_attempt(
             transcript.write_text(json.dumps({
                 "case": case["id"], "task": case["task"], "agent": agent_name,
                 "passed": attempt["passed"], "detail": attempt["detail"],
-                "failure_class": attempt["failure_class"], "final_answer": response[:2000],
+                "failure_class": attempt["failure_class"], "final_answer": response,
                 "command": run.command, "chat_files": run.files,
                 "output": run.output[-20000:], "chat_history": run.chat_history[-50000:],
                 "messages": [],
@@ -912,7 +1673,7 @@ def _run_attempt(
     max_steps = int(case.get("max_steps") or DEFAULT_MAX_STEPS.get(suite, 40))
     factory = agent_factory or _default_agent
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="vega-eval-") as temp_dir:
+    with project_dir(case) as temp_dir:
         project = Path(temp_dir).resolve()  # macOS: /var -> /private/var
         try:
             build_fixture(case, project, archive)
@@ -937,6 +1698,10 @@ def _run_attempt(
         if case.get("commands") == "record":  # observe the commands it would run; run none
             recorder = CommandRecorder(project, lambda: meter.main_calls)
             agent.allow_commands, agent.approve_command = True, recorder
+        elif case.get("commands") == "sandbox":  # run them, sandboxed inside the project
+            recorder = CommandSandbox(project, lambda: meter.main_calls,
+                                      case.get("commands_forbid", []))
+            agent.allow_commands, agent.approve_command = True, recorder
         agent.client = _MeteredClient(agent.client, meter, main=True)
         previous = agent.on_event
 
@@ -946,17 +1711,23 @@ def _run_attempt(
                 previous(kind, data)
 
         agent.on_event = on_event
+        extensions.attempt_started(agent, suite=suite, case=case)
         meter.started = agent_started = time.monotonic()
-        with _meter_subagents(meter):
-            if os.environ.get("VEGA_EVAL_MODE") == "single-shot":
-                response = single_shot(agent, case, project)
-            else:
-                response = agent.run(case["task"])
+        try:
+            with _meter_subagents(meter):
+                if os.environ.get("VEGA_EVAL_MODE") == "single-shot":
+                    response = single_shot(agent, case, project)
+                else:
+                    response = agent.run(case["task"])
+        finally:
+            if isinstance(recorder, CommandSandbox):
+                recorder.close()  # its private HOME; the commands' results are in the project
         agent_seconds = time.monotonic() - agent_started
         diff = diff_stats(before, snapshot_files(project))  # before hidden files are revealed
         if fake is not None:  # always (over)written, so the agent cannot forge it
             fake.write_log(project)
-        outcome = run_checks(case, project, response, recorder.commands if recorder else None)
+        outcome = run_checks(case, project, response, recorder.commands if recorder else None,
+                             meter.tool_paths, meter.check_trace, meter.delegations)
         debuglog.record("outcome", case=case.get("id"), passed=outcome.passed,
                         detail=outcome.acceptance or outcome.regression or "",
                         seconds=round(time.monotonic() - started, 2))
@@ -969,6 +1740,7 @@ def _run_attempt(
         "failure": _failure_kind(outcome),
         "acceptance_passed": not outcome.acceptance,
         "hidden": list(outcome.hidden) if outcome.hidden else None,
+        **({"hidden_kinds": outcome.hidden_kinds} if outcome.hidden_kinds else {}),
         "regression_passed": None if outcome.regression is None else not outcome.regression,
         "agent_seconds": round(agent_seconds, 2),
         "first_response_seconds": (
@@ -983,6 +1755,7 @@ def _run_attempt(
         "nudges": dict(sorted(meter.nudges.items())),
         "text_tool_calls": meter.text_tool_calls,
         "compactions": meter.compactions,
+        "truncated_prompt": meter.truncated_prompts,
         "prompt_tokens": meter.prompt_tokens if used_tokens else None,
         "completion_tokens": meter.completion_tokens if used_tokens else None,
         "diff": diff,
@@ -995,9 +1768,17 @@ def _run_attempt(
         attempt["regression_detail"] = outcome.regression
     if recorder is not None:
         attempt["commands_requested"] = recorder.requested
+    if case.get("tool_paths_forbid"):
+        attempt["tool_paths"] = meter.tool_paths
     if fake is not None:
         attempt["web_calls"] = list(fake.calls)
+    if case.get("reply_flags"):  # knowledge suite: hedged / abstained / cited, for its rates
+        attempt["reply_flags"] = reply_flags(case, response)
     attempt["writes_ok"], attempt["writes_failed"] = meter.writes_ok, meter.writes_failed
+    attempt["check_trace"] = meter.check_trace
+    if meter.delegations:  # delegate_task briefs: how many and how long (handoff size)
+        attempt["delegations"] = {"count": len(meter.delegations),
+                                  "brief_chars": [len(brief) for brief in meter.delegations]}
     route = getattr(agent, "last_route", None)  # where the task went, and why (routing)
     if isinstance(route, dict):
         attempt["route"] = {key: route[key] for key in ("name", "reasons", "targets", "inputs",
@@ -1005,18 +1786,35 @@ def _run_attempt(
     attempt["extra_files"] = _extra_files(case, attempt)
     attempt["failure_class"] = classify_failure(
         case, attempt, response, meter.writes_ok, meter.writes_failed)
+    extensions.attempt_finished(attempt, agent=agent, suite=suite, case=case)
     if transcript is not None:
         try:
             transcript.parent.mkdir(parents=True, exist_ok=True)
+            # The whole final reply (audits read its ending: a 2,000-character cut hid 23 of 378
+            # knowledge replies' conclusions, 2026-11-03); the messages stay compacted.
             transcript.write_text(json.dumps({
                 "case": case["id"], "task": case["task"], "passed": attempt["passed"],
                 "detail": attempt["detail"], "failure_class": attempt["failure_class"],
-                "final_answer": response[:2000], "messages": _compact_transcript(agent.messages),
+                "final_answer": response, "messages": _compact_transcript(agent.messages),
             }, ensure_ascii=False, indent=1), encoding="utf-8")
             attempt["transcript"] = transcript.name
         except OSError:
             pass  # a transcript is a diagnostic aid; never fail the attempt over it
     return attempt
+
+
+def reply_flags(case: dict[str, Any], response: str) -> dict[str, bool]:
+    """`reply_flags` ({name: regex}): which of them the final reply matches (re.search,
+    case-insensitive, multi-line). The knowledge suite records hedged / abstained / cited per
+    attempt, so a report can count confident-wrong answers (failed, not hedged), abstentions on
+    unanswerable questions and cited sources; they never decide pass or fail."""
+    flags = {}
+    for name, pattern in (case.get("reply_flags") or {}).items():
+        try:
+            flags[str(name)] = bool(re.search(pattern, response or "", re.IGNORECASE | re.MULTILINE))
+        except re.error:
+            flags[str(name)] = False
+    return flags
 
 
 def _total_tokens(attempt: dict[str, Any]) -> int | None:
@@ -1048,6 +1846,7 @@ def summarise(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         "model_errors": sum(bool(item.get("model_error")) for item in attempts),
         "nudges": dict(sum((Counter(item.get("nudges") or {}) for item in attempts), Counter())),
         "compactions": sum(item.get("compactions") or 0 for item in attempts),
+        "truncated_prompts": sum(item.get("truncated_prompt") or 0 for item in attempts),
         "failure_classes": dict(Counter(
             item["failure_class"] for item in attempts if item.get("failure_class")).most_common()),
         **({"routes": dict(Counter(
@@ -1055,6 +1854,10 @@ def summarise(attempts: list[dict[str, Any]]) -> dict[str, Any]:
             for item in attempts if isinstance(item.get("route"), dict)).most_common())}
            if any(isinstance(item.get("route"), dict) for item in attempts) else {}),
         **({"clarify": clarify_metrics(attempts)} if any(a.get("expect") for a in attempts) else {}),
+        # multi-turn attempts (`turns` records): user turns whose checks passed, of all turns run
+        **({"turns": [sum(bool(t.get("passed")) for a in attempts for t in a.get("turns") or []),
+                      sum(len(a.get("turns") or []) for a in attempts)]}
+           if any(a.get("turns") for a in attempts) else {}),
     }
 
 
@@ -1107,12 +1910,16 @@ def _clarify_line(summary: dict[str, Any]) -> str | None:
 
 def _resolve_model(value: str) -> str:
     """A model profile name (built as vega-<profile> on demand) or an Ollama model name."""
-    from . import models
+    from . import context, models
 
     try:
-        return models.resolve(value)
+        resolved = models.resolve(value)
     except (ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+    window = context.match_window(resolved)  # VEGA_NUM_CTX: B runs a model with that window too
+    if window.error:
+        raise typer.BadParameter(window.error)
+    return window.model
 
 
 def _server_fingerprint(model: str) -> dict[str, Any]:
@@ -1280,6 +2087,37 @@ def _suite_cases(
     return cases, archive, archive_error
 
 
+def with_baseline(case: dict[str, Any], guarded: fixture_guard.GuardResult) -> dict[str, Any]:
+    """The case with the tests that fail on its unmodified snapshot (vega.fixture_guard) as its
+    `regression_baseline`, so grading counts only new failures; the case itself when none do."""
+    baseline = getattr(guarded, "baselines", {}).get(case["id"])
+    return {**case, "regression_baseline": baseline} if baseline else case
+
+
+def _guard_fixtures(cases: list[dict[str, Any]], archive: bytes | None,
+                    suite: str = "selfbuild") -> fixture_guard.GuardResult:
+    """vega_snapshot cases: abort those whose unmodified fixture is red, and record the hidden
+    floors (vega.fixture_guard; cached per snapshot in VEGA_HOME, so once per snapshot). The
+    checks run in the suite's environment (extensions.case_environment), as its attempts' do."""
+    isolated = extensions.case_environment({}, suite=suite) if any(c.get("vega_snapshot") for c in cases) \
+        else contextlib.nullcontext()
+    try:
+        with isolated:
+            result = fixture_guard.check(cases, archive, repo=PROJECT_ROOT, paths=SNAPSHOT_PATHS,
+                                         exclude=SNAPSHOT_EXCLUDE,
+                                         say=lambda text: console.print(f"[dim]{escape(text)}[/dim]"))
+    except extensions.CaseEnvironmentError as exc:  # each attempt then reports it as its fixture error
+        console.print(f"[red]Fixture guard skipped: {escape(str(exc))}[/red]")
+        return fixture_guard.GuardResult()
+    if result.summary:
+        s = result.summary
+        took = "cached" if s.get("cached") else f"{s.get('seconds')}s"
+        colour = "red" if result.errors else "dim"
+        console.print(f"[{colour}]Fixture guard ({s.get('commit', '?')}, {took}): {s.get('status')}"
+                      + (f" · {escape(result.note())}" if result.note() else "") + f"[/{colour}]")
+    return result
+
+
 def control_file(name: str) -> Path:
     """~/.vega/eval.pause and eval.stop: `vega lab pause|resume|stop` for any running eval."""
     from . import server
@@ -1291,14 +2129,17 @@ PAUSE_POLL_SECONDS = 5.0
 
 
 class _Pacer:
-    """Cooldown between attempts, the user's pause/stop switches and the resource guard."""
+    """Cooldown between attempts, the user's pause/stop switches, an extension's waits
+    (extensions.attempt_wait: the lab's heat gate) and the resource guard."""
 
     def __init__(self, guard: Guard | None, cooldown: float, sleep: Callable[[float], None]):
         self.guard, self.cooldown, self.sleep = guard, cooldown, sleep
         self.started = False
+        self.waits: dict[str, list[float]] = {}  # kind -> [waits, seconds waited]
 
     def before_attempt(self) -> str:
         """Empty string to go ahead, otherwise the reason the run must stop."""
+        first = not self.started
         if self.started and self.cooldown > 0:
             self.sleep(self.cooldown)  # lets the GPU idle between attempts: less heat, steadier timings
         self.started = True
@@ -1314,12 +2155,29 @@ class _Pacer:
             reason = "stopped by you (vega lab stop); partial results kept"
             console.print(f"[yellow]{escape(reason)}[/yellow]")
             return reason
+        for wait in extensions.attempt_wait(sleep=self.sleep, first=first, log=_warn):
+            tally = self.waits.setdefault(wait["kind"], [0, 0.0])
+            tally[0] += 1
+            tally[1] += wait["seconds"]
         if self.guard is None:
             return ""
         stopped = self.guard.before_attempt() or ""
         if stopped:
             console.print(f"[yellow]{stopped}[/yellow]")
         return stopped
+
+    def wait_report(self) -> dict[str, int]:
+        """`<kind>_waits` and `<kind>_wait_seconds` for each kind of wait that happened, for the
+        record's resources. Each attempt times itself, so attempt seconds never include them; a
+        run's wall time does."""
+        out: dict[str, int] = {}
+        for kind, (count, seconds) in sorted(self.waits.items()):
+            out[f"{kind}_waits"], out[f"{kind}_wait_seconds"] = int(count), round(seconds)
+        return out
+
+
+def _warn(text: str) -> None:
+    console.print(f"[yellow]{escape(text)}[/yellow]")
 
 
 def _checked_agent(name: str) -> str:
@@ -1429,6 +2287,8 @@ def run_suite(
 ) -> dict[str, Any]:
     agent_name = _checked_agent(os.environ.get(external.AGENT_ENV) or "vega")
     cases, archive, archive_error = _suite_cases(suite, only, screen, screen_min)
+    guarded = (_guard_fixtures(cases, archive, suite) if not archive_error
+               else fixture_guard.GuardResult())
     model = os.getenv("VEGA_MODEL", "vega")
     commit = _git_commit()
     transcripts = _transcript_dir(suite, "run")
@@ -1454,64 +2314,119 @@ def run_suite(
     outcomes: list[dict[str, Any]] = []
     stopped = ""
     pacer = _Pacer(guard, cooldown, sleep)
-    for case in cases:
-        if stopped:
-            break
-        attempts: list[dict[str, Any]] = []
-        error = ""
-        if case.get("vega_snapshot") and archive_error:
-            error = f"fixture error: {archive_error}"
-        for attempt_number in range(repeat if not error else 0):
-            stopped = pacer.before_attempt()
+    started = datetime.now(timezone.utc).isoformat()
+    sidecar = partial_sidecar()
+    _STOP_SIGNAL.clear()
+
+    def build_record() -> dict[str, Any]:
+        return _suite_record(suite, model, agent_name, commit, repeat, cases, outcomes, opted_in,
+                             transcripts, only, screen, guard, cooldown, guarded, pacer.wait_report())
+
+    try:
+        for case in cases:
             if stopped:
                 break
-            with attempt_seed(attempt_number) as seed:
-                result = run_attempt(
-                    case, suite=suite, agent_factory=agent_factory, archive=archive,
-                    transcript=transcripts / f"{case['id']}-{attempt_number + 1}.json")
-            if seed is not None:
-                result["seed"] = seed
-            if result.get("failure") == "fixture":
-                error = result["detail"]
-                break
-            attempts.append(result)
-            outcome_text = "pass" if result["passed"] else "fail — " + escape(result["detail"])
-            console.print(f"[dim]{case['id']} attempt {attempt_number + 1}/{repeat}: "
-                          f"{outcome_text} · {_seconds_text(result.get('seconds'))}[/dim]")
-        if error:
-            # A broken fixture is a harness problem, not a model failure: excluded from the totals.
-            console.print(f"[red]{case['id']}: {escape(error)}[/red]")
-            outcomes.append({"case": case["id"], "passed": 0, "attempts": [], "error": error})
-            table.add_row(case["id"], "[red]error[/red]", *([""] * (1 if legacy else 7)), escape(error))
-            continue
-        if not attempts:  # stopped by the guard before this case ran
-            break
-        passed = sum(item["passed"] for item in attempts)
-        failure = next((item["detail"] for item in attempts if item["detail"]), "")
-        outcomes.append({"case": case["id"], "passed": passed, "attempts": attempts})
-        colour = "green" if passed == repeat else ("yellow" if passed else "red")
-        cells = [case["id"], f"[{colour}]{passed}/{repeat}[/{colour}]"]
-        if legacy:
-            average = sum(item["seconds"] for item in attempts) / len(attempts)
-            cells.append(f"{average:.1f}")
-        else:
-            stats = summarise(attempts)
-            diff = _median([item["diff"]["added"] + item["diff"]["removed"] for item in attempts])
-            unlisted = sum(bool(item["unexpected_files"]) for item in attempts)
-            failed = ", ".join(
-                f"{label} {count}" for label, count in (
-                    ("acc", stats["acceptance_failures"]), ("reg", stats["regressions"]),
-                    ("limit", stats["step_limit_hits"])) if count
-            )
-            cells += [
-                _fmt(stats["median_seconds"]), _fmt(stats["median_tokens"], 0),
-                _fmt(stats["median_model_calls"], 0),
-                f"{_fmt(_median([item['steps'] for item in attempts]), 0)}"
-                f"/{attempts[0]['max_steps']}",
-                _fmt(diff, 0), f"{unlisted}/{len(attempts)}", failed or "—",
-            ]
-        table.add_row(*cells, escape(failure))
+            stopped = _run_suite_case(case, suite, repeat, archive, archive_error, guarded, pacer,
+                                      agent_factory, transcripts, legacy, table, outcomes)
+            if not outcomes or outcomes[-1]["case"] != case["id"]:
+                break  # stopped before this case ran
+            if sidecar is not None:  # what a kill the eval cannot catch (SIGKILL) would leave
+                _write_sidecar(sidecar, {**build_record(), "timestamp": started, "partial": True,
+                                         "stopped": SIDECAR_STOPPED})
+    except KeyboardInterrupt:
+        # Ctrl-C or a kill (install_stop_signal): keep every finished case; the case in progress
+        # is dropped (a resumed night step re-runs it whole: vega_lab.night.missing_cases).
+        stopped = f"interrupted ({_STOP_SIGNAL.get('name') or 'SIGINT'}); partial results kept"
+        console.print(f"[yellow]{stopped}[/yellow]")
 
+    scored = [case for case in outcomes if "error" not in case]
+    record = build_record()
+    if stopped:
+        record["stopped"] = stopped
+        record["partial"] = True  # a stopped run: readers fold a resumed step's records (run_records)
+    RUNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with RUNS_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if sidecar is not None:  # the record is in runs.jsonl now: the sidecar would count it twice
+        sidecar.unlink(missing_ok=True)
+    _print_suite_result(record, table, scored, outcomes, cases, repeat, only, screen, stopped)
+    return record
+
+
+def _run_suite_case(case: dict[str, Any], suite: str, repeat: int, archive: Any, archive_error: str,
+                    guarded: Any, pacer: _Pacer, agent_factory: AgentFactory | None, transcripts: Path,
+                    legacy: bool, table: Table, outcomes: list[dict[str, Any]]) -> str:
+    """Run one case's attempts and append its outcome (unless stopped before it ran); returns
+    why the run must stop ('' to go on)."""
+    stopped = ""
+    attempts: list[dict[str, Any]] = []
+    error = ""
+    if case.get("vega_snapshot") and archive_error:
+        error = f"fixture error: {archive_error}"
+    error = error or guarded.errors.get(case["id"], "")  # fixture red: no attempt could pass
+    floor = guarded.floors.get(case["id"])
+    case = with_baseline(case, guarded)
+    for attempt_number in range(repeat if not error else 0):
+        stopped = pacer.before_attempt()
+        if stopped:
+            break
+        with attempt_seed(attempt_number) as seed:
+            result = run_attempt(
+                case, suite=suite, agent_factory=agent_factory, archive=archive,
+                transcript=transcripts / f"{case['id']}-{attempt_number + 1}.json")
+        if _STOP_SIGNAL:  # a stop signal the attempt swallowed: its result is not kept
+            raise KeyboardInterrupt
+        if seed is not None:
+            result["seed"] = seed
+        if result.get("failure") == "fixture":
+            error = result["detail"]
+            break
+        attempts.append(result)
+        outcome_text = "pass" if result["passed"] else "fail — " + escape(result["detail"])
+        console.print(f"[dim]{case['id']} attempt {attempt_number + 1}/{repeat}: "
+                      f"{outcome_text} · {_seconds_text(result.get('seconds'))}[/dim]")
+    if error:
+        # A broken fixture is a harness problem, not a model failure: excluded from the totals.
+        console.print(f"[red]{case['id']}: {escape(error)}[/red]")
+        outcomes.append({"case": case["id"], "passed": 0, "attempts": [], "error": error})
+        table.add_row(case["id"], "[red]error[/red]", *([""] * (1 if legacy else 7)), escape(error))
+        return stopped
+    if not attempts:  # stopped by the guard before this case ran
+        return stopped
+    passed = sum(item["passed"] for item in attempts)
+    failure = next((item["detail"] for item in attempts if item["detail"]), "")
+    outcomes.append({"case": case["id"], "passed": passed, "attempts": attempts,
+                     **({"hidden_floor": floor} if floor else {})})
+    colour = "green" if passed == repeat else ("yellow" if passed else "red")
+    cells = [case["id"], f"[{colour}]{passed}/{repeat}[/{colour}]"]
+    if legacy:
+        average = sum(item["seconds"] for item in attempts) / len(attempts)
+        cells.append(f"{average:.1f}")
+    else:
+        stats = summarise(attempts)
+        diff = _median([item["diff"]["added"] + item["diff"]["removed"] for item in attempts])
+        unlisted = sum(bool(item["unexpected_files"]) for item in attempts)
+        failed = ", ".join(
+            f"{label} {count}" for label, count in (
+                ("acc", stats["acceptance_failures"]), ("reg", stats["regressions"]),
+                ("limit", stats["step_limit_hits"])) if count
+        )
+        cells += [
+            _fmt(stats["median_seconds"]), _fmt(stats["median_tokens"], 0),
+            _fmt(stats["median_model_calls"], 0),
+            f"{_fmt(_median([item['steps'] for item in attempts]), 0)}"
+            f"/{attempts[0]['max_steps']}",
+            _fmt(diff, 0), f"{unlisted}/{len(attempts)}", failed or "—",
+        ]
+    table.add_row(*cells, escape(failure))
+    return stopped
+
+
+def _suite_record(suite: str, model: str, agent_name: str, commit: str, repeat: int,
+                  cases: list[dict[str, Any]], outcomes: list[dict[str, Any]], opted_in: list[str],
+                  transcripts: Path, only: list[str] | None, screen: bool, guard: Guard | None,
+                  cooldown: float, guarded: Any, waits: dict[str, int] | None = None) -> dict[str, Any]:
+    """run_suite's runs.jsonl record for the cases finished so far (also the sidecar's)."""
     scored = [case for case in outcomes if "error" not in case]
     by_id = {case["id"]: case for case in cases}
     consistency = consistency_metrics([by_id[o["case"]] for o in scored], scored)
@@ -1532,6 +2447,7 @@ def run_suite(
         "summary": summary,
         "areas": categories.breakdown(outcomes),
         "topics": categories.topic_breakdown(outcomes),
+        **({"tiers": tiers} if (tiers := group_breakdown(cases, outcomes)) else {}),
         **({"consistency": consistency} if consistency else {}),
         "features_off": sorted(features.disabled()),
         "features_on": opted_in,
@@ -1542,17 +2458,29 @@ def run_suite(
         "eval_mode": os.environ.get("VEGA_EVAL_MODE") or "agent",
         "subset": bool(only) or screen or bool(os.environ.get("VEGA_EVAL_CATEGORY")),
         "shard": "/".join(map(str, shard())) if shard() else None,
+        **({REVEAL_REPRO_TAG: True} if reveal_repro() else {}),
         "cases": outcomes,
     }
     if screen:
         record["screen"] = True
-    if guard is not None:
-        record["resources"] = {**guard.report(), "cooldown_seconds": cooldown}
-    if stopped:
-        record["stopped"] = stopped
-    RUNS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with RUNS_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if guard is not None or waits:
+        record["resources"] = _resources(guard, cooldown, waits)
+    if guarded.summary:
+        record["fixture_guard"] = guarded.summary
+    return record
+
+
+def _resources(guard: Guard | None, cooldown: float, waits: dict[str, int] | None) -> dict[str, Any]:
+    """A record's `resources`: the guard's report (when it ran), the cooldown and the waits."""
+    return {**(guard.report() if guard is not None else {}), "cooldown_seconds": cooldown,
+            **(waits or {})}
+
+
+def _print_suite_result(record: dict[str, Any], table: Table, scored: list[dict[str, Any]],
+                        outcomes: list[dict[str, Any]], cases: list[dict[str, Any]], repeat: int,
+                        only: list[str] | None, screen: bool, stopped: str) -> None:
+    total_passed, total_attempts = record["passed"], record["total"]
+    summary, consistency = record["summary"], record.get("consistency")
     console.print(table)
     fully_passing = sum(case["passed"] == repeat for case in scored)
     console.print(
@@ -1569,6 +2497,8 @@ def run_suite(
         console.print(hidden)
     if record["topics"]:
         console.print(_topics_line(record["topics"]))
+    if record.get("tiers"):
+        console.print(_tiers_line(record["tiers"]))
     if consistency:
         console.print(f"Robustness: {consistency['consistent']}/{consistency['tasks']} tasks got the same "
                       f"result in every wording; {consistency['robust']} passed in every wording, "
@@ -1581,27 +2511,71 @@ def run_suite(
     if screen:
         console.print(f"[yellow]{SCREEN_NOTE}; confirm with a full run.[/yellow]")
     errors = len(outcomes) - len(scored)
+    red = sum(fixture_guard.is_red(case.get("error")) for case in outcomes)
     if errors:
         console.print(
-            f"[red]{errors} case(s) could not build their fixture and were not scored.[/red]")
+            f"[red]{errors} case(s) could not build their fixture and were not scored"
+            + (f" ({red} fixture red: the unmodified fixture fails its own checks, so no attempt "
+               "could pass; not model failures)" if red else "") + ".[/red]")
     console.print(f"Recorded results in {_display_path(RUNS_FILE)}")
-    return record
 
 
-def install_stop_signal() -> None:
-    """Turn SIGTERM (a plain `kill`) into KeyboardInterrupt, so a killed A/B still saves its
-    finished cases. Main thread only; a no-op where signals are unavailable."""
+# The stop signal a run received ({'name': 'SIGTERM'}; empty while none): run_suite drops the
+# result of an attempt that swallowed the KeyboardInterrupt, and names the signal in `stopped`.
+_STOP_SIGNAL: dict[str, str] = {}
+
+# VEGA_EVAL_PARTIAL=<path>: run_suite rewrites this sidecar after every finished case with the
+# record so far (`partial`, `stopped` = SIDECAR_STOPPED) and deletes it once the record is in
+# runs.jsonl. Only a run killed outright (SIGKILL, a crash) leaves it behind; the night runner
+# (vega_lab.night) then takes it as the step's record, so the finished cases are kept. Never read
+# from runs.jsonl's readers: at most one of the sidecar and the record exists for a run.
+PARTIAL_ENV = "VEGA_EVAL_PARTIAL"
+SIDECAR_STOPPED = "killed before the end (sidecar record: the finished cases only)"
+
+
+def partial_sidecar() -> Path | None:
+    value = (os.environ.get(PARTIAL_ENV) or "").strip()
+    return Path(value) if value else None
+
+
+def _write_sidecar(path: Path, record: dict[str, Any]) -> None:
+    """Atomic: a kill mid-write leaves the previous case's sidecar, never half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def install_stop_signal() -> Callable[[], None]:
+    """Turn SIGTERM (a plain `kill`) and SIGINT into KeyboardInterrupt, so a stopped run still
+    saves its finished cases (run_suite, run_ab). A repeated SIGTERM is ignored while the record is
+    written (the research runner signals the process group and the process). Main thread only; a
+    no-op where signals are unavailable. Returns a function that puts the previous handlers back."""
     import signal
     import threading
 
+    saved: dict[int, Any] = {}
+
+    def restore() -> None:
+        for signum, handler in saved.items():
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(signum, handler)
+
     if threading.current_thread() is not threading.main_thread():
-        return
+        return restore
 
     def interrupt(signum: int, frame: Any) -> None:
+        if _STOP_SIGNAL and signum != signal.SIGINT:
+            return  # already stopping
+        with contextlib.suppress(ValueError):
+            _STOP_SIGNAL["name"] = signal.Signals(signum).name
         raise KeyboardInterrupt
 
-    with contextlib.suppress(ValueError, AttributeError):
-        signal.signal(signal.SIGTERM, interrupt)
+    for name in ("SIGTERM", "SIGINT"):
+        with contextlib.suppress(ValueError, AttributeError, OSError):
+            signum = getattr(signal, name)
+            saved[signum] = signal.signal(signum, interrupt)
+    return restore
 
 
 def _seconds_text(seconds: float | None) -> str:
@@ -1646,12 +2620,30 @@ def hidden_totals(cases: list[dict[str, Any]]) -> tuple[int, int, int]:
     return passed, total, attempts
 
 
+def hidden_kind_totals(cases: list[dict[str, Any]]) -> dict[str, list[int]]:
+    """{kind: [passed, total, attempts]} over attempts that recorded hidden tests by kind."""
+    totals: dict[str, list[int]] = {}
+    for case in cases:
+        for attempt in case.get("attempts", []):
+            for kind, (passed, total) in (attempt.get("hidden_kinds") or {}).items():
+                row = totals.setdefault(kind, [0, 0, 0])
+                row[0] += passed
+                row[1] += total
+                row[2] += 1
+    return totals
+
+
 def _hidden_line(cases: list[dict[str, Any]]) -> str | None:
-    """'Hidden tests: 23/64 passed (36%) over 8 attempts' — partial credit below the pass line."""
+    """'Hidden tests: 23/64 passed (36%) over 8 attempts' — partial credit below the pass line;
+    plus each kind's passed/total (functional, security) when the hidden tests are split by kind."""
     passed, total, attempts = hidden_totals(cases)
     if not total:
         return None
-    return f"Hidden tests: {passed}/{total} passed ({passed / total:.0%}) over {attempts} attempts"
+    by_kind = hidden_kind_totals(cases)
+    kinds = "".join(f" · {HIDDEN_KINDS.get(kind, kind)} {row[0]}/{row[1]} ({row[0] / row[1]:.0%})"
+                    for kind, row in sorted(by_kind.items()) if row[1])
+    return (f"Hidden tests: {passed}/{total} passed ({passed / total:.0%}) over {attempts} "
+            f"attempts{kinds}")
 
 
 def _hidden_fraction(attempt: dict[str, Any]) -> float | None:
@@ -1663,6 +2655,38 @@ def _topics_line(by_topic: dict[str, list[int]]) -> str:
     """'By topic: Planning 2/4 (50%), ...' (engineering suite)."""
     return "By topic: " + ", ".join(f"{name} {passed}/{total} ({passed / total:.0%})"
                                     for name, (passed, total) in by_topic.items() if total)
+
+
+GROUP_FIELD = "tier"  # a case field summaries break down by when a suite sets it (difficulty)
+
+
+def group_breakdown(cases: list[dict[str, Any]], outcomes: list[dict[str, Any]],
+                    field: str = GROUP_FIELD) -> dict[str, list[int]]:
+    """Per value of the cases' `field` over scored outcomes: [attempts passed, attempts, hidden
+    tests passed, hidden tests run]. {} when no case sets the field."""
+    values = {case["id"]: str(case[field]) for case in cases if case.get(field) is not None}
+    result: dict[str, list[int]] = {}
+    for outcome in outcomes:
+        if outcome.get("error") or outcome["case"] not in values:
+            continue
+        row = result.setdefault(values[outcome["case"]], [0, 0, 0, 0])
+        row[0] += int(outcome.get("passed", 0))
+        row[1] += len(outcome.get("attempts", []))
+        hidden = hidden_totals([outcome])
+        row[2] += hidden[0]
+        row[3] += hidden[1]
+    return dict(sorted(result.items()))
+
+
+def _tiers_line(by_tier: dict[str, list[int]], field: str = GROUP_FIELD) -> str:
+    """'By tier: 1 2/15 (13%; hidden 30/45), 2 0/15 (0%; hidden 12/50), ...'"""
+    parts = []
+    for value, (passed, total, hidden_passed, hidden_total) in by_tier.items():
+        if not total:
+            continue
+        hidden = f"; hidden {hidden_passed}/{hidden_total}" if hidden_total else ""
+        parts.append(f"{value} {passed}/{total} ({passed / total:.0%}{hidden})")
+    return f"By {field}: " + ", ".join(parts)
 
 
 def _summary_line(summary: dict[str, Any]) -> str:
@@ -1677,17 +2701,22 @@ def _summary_line(summary: dict[str, Any]) -> str:
         + (" · failure types: " + ", ".join(f"{name} {count}" for name, count in
                                            summary.get("failure_classes", {}).items())
            if summary.get("failure_classes") else "")
+        + (" · turns passed {}/{}".format(*summary["turns"]) if summary.get("turns") else "")
     )
 
 
 def _resources_line(res: dict[str, Any]) -> str:
-    free = f"{res['min_free_pct']}%" if res.get("min_free_pct") is not None else "n/a"
-    return (
-        f"Machine: lowest free memory {free} · peak swap growth {res['peak_swap_growth_mb']} MB · "
-        f"peak model memory {res['peak_model_rss_mb'] / 1024:.1f} GB · lowest free disk "
-        f"{res['min_disk_free_gb']} GB · paused {res['pauses']}× ({res['paused_seconds']} s) · "
-        f"cooldown {res['cooldown_seconds']:g} s between attempts"
-    )
+    parts = []
+    if "min_disk_free_gb" in res:  # the resource guard ran
+        free = f"{res['min_free_pct']}%" if res.get("min_free_pct") is not None else "n/a"
+        parts = [f"lowest free memory {free}", f"peak swap growth {res['peak_swap_growth_mb']} MB",
+                 f"peak model memory {res['peak_model_rss_mb'] / 1024:.1f} GB",
+                 f"lowest free disk {res['min_disk_free_gb']} GB",
+                 f"paused {res['pauses']}× ({res['paused_seconds']} s)"]
+    parts.append(f"cooldown {res['cooldown_seconds']:g} s between attempts")
+    parts += [f"{key.removesuffix('_waits')} waits {res[key]}× ({res.get(key[:-1] + '_seconds', 0)} s "
+              "idle between attempts, not in attempt seconds)" for key in sorted(res) if key.endswith("_waits")]
+    return "Machine: " + " · ".join(parts)
 
 
 def run_evaluations(
@@ -1757,7 +2786,7 @@ def run_ab(
     # Opt-in features that are on (e.g. constrained as a profile default) can be switched off for B.
     b_off_opt_in = [name for name in b_off if name in features.OPT_IN]
     b_off = [name for name in b_off if name not in features.OPT_IN]
-    unknown = set(b_off) - features.FEATURES.keys()
+    unknown = set(b_off) - features.FEATURES.keys() - set(extensions.switch_names())
     if unknown:
         raise typer.BadParameter(f"Unknown feature(s): {', '.join(sorted(unknown))}.")
     b_on = [name for name in b_on if name not in features.FEATURES]  # defaults now: already on
@@ -1830,6 +2859,18 @@ def run_ab(
     for column in ("Case", "A", "B", "A med s", "B med s"):
         table.add_column(column, justify="left" if column == "Case" else "right")
 
+    guarded = (_guard_fixtures(cases, archive, suite) if not archive_error
+               else fixture_guard.GuardResult())
+    case_errors: list[dict[str, str]] = []  # cases neither arm could run (left out of the pairs)
+
+    def unrunnable(case: dict[str, Any]) -> bool:
+        error = (f"fixture error: {archive_error}" if case.get("vega_snapshot") and archive_error
+                 else guarded.errors.get(case["id"], ""))
+        if error:
+            console.print(f"[red]{case['id']}: {escape(error)}[/red]")
+            case_errors.append({"case": case["id"], "error": error})
+        return bool(error)
+
     def run_one(case: dict[str, Any], index: int, name: str) -> dict[str, Any] | None:
         """One attempt of one variant; None when the run must stop (`stopped` says why)."""
         nonlocal stopped
@@ -1842,7 +2883,7 @@ def run_ab(
         os.environ[external.AGENT_ENV] = agents_by_variant[name]
         with attempt_seed(index) as seed:  # pair `index`: the same seed for A and B
             result = run_attempt(
-                case, suite=suite, agent_factory=agent_factory, archive=archive,
+                with_baseline(case, guarded), suite=suite, agent_factory=agent_factory, archive=archive,
                 transcript=transcripts / f"{case['id']}-{index + 1}-{name}.json")
         if seed is not None:
             result["seed"] = seed
@@ -1876,10 +2917,11 @@ def run_ab(
                             f"pairs went one way, p could only reach {best:.3f})")
             console.print(f"[dim]Interim look at {done} pairs: only A {a_so_far}, only B "
                           f"{b_so_far}, p = {interim_p:.3f}{note}[/dim]")
+        floor = guarded.floors.get(case["id"])
         for name in ("A", "B"):
             per_variant[name].append({
                 "case": case["id"], "passed": sum(r["passed"] for r in results[name]),
-                "attempts": results[name],
+                "attempts": results[name], **({"hidden_floor": floor} if floor else {}),
             })
         table.add_row(
             case["id"], f"{sum(a for a, _ in pairs)}/{len(pairs)}",
@@ -1896,8 +2938,7 @@ def run_ab(
             for case in cases:
                 if halted():
                     break
-                if case.get("vega_snapshot") and archive_error:
-                    console.print(f"[red]{case['id']}: fixture error: {escape(archive_error)}[/red]")
+                if unrunnable(case):
                     continue
                 results: dict[str, list[dict[str, Any]]] = {"A": [], "B": []}
                 pairs: list[tuple[bool, bool]] = []
@@ -1929,8 +2970,7 @@ def run_ab(
             for case in cases:
                 if stopped:
                     break
-                if case.get("vega_snapshot") and archive_error:
-                    console.print(f"[red]{case['id']}: fixture error: {escape(archive_error)}[/red]")
+                if unrunnable(case):
                     continue
                 a_results: list[dict[str, Any]] = []
                 error = ""
@@ -2022,6 +3062,7 @@ def run_ab(
             "total": len(attempts), "summary": summarise(attempts), "cases": per_variant[name],
             "areas": categories.breakdown(per_variant[name]),
             "topics": categories.topic_breakdown(per_variant[name]),
+            **({"tiers": tiers} if (tiers := group_breakdown(cases, per_variant[name])) else {}),
         }
     record: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2029,6 +3070,7 @@ def run_ab(
         "subset": bool(only) or screen or bool(os.environ.get("VEGA_EVAL_CATEGORY")),
         "shard": "/".join(map(str, shard())) if shard() else None,
         "order": "grouped" if grouped else "alternating",
+        **({REVEAL_REPRO_TAG: True} if reveal_repro() else {}),
         "sampling": _sampling_record(),
         "server": _server_fingerprint(model), "variants": variant_rows,
         "transcripts": _display_path(transcripts),
@@ -2048,8 +3090,13 @@ def run_ab(
             "diff_ci": [round(partial_low, 4), round(partial_high, 4)],
         },
     }
-    if guard is not None:
-        record["resources"] = {**guard.report(), "cooldown_seconds": cooldown}
+    waits = pacer.wait_report()
+    if guard is not None or waits:
+        record["resources"] = _resources(guard, cooldown, waits)
+    if guarded.summary:
+        record["fixture_guard"] = guarded.summary
+    if case_errors:
+        record["errors"] = case_errors
     if screen:
         record["screen"] = True
     if unpaired_a:
@@ -2080,6 +3127,8 @@ def run_ab(
             console.print("   " + hidden)
         if row["topics"]:
             console.print("   " + _topics_line(row["topics"]))
+        if row.get("tiers"):
+            console.print("   " + _tiers_line(row["tiers"]))
         console.print("   " + _times_line(row["cases"]))
     paired = record["paired"]
     console.print(

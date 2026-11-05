@@ -1,4 +1,5 @@
-"""Scripted two-turn session rendered at 120x36 and 80x24 in both themes (SVG screenshots).
+"""Scripted two-turn session in the default chat layout at 120x36 and 80x24 (SVG screenshots);
+the working, edit review and command dialogs in the classic layout.
 
 Writes to tmp_path; with VEGA_WRITE_SCREENS=1 it refreshes the committed docs/screens/ instead.
 """
@@ -13,10 +14,14 @@ import pytest
 from switches import switch_off
 from tui_helpers import answer, calls, drive, make_app, scripted_agent, send, wait_until
 
-from vega import sandbox
-from vega.tui import ChoiceScreen, StepsToggle
+from vega import live_stats, sandbox, view
+from vega.transcripts import SessionLog
+from vega.tui import ChoiceScreen, StepsToggle, VegaApp
 
 SCREENS = Path(__file__).resolve().parents[1] / "docs" / "screens"
+# A fixed reading for the live resource line (the real one would print this machine's numbers)
+READING = live_stats.Reading(cpu_pct=12.0, mem_used_gb=10.4, mem_total_gb=16.0, pressure="normal",
+                             swap_used_gb=0.0)
 CALC = "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n"
 
 
@@ -49,8 +54,11 @@ def session_replies() -> list:
             {"text": "add a test for it", "status": "done"},
             {"text": "run the tests", "status": "done"},
         ]}), prompt_tokens=8000),
-        answer("Added `sub(a, b)` to `src/calc.py` and a test in `tests/test_sub.py`. The new "
-               "test fails to import `calc` because `src/` is not on the path; add a "
+        answer("Added `sub(a, b)` and a test for it, but the test does not pass yet.\n\n"
+               "| file | change | check |\n|---|---|---|\n"
+               "| `src/calc.py` | added `sub(a, b)` | not run |\n"
+               "| `tests/test_sub.py` | new test | fails: no module `calc` |\n\n"
+               "The test cannot import `calc` because `src/` is not on the path; add a "
                "`conftest.py` or install the package before running it.", prompt_tokens=8500),
     ]
 
@@ -85,33 +93,35 @@ def test_screenshots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv("VEGA_MODEL", "granite-8b")
     out = SCREENS if os.environ.get("VEGA_WRITE_SCREENS") == "1" else tmp_path / "screens"
     out.mkdir(parents=True, exist_ok=True)
+    # The app as a new user starts it (chat only, the terminal's colours): no layout or theme
+    # passed in (conftest starts the older tests in the workbench).
+    monkeypatch.setattr(view, "NEW_USER_PRESET", "chat")
+    for name in ("VEGA_LAYOUT", "VEGA_THEME", "COLORFGBG", "NO_COLOR"):
+        monkeypatch.delenv(name, raising=False)
     agent, _ = scripted_agent(project, session_replies())
-    app = make_app(project, agent, tmp_path)
+    app = VegaApp(project, agent=agent, session_log=SessionLog(tmp_path / "sessions", project),
+                  warm_up=False, memory_probe=lambda: 5.1 * 1024, total_memory_gb=16.0,
+                  appearance="dark", resource_probe=lambda: READING)
     width, height = size
 
     async def script(pilot) -> None:
         await send(pilot, "fix the bug in add() in src/calc.py")
-        await send(pilot, "Add a subtract function:\n- add sub(a, b) to src/calc.py\n"
-                          "- add a test for it\n- run the tests")
+        await send(pilot, "add sub(a, b) to src/calc.py with a test, then run the tests")
         toggles = list(app.query(StepsToggle))
         assert toggles[-1].expanded  # the failed check keeps the second turn's steps open
         app.query_one("#prompt").load_text("")
         await pilot.pause()
         await wait_until(pilot, lambda: app.memory_mb is not None)
-        for theme in ("dark", "light"):
-            if (theme == "light") != (app.theme == "vega-light"):
-                await pilot.press("ctrl+t")
-            await pilot.pause()
-            app.save_screenshot(f"session-{width}x{height}-{theme}.svg", path=str(out))
-        if width < 100:  # the side panel as an overlay
-            await pilot.press("ctrl+p")
-            await pilot.pause()
-            app.save_screenshot(f"panel-overlay-{width}x{height}-light.svg", path=str(out))
+        assert app.layout_name == "chat" and app.theme == "vega-terminal-dark"
+        assert not app.query_one("#side").display  # chat only: panels are opt-in
+        assert "mem 10.4/16 GB" in str(app.query_one("#readouts").render())
+        # Dark only: the terminal theme's colours are the terminal's own, and the SVG export
+        # draws them on Rich's dark default, so a "light" shot would not be one.
+        app.save_screenshot(f"session-{width}x{height}-dark.svg", path=str(out))
 
     drive(app, script, size=size)
-    names = sorted(path.name for path in out.glob(f"*{width}x{height}*.svg"))
-    assert f"session-{width}x{height}-dark.svg" in names
-    assert f"session-{width}x{height}-light.svg" in names
+    svg = (out / f"session-{width}x{height}-dark.svg").read_text(encoding="utf-8")
+    assert "fails:&#160;no&#160;module" in svg  # the answer's table
 
 
 def test_dialog_screenshots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

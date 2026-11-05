@@ -65,6 +65,30 @@ def test_attempt_saves_transcript_and_class(tmp_path: Path, monkeypatch) -> None
     assert saved["final_answer"].startswith("x is 1")
 
 
+def test_the_transcript_keeps_the_whole_final_reply(tmp_path: Path, monkeypatch) -> None:
+    """Audits read a reply's ending (its verdict, its ANSWER: line): never cut at 2,000 chars."""
+    switch_off(monkeypatch, "clarify_first")
+    switch_off(monkeypatch, "finish_gate_no_edit")
+    from test_agent_loop import text
+
+    reply = "x is 1. " + "Reasoning line. " * 400 + "ANSWER: 1"  # ~6,400 characters
+    replies = [text(reply)]
+
+    def factory(project: Path, max_steps: int):
+        from vega.agent import CodingAgent
+
+        agent = CodingAgent(project, allow_commands=False, max_steps=max_steps)
+        agent.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kw: SimpleNamespace(choices=[SimpleNamespace(message=replies.pop(0))], usage=None))))
+        return agent
+
+    path = tmp_path / "t" / "r-1.json"
+    evals.run_attempt(READ_CASE, agent_factory=factory, transcript=path)
+    saved = json.loads(path.read_text())
+    assert len(saved["final_answer"]) > 6000
+    assert saved["final_answer"].endswith("ANSWER: 1")
+
+
 # Modelled on real eval records (2026-10-20/21 goals, engineering and selfbuild runs).
 GOAL_CASE = EDIT_CASE | {"expected_files": ["app/http.py", "app/settings.py", "tests/test_app.py"]}
 SELFBUILD_CASE = EDIT_CASE | {"expected_files": ["src/vega/agent.py", "tests/test_agent_loop.py"]}

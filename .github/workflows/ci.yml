@@ -130,6 +130,17 @@ jobs:
           python .github/scripts/check_keywords.py --readme README.md
           --pyproject pyproject.toml --keywords docs/release/keywords.md
 
+  pinned:
+    name: Actions pinned to commit SHAs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Every `uses:` must be owner/repo@<40-hex SHA> # vX.Y.Z, so a moved tag cannot change what runs.
+      - run: python3 .github/scripts/check_pinned_actions.py .github/workflows
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest

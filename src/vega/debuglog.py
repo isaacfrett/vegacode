@@ -25,8 +25,42 @@ from typing import Any
 from . import server
 
 TEXT_LIMIT = 6000
+# A model reply is logged whole (max_tokens 2048 is ~10K characters): replays rebuilt files from
+# 6,000-character copies and read the clip marker as code (2026-10-27: 105 writes over 6 KB in 13
+# days, 6 false regression flags in the bigbuild replay)
+REPLY_LIMIT = 40000
 _lock = threading.Lock()
 _current: DebugLog | None = None
+# Observers of every row written (add_listener): read-only watchers such as the lab's progress
+# monitor in shadow mode. Called after the row is on disk, never inside one another's rows.
+_listeners: list[Any] = []
+_notifying = threading.local()
+
+
+def add_listener(listener: Any) -> None:
+    """Call `listener(log, entry)` after each row any log writes (debug mode only: no log, no
+    rows). A listener may write rows itself; those are not passed to listeners again."""
+    if listener not in _listeners:
+        _listeners.append(listener)
+
+
+def remove_listener(listener: Any) -> None:
+    if listener in _listeners:
+        _listeners.remove(listener)
+
+
+def _notify(log: DebugLog, entry: dict[str, Any]) -> None:
+    if getattr(_notifying, "active", False):
+        return
+    _notifying.active = True
+    try:
+        for listener in list(_listeners):  # noqa: PERF101 - a copy: a listener may leave
+            try:
+                listener(log, entry)
+            except Exception:  # noqa: BLE001, S110 - a watcher never fails the logged work
+                pass
+    finally:
+        _notifying.active = False
 
 
 def enabled() -> bool:
@@ -41,11 +75,11 @@ def latest_pointer() -> Path:
     return folder() / "latest"
 
 
-def _clip(text: Any) -> str:
+def _clip(text: Any, limit: int = TEXT_LIMIT) -> str:
     text = "" if text is None else str(text)
-    if len(text) <= TEXT_LIMIT:
+    if len(text) <= limit:
         return text
-    return text[:TEXT_LIMIT] + f"\n… ({len(text) - TEXT_LIMIT} more characters)"
+    return text[:limit] + f"\n… ({len(text) - limit} more characters)"
 
 
 class DebugLog:
@@ -67,6 +101,8 @@ class DebugLog:
         with _lock:
             self._file.write(json.dumps(entry, default=str) + "\n")
             self._file.flush()
+        if _listeners:
+            _notify(self, entry)
 
     def new_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """The messages this log has not shown yet, compacted (the history is resent every step)."""
@@ -99,9 +135,9 @@ def _as_dict(message: Any) -> dict[str, Any]:
 def _call_dict(call: Any) -> dict[str, str]:
     if isinstance(call, dict):
         function = call.get("function", {})
-        return {"name": function.get("name", ""), "args": _clip(function.get("arguments", ""))}
+        return {"name": function.get("name", ""), "args": _clip(function.get("arguments", ""), REPLY_LIMIT)}
     function = getattr(call, "function", None)
-    return {"name": getattr(function, "name", ""), "args": _clip(getattr(function, "arguments", ""))}
+    return {"name": getattr(function, "name", ""), "args": _clip(getattr(function, "arguments", ""), REPLY_LIMIT)}
 
 
 def start(label: str) -> DebugLog | None:
@@ -154,6 +190,13 @@ class DebugClient:
         log = current()
         if log is None:
             return self._client.chat.completions.create(**kwargs)
+        try:  # what the window holds, by part (counts only): vega.window_log
+            from . import window_log
+
+            log.write("stage", stage="window", role=self._role, **window_log.compose(
+                kwargs.get("messages", []), kwargs.get("tools"), window_log.take_hint()))
+        except Exception:  # noqa: BLE001, S110 - instrumentation never fails a request
+            pass
         request: dict[str, Any] = {"role": self._role, "new": log.new_messages(kwargs.get("messages", []))}
         if kwargs.get("tools"):
             request["tools"] = [tool.get("function", {}).get("name") for tool in kwargs["tools"]]
@@ -170,23 +213,34 @@ class DebugClient:
                       seconds=round(time.monotonic() - started, 2))
             raise
         if kwargs.get("stream"):
-            return self._stream(log, response, started)
+            return self._stream(log, response, started, kwargs)
         choice = response.choices[0]
         usage = getattr(response, "usage", None)
         log.write("reply", role=self._role, seconds=round(time.monotonic() - started, 2),
                   finish=getattr(choice, "finish_reason", None),
-                  text=_clip(choice.message.content),
+                  text=_clip(choice.message.content, REPLY_LIMIT),
                   calls=[_call_dict(call) for call in choice.message.tool_calls or []],
                   prompt_tokens=getattr(usage, "prompt_tokens", None),
                   reply_tokens=getattr(usage, "completion_tokens", None))
+        if _lost(choice.message.content, choice.message.tool_calls,
+                 getattr(usage, "completion_tokens", None)):
+            log.write("lost_reply", **_lost_entry(
+                self._role, kwargs, getattr(choice, "finish_reason", None),
+                getattr(usage, "completion_tokens", None), raw=_raw(choice.message)))
         return response
 
-    def _stream(self, log: DebugLog, chunks: Any, started: float) -> Iterator[Any]:
+    def _stream(self, log: DebugLog, chunks: Any, started: float,
+                kwargs: dict[str, Any] | None = None) -> Iterator[Any]:
         text: list[str] = []
         calls: dict[int, dict[str, str]] = {}
         finish = prompt_tokens = reply_tokens = None
         first = None
+        count = 0
+        extras: dict[str, str] = {}  # non-standard delta fields (e.g. `reasoning`), joined
+        last: Any = None
         for chunk in chunks:
+            count += 1
+            last = chunk
             usage = getattr(chunk, "usage", None)
             if usage is not None:
                 prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -200,6 +254,9 @@ class DebugClient:
                     first = round(time.monotonic() - started, 2)
                 if getattr(delta, "content", None):
                     text.append(delta.content)
+                for key, value in (getattr(delta, "model_extra", None) or {}).items():
+                    if value:
+                        extras[key] = extras.get(key, "") + str(value)
                 for fragment in getattr(delta, "tool_calls", None) or []:
                     entry = calls.setdefault(getattr(fragment, "index", 0) or 0, {"name": "", "args": ""})
                     function = getattr(fragment, "function", None)
@@ -207,9 +264,47 @@ class DebugClient:
                     entry["args"] += getattr(function, "arguments", None) or ""
             yield chunk
         log.write("reply", role=self._role, seconds=round(time.monotonic() - started, 2),
-                  first_token_seconds=first, finish=finish, text=_clip("".join(text)),
-                  calls=[{"name": c["name"], "args": _clip(c["args"])} for _, c in sorted(calls.items())],
+                  first_token_seconds=first, finish=finish, text=_clip("".join(text), REPLY_LIMIT),
+                  calls=[{"name": c["name"], "args": _clip(c["args"], REPLY_LIMIT)} for _, c in sorted(calls.items())],
                   prompt_tokens=prompt_tokens, reply_tokens=reply_tokens)
+        if _lost("".join(text), calls, reply_tokens):
+            log.write("lost_reply", **_lost_entry(
+                self._role, kwargs or {}, finish, reply_tokens, chunks=count,
+                extras={key: _clip(value) for key, value in extras.items()},
+                last_chunk=_raw(last)))
+
+
+# A reply with completion tokens but no text and no tool call: the server dropped what the model
+# wrote (Ollama's tool parser returns nothing when the text after Granite's <tool_call> tag holds no
+# call it can parse). The raw reply is logged so a case can be told apart from an empty generation;
+# the dropped text itself never reaches the client (`python -m vega_lab.lost_output replay` re-asks
+# with the parser off to see it).
+def _lost(text: Any, calls: Any, reply_tokens: Any) -> bool:
+    return (not str(text or "").strip() and not calls
+            and isinstance(reply_tokens, int) and reply_tokens > 0)
+
+
+def _raw(value: Any) -> Any:
+    """A response object (message, chunk) as clipped JSON-able data."""
+    if value is None:
+        return None
+    try:
+        data = value.model_dump() if hasattr(value, "model_dump") else vars(value)
+    except Exception:  # noqa: BLE001 - diagnostics never fail a request
+        return _clip(repr(value))
+    return _clip(json.dumps(data, default=str))
+
+
+def _lost_entry(role: str, kwargs: dict[str, Any], finish: Any, reply_tokens: Any,
+                **raw: Any) -> dict[str, Any]:
+    messages = kwargs.get("messages") or []
+    return {"role": role, "finish": finish, "reply_tokens": reply_tokens,
+            "max_tokens": kwargs.get("max_tokens"), "tools": len(kwargs.get("tools") or []),
+            "format": (kwargs.get("response_format") or {}).get("type"),
+            "messages": len(messages), "prompt_chars": sum(
+                len(str((m if isinstance(m, dict) else _as_dict(m)).get("content") or ""))
+                for m in messages),
+            "stream": bool(kwargs.get("stream")), **raw}
 
 
 # -- watching ---------------------------------------------------------------------------------------
@@ -262,6 +357,10 @@ def format_entry(entry: dict[str, Any], *, full: bool = False) -> list[tuple[str
         for call in entry.get("calls") or []:
             lines.append(("bold green", f"{pad}  call {call['name']} {_short(call['args'], limit)}"))
         return lines
+    if kind == "lost_reply":
+        line = (f"{t}✗ lost reply: {entry.get('reply_tokens')} tokens, no text and no call "
+                f"(finish {entry.get('finish')}; the server dropped a tool call it could not parse)")
+        return [("bold yellow", line)]
     if kind == "event":
         event, data = entry.get("event"), entry.get("data") or {}
         if event == "request":

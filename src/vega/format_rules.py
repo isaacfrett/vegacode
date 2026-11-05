@@ -324,4 +324,6 @@ def problems(task: str, files: dict[str, str], found: Rules | None = None) -> li
             for n, line in long[:_MAX_SHOWN]:
                 out.append(f"{path} line {n} is {len(line)} characters; the task says at most "
                            f"{found.line_max}: rewrap it (`{line[:60]}...`)")
+    if out:
+        features.mark_acted("format_rules", where="problems")
     return out

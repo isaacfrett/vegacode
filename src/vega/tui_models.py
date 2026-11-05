@@ -111,7 +111,7 @@ def name_line(row: ModelRow, width: int, colours: dict[str, str], g: SimpleNames
     if row.default and not row.active:
         tags.append("default")
     if row.over_limit:
-        tags.append("over 10B")
+        tags.append("over budget")
     suffix = ("  " + ", ".join(tags)) if tags else ""
     room = width - 2 - cell_len(size) - 1
     name_style = f"bold {colours['fg']}" if row.active else (
@@ -213,9 +213,9 @@ def preview(state: Inventory, name: str, width: int, colours: dict[str, str]
     if row.endpoint:
         line("Server", row.endpoint)
     if row.params_b:
-        line("Params", f"{row.params_b:g}B" + ("  (over Vega's 10B limit)" if row.over_limit
-                                                  else ""), colours["warning"] if row.over_limit
-             else None)
+        line("Params", f"{row.params_b:g}B")
+    if not row.endpoint:
+        line("Budget", row.budget.text, colours["warning"] if row.over_limit else None)
     if row.size_gb:
         disk = "on disk" if row.downloaded else "to download"
         line("Size", f"{size_text(row)} {disk}")

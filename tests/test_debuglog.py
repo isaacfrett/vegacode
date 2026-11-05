@@ -85,6 +85,13 @@ def test_long_text_is_clipped(debug_on: None) -> None:
     assert entry["text"].endswith("(50 more characters)")
 
 
+def test_a_model_write_longer_than_the_text_limit_is_logged_whole() -> None:
+    content = "x = 1\n" * 2000  # 12,000 characters: a whole-file write the replays rebuild
+    call = {"function": {"name": "write_file", "arguments": content}}
+    assert debuglog._call_dict(call)["args"] == content
+    assert debuglog._clip(content).endswith("more characters)")  # prompts and results still cut
+
+
 def test_watch_prints_a_readable_log(debug_on: None) -> None:
     log = debuglog.start("watch")
     debuglog.record("turn", task="Add a CLI flag", model="vega", features_on=[], features_off=[])

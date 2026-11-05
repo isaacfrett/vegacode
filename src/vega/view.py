@@ -1,6 +1,12 @@
-"""What the workbench shows and where: pane placement, column widths, step detail and status bar
-items. Saved per user in ~/.vega/view.json (plain JSON, safe to edit or delete); presets cover
-the common setups. The TUI applies changes live (/view, /pane, /width, F2)."""
+"""How the app looks and what it shows: the layout (chat by default), the colour theme, which
+panels are open and where, column widths, step detail and status line items. Saved per user in
+~/.vega/view.json (plain JSON, safe to edit or delete); presets cover the common setups. The TUI
+applies changes live (/ menu, /panel, /theme, /view, /pane, /width, F2).
+
+Since 2026-10-24 (version 2) Vega opens as one conversation column in the terminal's own colours;
+panels are opt-in. A view.json written before that (no "version") is copied to view-v1.json and
+replaced by the chat view, keeping teach mode and step detail (`/view workbench` brings the
+workbench back)."""
 
 from __future__ import annotations
 
@@ -53,7 +59,14 @@ LEFT_WIDTHS = (24, 64)  # columns
 RIGHT_WIDTHS = (30, 100)  # columns; 0 means "share the space equally with the conversation"
 MIN_CONVERSATION = 44  # below this the workbench falls back to one column
 MODES = ("product", "code")  # F3 swaps them: the product view and the code view
-NEW_USER_PRESET = "product"  # with no saved view.json; a saved one is always kept as it is
+NEW_USER_PRESET = "chat"  # with no saved view.json (or one from before version 2)
+VERSION = 2  # 2: chat-first (2026-10-24); files without a version are migrated by load()
+DEFAULT_LAYOUT = "chat"  # the layout when neither VEGA_LAYOUT nor view.json names one
+THEMES = ("terminal", "classic", "quiet", "observatory", "workbench", "layout")
+APPEARANCES = ("auto", "dark", "light")
+CHAT_STYLES = ("rail", "gutter", "bubbles")
+# where /panel opens a pane: lists on the left, readers on the right (as in the workbench)
+RIGHT_PANES = ("preview", "machine", "session", "context", "models")
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,14 @@ class View:
     preset: str = "workbench"  # the preset it started from ("custom" once changed)
     teach: bool = False  # teach mode (teaching.py); kept across presets, set with /teach
     mode: str = "code"  # product or code view: which way F3 goes (kept when panes move)
+    # settings, not layout: kept across presets (see SETTINGS)
+    layout: str = ""  # the layout the user chose ("" = DEFAULT_LAYOUT)
+    theme: str = "terminal"  # colour theme: the terminal's own palette, a named one, or "layout"
+    appearance: str = "auto"  # light/dark for themes that need it ("auto" asks the terminal)
+    chat_style: str = "rail"  # how the chat layout marks who is speaking
+    hinted: bool = False  # the first-run key hint was shown
+    resources: bool = True  # chat status line: live CPU, memory, swap and model (/resources)
+    version: int = VERSION
 
     def column(self, pane: str) -> str | None:
         return "left" if pane in self.left else "right" if pane in self.right else None
@@ -91,6 +112,9 @@ class View:
                 f"{self.steps}; status bar {', '.join(STATUS_ITEMS[s] for s in self.status)}")
 
 
+SETTINGS = ("teach", "layout", "theme", "appearance", "chat_style", "hinted", "resources",
+            "version")
+
 PRESETS: dict[str, tuple[View, str]] = {
     "workbench": (View(), "changes, git, steps and loops | conversation | preview"),
     "focus": (View(left=(), right=(), preset="focus", steps="collapsed"),
@@ -108,7 +132,11 @@ PRESETS: dict[str, tuple[View, str]] = {
     "product": (View(left=("product", "release"), right=(), left_width=42, preset="product",
                      mode="product"),
                 "product and release checklist | conversation; F3 switches to the code view"),
+    # the default since 2026-10-24: one conversation column, panels opened one by one
+    "chat": (View(left=(), right=(), preset="chat", status=("gauge", "keys")),
+             "just the conversation; open panels one at a time from the / menu"),
 }
+LAYOUT_PRESETS = {"chat": "chat", "workbench": "workbench"}  # presets that also pick a layout
 
 
 def _path():
@@ -149,19 +177,53 @@ def validate(raw: dict[str, Any]) -> View:
         steps=steps, status=status_items, preset=str(raw.get("preset", base.preset)),
         teach=raw.get("teach") is True,
         mode=raw.get("mode") if raw.get("mode") in MODES else base.mode,
+        layout=str(raw.get("layout", "")) if raw.get("layout") in LAYOUT_NAMES else "",
+        theme=raw.get("theme") if raw.get("theme") in THEMES else base.theme,
+        appearance=raw.get("appearance") if raw.get("appearance") in APPEARANCES
+        else base.appearance,
+        chat_style=raw.get("chat_style") if raw.get("chat_style") in CHAT_STYLES
+        else base.chat_style,
+        hinted=raw.get("hinted") is True,
+        resources=raw.get("resources") is not False,
     )
+
+
+LAYOUT_NAMES = ("chat", "classic", "quiet", "observatory", "workbench")  # tui.LAYOUTS
+migrated = False  # set by load() when it replaced a view.json from before VERSION 2
+
+
+def migrate(raw: dict[str, Any]) -> View:
+    """A version-1 view.json (the workbench was the default) becomes the chat view: panels
+    closed, layout and theme back to the defaults; teach mode, step detail and the product/code
+    mode are the user's and are kept."""
+    old = validate(raw)
+    return replace(preset(NEW_USER_PRESET), teach=old.teach, steps=old.steps, mode=old.mode)
 
 
 def load() -> View:
     """The saved view; a new user (no view.json yet) starts with NEW_USER_PRESET. An unreadable
     file falls back to the code workbench, as before the product view existed."""
+    global migrated
+    path = _path()
     try:
-        raw = json.loads(_path().read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        raw = json.loads(text)
     except FileNotFoundError:
         return preset(NEW_USER_PRESET)
     except (OSError, ValueError):
-        return View()
-    return validate(raw) if isinstance(raw, dict) else View()
+        return preset(NEW_USER_PRESET)
+    if not isinstance(raw, dict):
+        return preset(NEW_USER_PRESET)
+    if not isinstance(raw.get("version"), int) or raw["version"] < VERSION:
+        new = migrate(raw)
+        try:
+            path.with_name("view-v1.json").write_text(text, encoding="utf-8")
+            save(new)
+        except OSError:
+            pass  # read-only home: the chat view still applies for this session
+        migrated = True
+        return new
+    return validate(raw)
 
 
 def save(view: View) -> None:
@@ -218,13 +280,33 @@ def with_teach(view: View, on: bool) -> View:
     return replace(view, teach=on)
 
 
+def with_resources(view: View, on: bool) -> View:
+    """The live resource readings in the chat status line: a setting, like teach mode."""
+    return replace(view, resources=on)
+
+
+def with_settings(view: View, source: View) -> View:
+    """`view`'s panes with `source`'s settings (teach, layout, theme, ...): a preset never
+    changes them."""
+    return replace(view, **{name: getattr(source, name) for name in SETTINGS})
+
+
+def toggle_pane(view: View, pane: str) -> View:
+    """Open a closed pane (lists on the left, readers on the right) or close an open one."""
+    if view.column(pane) is not None:
+        return place(view, pane, "hide")
+    return place(view, pane, "right" if pane in RIGHT_PANES else "left")
+
+
 def toggle_status(view: View, item: str) -> View:
     items = set(view.status) ^ {item}
     return replace(view, status=tuple(s for s in STATUS_ITEMS if s in items), preset="custom")
 
 
 __all__ = [
-    "COLUMNS", "MODES", "NEW_USER_PRESET", "PANES", "PANE_TITLES", "PRESETS", "STATUS_ITEMS", "STEP_DETAIL", "View",
-    "load", "place", "preset", "resize", "save", "shift", "toggle_status", "validate",
-    "with_steps", "with_teach",
+    "APPEARANCES", "CHAT_STYLES", "COLUMNS", "DEFAULT_LAYOUT", "LAYOUT_PRESETS", "MODES",
+    "NEW_USER_PRESET", "PANES", "PANE_TITLES", "PRESETS", "SETTINGS", "STATUS_ITEMS",
+    "STEP_DETAIL", "THEMES", "VERSION", "View", "load", "migrate", "place", "preset", "resize",
+    "save", "shift", "toggle_pane", "toggle_status", "validate", "with_resources",
+    "with_settings", "with_steps", "with_teach",
 ]

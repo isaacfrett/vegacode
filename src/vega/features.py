@@ -15,25 +15,38 @@ FEATURES: dict[str, str] = {
     "plan": "update_plan tool, its prompt line, plan injection and the unfinished-plan nudge",
     "remember": "remember tool, its prompt line and loading .vega/notes.md",
     # added 2026-10-15: familiarity between chat sessions. Deterministic (no model call)
-    "manage_gitignore": "keep .vega/ out of git: a marked Vega block in .gitignore, added once per repo "
-                        "(never touches other lines; not re-added after you remove it)",
     "project_context": "VEGA.md (drafted on a project's first chat session, generated block kept "
     "current), a digest of each chat session in .vega/sessions.md, and loading VEGA.md (else "
     "AGENTS.md/CLAUDE.md), the last 2 digests and notes under one token budget at session start",
     "compaction": "summarising older history when nearing the context limit",
-    "result_cap": "per-tool-result size cap (20% of the context window)",
     "code_index": "repo_map and search_code tools and their prompt mention",
     "nudge_act": "send back a reply that used no tools",
-    "nudge_malformed": "send back a tool call written as unparseable text",
     "nudge_parse": "send back when an edited file no longer parses",
     "nudge_claim": "send back a claimed change when no edit succeeded",
-    "nudge_length": "send back a reply cut off by the length limit once (else stop cleanly)",
     # added 2026-10-21: a continuation restarted a cut-off line with its full indent (3 + 4 spaces)
     "continuation_seams": "join a continued reply cleanly: a line cut inside its indent or mid-word "
                           "is not indented twice",
     "repeat_guard": "do not re-run a call identical to one that already failed; say so instead",
     # added 2026-10-21: a task re-sent one refused write over a hundred times
-    "repeat_stop": "end the agent-loop turn after 3 guarded repeats of failed calls in a row",
+    # 2026-10-27: reads between repeats no longer reset the count; 4 repeats, not 3
+    "repeat_stop": "end the agent-loop turn after 4 guarded repeats of failed calls with no "
+                   "saved write or command run in between",
+    # 2026-10-27, A/B switch: off restores the old rule (any call that ran resets the count; 3)
+    "repeat_stop_reads": "repeat_stop counts repeats across reads and searches (only a saved write "
+                         "or a command run resets it) and stops at 4",
+    # 2026-10-28, A/B switch: bigbuild 10-28 rewrote one file unchanged ~36 times in a turn
+    # (151 no-op writes, 22% of model time), each resetting repeat_stop. Off: today's behaviour
+    "noop_write_repeat": "agent loop: a write that would leave the file byte-identical is not "
+    "written; the model is told the file already has this content, it does not count as a saved "
+    "write (no repeat_stop reset, a refused write stays refused) and it counts toward repeat_stop "
+    "like a guarded repeat",
+    # 2026-10-28: 94 of 109 refused writes on bigbuild 10-28 were undefined names; the model
+    # rewrote the defining module unchanged instead of adding the import
+    "import_offer": "a write refused for an undefined name that exactly one project module "
+    "defines (else exactly one in the file's own package) names that module and the import line "
+    "to add (in the file's import style), and a project package used as a module "
+    "(`pkg.errors.X` with no import) gets `import pkg.errors`; never for names defined nowhere "
+    "or in several places, nor when the import would be circular",
     "unchanged_rounds": "a repair round whose saved writes leave every file byte-identical runs no "
     "checks: the writer is told so with the failing check once; a second such round in a row ends "
     "the loop (best round kept)",
@@ -266,15 +279,9 @@ FEATURES: dict[str, str] = {
     "failing_checks_quoted": "direct pipeline: when it gives up with checks still failing, the "
     "final answer quotes the first 3 failing check lines (e.g. \"No module named 'yamlkit'\") "
     "instead of only their count",
-    "acceptance_prose_calls": "acceptance: a name written with empty parentheses in prose "
-    "(\"calls `format_total()`\") names the function; it is not a zero-parameter signature "
-    "requirement (only `def f()` is)",
     "acceptance_stubs": "acceptance: a task-named function whose body still raises "
     "NotImplementedError (or is only `...`/`pass` with a TODO comment) fails with a 'still a stub' "
     "item; @abstractmethod and base-class methods a subclass overrides are exempt",
-    "sandbox_toolchains": "run_check's sandbox gives Go a writable GOCACHE/GOPATH/GOMODCACHE inside "
-    "the clone (GOPROXY=off, GOTOOLCHAIN=local), and run_check also allows javac, java, Rscript "
-    "and `node <script.js>` (a script file inside the project)",
     # added 2026-10-17. On by default so each can be A/B'd off; unmeasured on a model
     "project_inputs": "project pipeline: the route's non-Python read-only inputs (text notes, "
     "docs, data files) are shown to the planner and the writer, as bounded excerpts "
@@ -285,8 +292,6 @@ FEATURES: dict[str, str] = {
     "project_honest_answer": "project pipeline: the final answer names exactly the files written "
     "and the planned files left unchanged with the reason, and never says the tests pass when "
     "nothing was written or no test ran",
-    "project_no_tests": "project pipeline: pytest exit code 5 (no tests collected) counts as no "
-    "tests, not as a failing test",
     "project_run_script": "project pipeline: when the task runs a script that writes an output "
     "(`python report.py` writes out.json), the script is run in the sandbox after each "
     "round's writes and its output files are saved, instead of the writer hand-writing them",
@@ -362,6 +367,14 @@ FEATURES: dict[str, str] = {
     "sandbox, the task's check commands and visible tests, and on macOS the page rendered in WebKit (script errors, declarations the engine "
     "drops, and the measured rules the task names: reduced motion, dark scheme, contrast, layout "
     "shift), ≤3 repairs, the round with the fewest failing checks kept",
+    # added 2026-10-29 (front-end failure review, fix 4): "you may edit both
+    # files; keep ... `styles.css`" made the HTML read-only and the stylesheet writable. Measured
+    # offline by a route diff over every suite's tasks; default on, unmeasured on a model
+    "web_file_permissions": "routing: the clauses that say which files may change are read for "
+    "front-end tasks: \"you may edit both files\" / \"you may change `a` and `b`\" make them "
+    "targets, a file listed in a keep clause (\"keep the ids and `styles.css`\") is read-only, "
+    "\"keep the other files\" leaves only the file named before it writable; keeping something "
+    "inside a file (\"keep every id\") protects no file",
     # added 2026-10-19/20. Default on, measured offline by replay; unmeasured on a model
     "finish_gate_answer_file": "finish gate: a JSON object in the final answer with the keys of "
     "the task's JSON template is that output file even when no heading names it, and is compared "
@@ -399,24 +412,34 @@ FEATURES: dict[str, str] = {
     "(no nulls, numbers where the placeholder is a number, fixed-length lists, string caps)",
     "script_error_values": "deliverable pipeline: a failed script's traceback starts at the "
     "script, shows its source lines and the values of the names on the failing line(s)",
-    "sandbox_path_scrub": "sandboxed command output has host paths replaced: the clone and the "
-    "project by `.`, Vega's venv by <venv>, the interpreter by <python>, the user's home by `~`",
     "deliverable_code_label": "deliverable pipeline: a Python script under a `File: x.json` label "
     "is run as the script, and a refused non-code deliverable is not asked for again \"in the "
     "same form as before\"",
+    # added 2026-10-27: 26 logged Python writes stood a comment such as `# ... rest of the
+    # function unchanged` in for code and 10 were saved, deleting it (they parse). On by default
+    # so it can be A/B'd off
+    "elision_guard": "agent-loop write tools (and, with pipeline_signals, the pipelines' writes "
+    "in write_loop.save) refuse a Python write to an existing file that stands "
+    "an elision comment (`# ... rest unchanged`, `# existing code omitted`) or a bare `...` in for "
+    "code the file had there (that code would be lost); the refusal names the line and asks for "
+    "the code in full or a partial edit. New files and real `...` stubs are allowed",
     "noop_edit_refused": "edit_file with new_text identical to old_text is refused with a note "
     "instead of reported as an exact-match edit",
-    "sandbox_env_scrub": "sandboxed checks run without Vega's own VEGA_* environment (an eval's "
-    "pinned seed/temperature and A/B feature switches are the harness's settings, not the "
-    "project's)",
-    "sandbox_read_guard": "deliverable scripts (and their `Run:` commands) may not read host "
-    "files outside the project and the interpreter: a macOS sandbox profile denies reads of "
-    "/Users, /Volumes, /private/etc, /private/var, /private/tmp, /Library/Keychains, and the "
-    "runner's audit hook refuses them in Python on every platform (naming the fixture copy when "
-    "the task maps `root/` to `/`)",
+    # promoted from the private lab on 2026-11-04 (release 0.3.2): a product feature, TUI only
+    "home_start": "the full-screen app started in the home folder, /, a folder above home or a large "
+    "folder with no project files asks what you are working on first (a recent project, a new one "
+    "or just chat; just chat answers with no tools and reads nothing)",
 }
 ENV = "VEGA_FEATURES_OFF"
 OPT_IN: dict[str, str] = {
+    # added 2026-10-28 (routing-fixes review) default on; OFF 2026-11-03 (owner):
+    # night A/B hurt (fewer hidden tests passed with it) -- when it acted it demoted
+    # the route to the single-pass direct writer. Redesign: keep the document as an input without
+    # changing the route
+    "reference_docs": "routing: a document the task names as where its rules are (\"what it has "
+    "to do is in docs/CONSENT.md\", \"described in\", \"follow / see / per X\", \"X describes "
+    "them\") is a read-only input, not a file to change, so the direct writer and the project "
+    "pipeline's planner and writers are shown it",
     "constrained": "every reply is one JSON action forced by a schema (structured outputs) instead "
     "of native tool calls",
     "search_streak": "after 4 searches in a row find nothing, show the file list and suggest "
@@ -460,30 +483,72 @@ OPT_IN: dict[str, str] = {
     "localize_ties": "issue_localize: the Likely-places block marks files scoring >= 0.85 x the "
     "top one as equally likely; the turn's first source write is held once while such a file is "
     "unread, and the no-edit finish gate names the Likely-places files",
+    # added 2026-10-22: on projects whose suite was red before any edit, every pre-existing
+    # failure was fed back as work and Vega edited unrelated files (wrong_file / regression).
+    # Opt-in until an A/B
+    # 2026-10-28: import_offer's import added by Vega instead of offered. Opt-in until an A/B
+    "import_offer_apply": "with import_offer: an atomic-write refusal whose only new findings "
+    "are undefined names that all have an import_offer is applied with those import lines added "
+    "at the top (the result says so) instead of refused",
+    "baseline_aware_gate": "agent loop: the pytest failures before Vega's first edit (the model's "
+    "own whole-suite run, else one sandboxed run of the project's test command at the first "
+    "write) are the baseline; afterwards test results, verify_before_finish and acceptance list "
+    "baseline failures the task does not name once as pre-existing instead of as work, and a run "
+    "whose only failures are those (complete, run to the end) does not block finishing; a test "
+    "that went from passing to failing always does",
+    # added 2026-10-29 (front-end failure review, fix 4, split from
+    # web_file_permissions): it moves 27 tasks (a whole suite of one-page design fixes) from the
+    # agent loop to the web pipeline, so it waits for its own A/B
+    "web_lone_page": "routing: a change whose only named file is one HTML page, read as a "
+    "document so far (no change cue before it), not kept and with no Python target, changes "
+    "that page: it goes to the web pipeline instead of the agent loop",
 }
 ENV_ON = "VEGA_FEATURES_ON"
-# Switches whose code was removed (2026-10-17), with what replaced them.
+# A switch whose code moved out of the core into an extension package is not retired: it still
+# exists there, and VEGA_FEATURES_OFF=<name> still switches it off. disabled() accepts such names
+# through extensions.switch_names (the extension keeps the list and its history); without the
+# extension they are unknown, like any other name.
+# Switches that no longer exist (code removed, or made plain code), with the date and why.
 # Still an error in VEGA_FEATURES_OFF/ON (an A/B arm would silently not differ), but a named one;
 # the experiment records keep the experiments that used them.
 RETIRED: dict[str, str] = {
-    "shape_routing": "routing.route_task is the only router",
-    "data_inputs": "routing.route_task classifies data inputs",
-    "direct_long_tasks": "routing.route_task budgets the direct writer by file size",
-    "parse_guard": "replaced by atomic_writes",
-    "replace_function": "replaced by edit_by_name (replace_definition)",
-    "repeat_unchanged": "replaced by turn_ledger",
+    "shape_routing": "on 2026-10-17: routing.route_task is the only router",
+    "data_inputs": "on 2026-10-17: routing.route_task classifies data inputs",
+    "direct_long_tasks": "on 2026-10-17: routing.route_task budgets the direct writer by file size",
+    "parse_guard": "on 2026-10-17: replaced by atomic_writes",
+    "replace_function": "on 2026-10-17: replaced by edit_by_name (replace_definition)",
+    "repeat_unchanged": "on 2026-10-17: replaced by turn_ledger",
+    "result_cap": "on 2026-10-22: plain code (tool results capped at 20% of the window)",
+    "nudge_length": "on 2026-10-22: plain code (a cut-off reply is sent back once)",
+    "nudge_malformed": "on 2026-10-22: plain code (unparseable text tool calls are sent back)",
+    "sandbox_toolchains": "on 2026-10-22: plain code (run_check allows the toolchains)",
+    "project_no_tests": "on 2026-10-22: plain code (pytest exit code 5 is no tests, not a failure)",
+    "acceptance_prose_calls": "on 2026-10-22: plain code (`f()` in prose is a name)",
+    "manage_gitignore": "on 2026-10-22: plain code (remove Vega's .gitignore block to opt out)",
+    # 2026-11-04 switch inventory: safety and eval-mechanics guards with no ablation value (the
+    # harness-off baseline already kept all three on: vega_lab.harness_baseline.CORE_EXCLUDED)
+    "sandbox_env_scrub": "on 2026-11-04: plain code (sandboxed checks never inherit Vega's VEGA_* "
+    "settings)",
+    "sandbox_read_guard": "on 2026-11-04: plain code (deliverable scripts never read host files "
+    "outside the project)",
+    "sandbox_path_scrub": "on 2026-11-04: plain code (host paths in sandboxed output are always "
+    "replaced)",
 }
 
 
 def _retired_note(names: set[str]) -> str:
     retired = sorted(names & RETIRED.keys())
-    return "".join(f" {name} was retired on 2026-10-17: {RETIRED[name]}." for name in retired)
+    return "".join(f" {name} was retired {RETIRED[name]}." for name in retired)
 
 
 def disabled() -> frozenset[str]:
     """Features switched off via VEGA_FEATURES_OFF; unknown names are an error, not a silent no-op."""
     names = {name.strip() for name in os.environ.get(ENV, "").split(",") if name.strip()}
     unknown = names - FEATURES.keys()
+    if unknown:  # an extension's own switches (extensions.switch_names) are not the core's to check
+        from . import extensions
+
+        unknown -= set(extensions.switch_names())
     if unknown:
         raise ValueError(
             f"Unknown feature(s) in {ENV}: {', '.join(sorted(unknown))}.{_retired_note(unknown)} "
@@ -513,3 +578,78 @@ def on(name: str) -> bool:
     if name in OPT_IN:
         return name in enabled()
     raise KeyError(f"Unknown feature {name!r}")
+
+
+# -- acted: whether a switch changed anything in this attempt (research A/B savings) -----------
+# An A/B that toggles one switch needs its WITHOUT arm only where the switch acted in the WITH arm:
+# at temperature 0 the rest runs identically (vega_lab.ab_savings, 2026-10-28). A switch "acts"
+# when it changes what the model sees or what the harness does (a prompt, a route, a write, a
+# check, a stop); merely being consulted is not acting. evals.run_attempt records `acted` per
+# attempt: {switch: bool} for every tracked switch that was on (False = on, never acted).
+# Core switches are tracked one by one (ACTED_TRACKED: the call site marks the acting branch);
+# lab features are tracked by vega_lab's hook dispatch (extensions.acted_tracked).
+# Where acting cannot be told from merely running, the call site marks conservatively (a mark too
+# many only costs an A/B its skip; a missed mark would let it skip a case that differs). A switch
+# whose effect applies to every request once on (kv_q8: a server setting) is not tracked: the
+# system map says `always = true` for it.
+ACTED_TRACKED = (
+    "elision_guard", "repeat_stop_reads", "noop_write_repeat", "import_offer",
+    # systems review 2026-10-29: the default-on core switches that logged nothing when they acted
+    "route_cli_target", "route_prose_class", "route_module_entry", "question_change_cues",
+    "clarify_model", "clarify_greedy", "plan_pending_ok",
+    "restore_later_files", "keep_docstrings", "fence_lines", "pipeline_signals", "direct_context",
+    "failing_checks_quoted", "project_inputs", "project_large_files",
+    "project_layer_imports", "plan_contradicting_tests", "deliverable_wide", "format_rules",
+    "script_error_values", "deliverable_code_label", "compaction", "turn_ledger",
+    "pin_editing_target", "project_context", "missing_symbol_hint", "data_preview",
+    "short_tracebacks", "output_head_tail", "web_site_apis", "web_adapter_builder",
+    "web_official_hint", "facet_same_option", "atomic_writes", "fence_strip", "lint",
+    "noop_edit_refused",
+    "acceptance_ignores_no_commands", "acceptance_uninstalled", "acceptance_stubs",
+    "task_module_commands", "command_absent_inputs", "json_template", "repeat_guard", "nudge_act",
+    "nudge_parse", "unchanged_rounds", "finish_gate_answer_file", "finish_gate_normalised",
+    "finish_gate_no_edit", "claim_check", "nudge_claim", "empty_final", "web_citations",
+    "cite_named_pages", "project_honest_answer", "continuation_seams", "web_file_permissions",
+    # 2026-11-03 night-runner audit: on, acting, but never marked (reports said "never acted")
+    "code_index", "acceptance",
+    "home_start",
+)
+_acted: set[str] = set()  # this attempt (evals._with_acted reads it; reset_acted per attempt)
+_turn_logged: set[str] = set()  # this turn: the switches already given their debug record
+
+
+def mark_acted(name: str, /, **detail: object) -> None:
+    """Switch `name` changed something: remembered for the attempt's `acted` record, and logged as
+    one debug stage {"stage": "acted", "feature": name, "switch": name, **detail} the first time
+    in a turn (new_turn). Without VEGA_DEBUG nothing is logged and `detail` is never used."""
+    _acted.add(name)
+    if name in _turn_logged:
+        return
+    try:
+        from . import debuglog
+
+        if not debuglog.enabled():
+            return
+        _turn_logged.add(name)
+        debuglog.record("stage", stage="acted", feature=name, switch=name, **detail)
+    except Exception:  # noqa: BLE001, S110 - instrumentation never fails a turn
+        pass
+
+
+def new_turn() -> None:
+    """A turn starts (CodingAgent.run): each switch that acts in it is logged once again."""
+    _turn_logged.clear()
+
+
+def reset_acted() -> None:
+    _acted.clear()
+    _turn_logged.clear()
+
+
+def acted_names() -> frozenset[str]:
+    return frozenset(_acted)
+
+
+def acted_core() -> list[str]:
+    """The tracked core switches that are on in this process."""
+    return [name for name in ACTED_TRACKED if name in FEATURES and on(name)]

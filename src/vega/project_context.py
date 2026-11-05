@@ -499,9 +499,9 @@ def ensure_gitignore(project: Path, state: dict[str, Any]) -> str | None:
     """Keep .vega/ and sensitive files out of git through Vega's marked block in .gitignore (see
     vega/gitignore.py). Returns a notice describing what changed or what needs the user's action,
     or None. Respects the user removing the block (remembered in state)."""
-    from . import features, gitignore
+    from . import gitignore
 
-    if not features.on("manage_gitignore") or not gitignore.in_work_tree(project):
+    if not gitignore.in_work_tree(project):
         return None
     path = project / ".gitignore"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
@@ -554,7 +554,7 @@ def start_session(project: Path) -> None:
             state["gitignore_message"] = added
         elif ("gitignore_notice" not in state and state.get("gitignore") != "user_removed"
               and _needs_gitignore_notice(project)):
-            state["gitignore_notice"] = "pending"  # managing switched off: suggest it instead
+            state["gitignore_notice"] = "pending"  # nothing to add but .vega/ not ignored: suggest it
         save_state(project, state)
     except (OSError, subprocess.SubprocessError, ValueError):
         pass

@@ -14,7 +14,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from vega.tools import ignored_parts
+from vega import extensions
+from vega.tools import _project_files, ignored_parts
 
 MAX_FILE_BYTES = 1_000_000
 MAX_FILES = 5000
@@ -93,10 +94,10 @@ def _list_files(project: Path) -> list[str]:
     if result is not None and result.returncode == 0:
         names = sorted(set(result.stdout.splitlines()))
     else:
+        # bounded, and never entering ignored folders (an rglob of ~ took minutes, 2026-10-28)
         names = sorted(
-            p.relative_to(project).as_posix() for p in project.rglob("*")
+            p.relative_to(project).as_posix() for p in _project_files(project)
             if p.is_file()
-            and not ignored_parts(p.relative_to(project).parts, project)
         )
     return [n for n in names if not ignored_parts(n.split("/"), project)]
 
@@ -412,6 +413,8 @@ class CodeIndex:
         if not picked:
             picked = [i for i in span if lines[i - 1].strip()][:3]
         snippet = "\n".join(f"{i}: {lines[i - 1].strip()[:160]}" for i in picked)
+        snippet = extensions.code_snippet(lines, picked, chunk.start_line, chunk.end_line,
+                                          default=snippet)
         return Hit(chunk.path, chunk.start_line, chunk.end_line, round(score, 2), snippet)
 
 

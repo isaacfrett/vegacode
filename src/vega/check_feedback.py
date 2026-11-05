@@ -105,6 +105,7 @@ def short_tracebacks(command: str) -> str:
     default long tracebacks through argparse, or for a dozen failures, did not fit)."""
     if (features.on("short_tracebacks") and _PYTEST_FAMILY.search(command)
             and not re.search(r"(?:^|\s)--tb\b|--full-trace", command)):
+        features.mark_acted("short_tracebacks", where="command")
         return f"{command} --tb=short"
     return command
 

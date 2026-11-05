@@ -150,7 +150,7 @@ def render(parts: Breakdown | None, fixed: float, used: float, window: int,
     text.append(percent, style=f"bold {value}")
     text.append("\n")
     text.append_text(bar)
-    room = context.COMPACT_AT * window - used
+    room = context.compact_at(window) * window - used
     text.append("\n")
     if room > 0:
         text.append(f"{g.tick}", style=colours["tick"])

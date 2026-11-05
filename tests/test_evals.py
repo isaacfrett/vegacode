@@ -198,12 +198,25 @@ def test_regression_reported_separately_from_acceptance(
 ) -> None:
     results = {"accept": "", "regress": "exit code: 1: 1 failed"}
     monkeypatch.setattr(evals, "_command_check",
-                        lambda command, project, timeout=0: (results[command], None))
+                        lambda command, project, timeout=0: (results[command], None, None))
     case = {**SUB_CASE, "check_command": "accept", "regression_command": "regress"}
     attempt = evals.run_attempt(case, agent_factory=scripted([fix_sub()]))
     assert (attempt["passed"], attempt["failure"]) == (False, "regression")
     assert attempt["acceptance_passed"] is True and attempt["regression_passed"] is False
     assert attempt["detail"] == "regression_command exit code: 1: 1 failed"
+
+
+def test_reply_flags_recorded_on_the_attempt() -> None:
+    """`reply_flags` (knowledge suite): which regexes the final reply matches, recorded per attempt
+    and never part of pass/fail; absent from attempts of cases without them."""
+    case = {"id": "flags", "task": "Is it true?", "files": {"NOTES.md": "notes\n"},
+            "response_matches": ["VERDICT: UNSURE"],
+            "reply_flags": {"hedged": r"\bnot sure\b", "cited": r"NOTES\.md"}}
+    attempt = evals.run_attempt(case, agent_factory=scripted([[text("I'm not sure.\nVERDICT: UNSURE")]]))
+    assert attempt["passed"] and attempt["reply_flags"] == {"hedged": True, "cited": False}
+    plain = evals.run_attempt({**case, "reply_flags": {}},
+                              agent_factory=scripted([[text("VERDICT: UNSURE")]]))
+    assert "reply_flags" not in plain
 
 
 def test_command_check_parses_exit_codes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,6 +231,24 @@ def test_command_check_parses_exit_codes(tmp_path: Path, monkeypatch: pytest.Mon
     assert evals.run_command_check("x", tmp_path) == (
         "exit code: 1: 2 failed · FAILED t.py::test_a - assert 1")
     assert evals.run_command_check("x", tmp_path).startswith("could not run")
+
+
+def test_check_output_keeps_every_hidden_result_line(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The harness parses per-test result lines from its own checks: far more than the model's
+    8k clip (bigbuild: 80+ hidden tests with tracebacks lost whole milestones from the counts)."""
+    seen: dict = {}
+
+    def run_check(command, project, timeout=0, output_limit=evals.sandbox.OUTPUT_LIMIT, **_):
+        seen["limit"] = output_limit
+        lines = [f"PASSED hidden_tests/t.py::test_m{1 + n % 3}_case_{n}" for n in range(400)]
+        return evals.sandbox.clip_output("exit code: 0\n" + "\n".join(lines) + "\n400 passed in 1s",
+                                         output_limit)
+
+    monkeypatch.setattr(evals.sandbox, "run_check", run_check)
+    _, counts, kinds = evals._command_check("pytest", tmp_path, 10)
+    assert seen["limit"] > evals.sandbox.OUTPUT_LIMIT
+    assert counts == (400, 400) and sum(row[1] for row in kinds.values()) == 400
 
 
 # --- vega_snapshot and mutations -----------------------------------------------------------------
@@ -256,6 +287,37 @@ def test_mutation_must_match_exactly_once(tmp_path: Path, old: str, count: int) 
         evals.build_fixture(case, tmp_path, ARCHIVE)
 
 
+def test_fixture_tree_is_copied_then_files_and_mutation_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trees = tmp_path / "trees"
+    (trees / "shop" / "src" / "__pycache__").mkdir(parents=True)
+    (trees / "shop" / "src" / "app.py").write_text("RATE = 1\nNAME = 'shop'\n")
+    (trees / "shop" / "src" / "__pycache__" / "app.cpython-311.pyc").write_bytes(b"\0")
+    (trees / "shop" / "README.md").write_text("Shop\n")
+    monkeypatch.setattr(evals, "FIXTURE_TREES", trees)
+    project = tmp_path / "project"
+    project.mkdir()
+    case = {"fixture_tree": "shop", "files": {"README.md": "Overridden\n", "new.py": "X = 2\n"},
+            "mutation": [{"path": "src/app.py", "old": "RATE = 1", "new": "RATE = 2"}]}
+    evals.build_fixture(case, project)
+    assert (project / "src/app.py").read_text() == "RATE = 2\nNAME = 'shop'\n"
+    assert (project / "README.md").read_text() == "Overridden\n"
+    assert (project / "new.py").is_file()
+    assert not (project / "src" / "__pycache__").exists()
+    assert (trees / "shop" / "src" / "app.py").read_text().startswith("RATE = 1")  # untouched
+
+
+@pytest.mark.parametrize("name", ["missing", "../escape", "a/b", "", 3])
+def test_unknown_or_unsafe_fixture_tree_is_a_fixture_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: object,
+) -> None:
+    monkeypatch.setattr(evals, "FIXTURE_TREES", tmp_path / "trees")
+    (tmp_path / "escape").mkdir()
+    with pytest.raises(evals.FixtureError, match="fixture_tree"):
+        evals.copy_fixture_tree(name, tmp_path / "project")
+
+
 def test_mutation_of_missing_file_fails(tmp_path: Path) -> None:
     case = {"vega_snapshot": True, "mutation": [{"path": "../x.py", "old": "a", "new": "b"}]}
     with pytest.raises(evals.FixtureError, match="no file"):
@@ -273,6 +335,74 @@ def test_broken_fixture_is_reported_and_not_scored(
     record = evals.run_suite("goals", repeat=1, agent_factory=scripted([fix_sub()]))
     assert record["cases"][0]["error"].startswith("fixture error: mutation 1")
     assert (record["passed"], record["total"]) == (1, 1)
+
+
+def test_a_red_snapshot_fixture_is_not_run_or_scored_and_floors_are_recorded(
+    tmp_path: Path, runs_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vega.fixture_guard: a case whose unmodified fixture fails its own checks gets a
+    "fixture red" error record (no attempt, not in the totals); floors land on the cases."""
+    from vega import fixture_guard
+
+    red = {"id": "sb-red", "task": "t", "vega_snapshot": True, "regression_command": "python -m pytest tests"}
+    goals = write_cases(tmp_path / "goals.jsonl", [red, SUB_CASE])
+    monkeypatch.setattr(evals, "GOALS_FILE", goals)
+    monkeypatch.setattr(evals, "vega_source_archive", lambda ref="HEAD": ARCHIVE)
+    seen = []
+
+    def check(cases, archive, **kwargs):
+        seen.append([c["id"] for c in cases])
+        return fixture_guard.GuardResult(
+            errors={"sb-red": "fixture red: 2 tests fail on the unmodified snapshot (a, b)"},
+            floors={"sub": [1, 3]}, summary={"status": "red", "commit": "abc1234", "note": "red"})
+
+    monkeypatch.setattr(evals.fixture_guard, "check", check)
+    record = evals.run_suite("goals", repeat=1, agent_factory=scripted([fix_sub()]))
+    assert seen == [["sb-red", "sub"]]
+    assert record["cases"][0] == {"case": "sb-red", "passed": 0, "attempts": [],
+                                  "error": "fixture red: 2 tests fail on the unmodified snapshot (a, b)"}
+    assert record["cases"][1]["hidden_floor"] == [1, 3]
+    assert (record["passed"], record["total"]) == (1, 1)
+    assert record["fixture_guard"]["status"] == "red"
+
+
+TURNS_CASE = {"id": "two-turns", "task": "sub() adds. Fix it.", "files": SUB_CASE["files"],
+              "turns": [{"task": "sub() adds. Fix it.", "python_check": SUB_CASE["python_check"]},
+                        {"task": "did you test it?", "response_matches": ["no"]}]}
+
+
+def test_a_multi_turn_case_without_an_extension_is_a_fixture_error_not_a_score(
+    tmp_path: Path, runs_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The core never runs `turns` as a one-turn attempt of the first message."""
+    goals = write_cases(tmp_path / "goals.jsonl", [TURNS_CASE, SUB_CASE])
+    monkeypatch.setattr(evals, "GOALS_FILE", goals)
+    record = evals.run_suite("goals", repeat=1, agent_factory=scripted([fix_sub()]))
+    assert "needs an extension" in record["cases"][0]["error"]
+    assert (record["passed"], record["total"]) == (1, 1)
+
+
+def test_an_extension_can_run_a_case_and_its_turns_are_summarised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def run_case(case: dict, **context) -> dict | None:
+        calls.append(context)
+        if "turns" not in case:
+            return None
+        return {"passed": False, "detail": "turn 2: no", "seconds": 1.0,
+                "turns": [{"passed": True}, {"passed": False}]}
+
+    monkeypatch.setattr(evals.extensions, "run_case", run_case)
+    attempt = evals.run_attempt(TURNS_CASE, suite="goals")
+    assert attempt["turns"] == [{"passed": True}, {"passed": False}]
+    assert sorted(calls[0]) == ["agent_factory", "archive", "suite", "transcript"]
+    assert evals.run_attempt(SUB_CASE, agent_factory=scripted([fix_sub()]))["passed"]
+    summary = evals.summarise([attempt, {"passed": True}])
+    assert summary["turns"] == [1, 2]
+    assert "turns passed 1/2" in evals._summary_line(summary)
+    assert "turns" not in evals.summarise([{"passed": True}])
 
 
 def test_failure_text_with_markup_brackets_is_printed_literally(
@@ -364,6 +494,35 @@ def test_goal_suite_table_and_summary(
     shown = evals.console.export_text()
     assert "Med tok" in shown and "3/80" in shown
     assert "Per attempt (median of n=2)" in shown and "321 tokens" in shown
+    assert "By tier" not in shown and "tiers" not in record  # no case sets a tier
+
+
+def test_suite_summary_breaks_down_by_tier(
+    tmp_path: Path, runs_file: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = [{**SUB_CASE, "id": "goal-easy", "tier": 1},
+             {**SUB_CASE, "id": "goal-hard", "tier": 3, "task": "sub() is wrong; fix it."},
+             {**SUB_CASE, "id": "goal-untiered", "task": "Please fix sub()."}]
+    monkeypatch.setattr(evals, "GOALS_FILE", write_cases(tmp_path / "goals.jsonl", cases))
+    record = evals.run_suite("goals", repeat=1,
+                             agent_factory=scripted([fix_sub(), [], fix_sub()]))
+    assert record["tiers"] == {"1": [1, 1, 0, 0], "3": [0, 1, 0, 0]}
+    assert "By tier: 1 1/1 (100%), 3 0/1 (0%)" in evals.console.export_text()
+
+
+def test_group_breakdown_counts_hidden_tests_and_skips_errors() -> None:
+    cases = [{"id": "a", "tier": 1}, {"id": "b", "tier": 1}, {"id": "c", "tier": 2},
+             {"id": "d"}]
+    outcomes = [
+        {"case": "a", "passed": 1, "attempts": [{"hidden": [3, 3]}, {"hidden": [1, 3]}]},
+        {"case": "b", "passed": 0, "attempts": [{"hidden": [0, 2]}]},
+        {"case": "c", "passed": 0, "attempts": [], "error": "fixture error"},
+        {"case": "d", "passed": 1, "attempts": [{}]},
+    ]
+    by_tier = evals.group_breakdown(cases, outcomes)
+    assert by_tier == {"1": [1, 3, 4, 8]}
+    assert evals._tiers_line(by_tier) == "By tier: 1 1/3 (33%; hidden 4/8)"
+    assert evals.group_breakdown([{"id": "a"}], outcomes) == {}
 
 
 # --- compare -------------------------------------------------------------------------------------
@@ -471,6 +630,50 @@ def test_guard_stop_records_partial_run(tmp_path, monkeypatch) -> None:
     assert slept == [7]
 
 
+def test_extension_waits_before_attempts_are_recorded_apart_from_attempt_seconds(tmp_path, monkeypatch) -> None:
+    """extensions.attempt_wait (the lab's heat gate): its idle goes in the run's resources as
+    <kind>_waits / <kind>_wait_seconds, recorded with or without the guard; attempt seconds exclude it."""
+    import sys
+    from types import ModuleType
+
+    from vega import evals, extensions
+    from vega.resources import Guard, Limits, Snapshot
+
+    cases = tmp_path / "fixes.jsonl"
+    cases.write_text('{"id": "a", "task": "t", "files": {"x.txt": "1"}, "response_contains": ["ok"]}\n')
+    monkeypatch.setattr(evals, "suite_file", lambda suite: cases)
+    monkeypatch.setattr(evals, "RUNS_FILE", tmp_path / "runs.jsonl")
+    monkeypatch.setattr(evals, "run_attempt",
+                        lambda case, **kw: {"passed": True, "detail": "", "seconds": 2.0, "failure": ""})
+    calls: list[bool] = []
+
+    def attempt_wait(*, sleep, first, log, **context):
+        calls.append(first)
+        if first:
+            return None  # cool before the first attempt
+        sleep(20)
+        return {"kind": "heat", "seconds": 20}
+
+    lab = ModuleType(extensions.PACKAGE)
+    lab.attempt_wait = attempt_wait
+    monkeypatch.delenv(extensions.DISABLE_ENV, raising=False)
+    monkeypatch.setitem(sys.modules, extensions.PACKAGE, lab)
+    extensions.reset()
+    slept: list[float] = []
+    record = evals.run_suite("fixes", repeat=3, sleep=slept.append)  # no guard
+    assert calls == [True, False, False] and slept == [20, 20]
+    assert record["resources"] == {"cooldown_seconds": 0.0, "heat_waits": 2, "heat_wait_seconds": 40}
+    assert [a["seconds"] for a in record["cases"][0]["attempts"]] == [2.0, 2.0, 2.0]
+    assert evals._resources_line(record["resources"]) == (
+        "Machine: cooldown 0 s between attempts · heat waits 2× (40 s idle between attempts, "
+        "not in attempt seconds)")
+    guard = Guard(Limits(), probe=lambda: Snapshot(80, 500, 30, 0), sleep=lambda s: None, log=lambda t: None)
+    guarded = evals.run_suite("fixes", repeat=2, guard=guard, sleep=slept.append)
+    assert guarded["resources"]["heat_waits"] == 1 and guarded["resources"]["pauses"] == 0
+    line = evals._resources_line(guarded["resources"])
+    assert line.startswith("Machine: lowest free memory") and "heat waits 1× (20 s" in line
+
+
 def test_meter_counts_nudges_text_calls_and_compactions() -> None:
     from vega.evals import _Meter, summarise
 
@@ -496,3 +699,41 @@ def test_vega_bookkeeping_is_not_an_unexpected_file() -> None:
     # failures used to be classed wrong_file only because `remember` wrote .vega/notes.md
     assert evals._vega_own(".vega/notes.md") and evals._vega_own(".vega")
     assert not evals._vega_own("vega/notes.md") and not evals._vega_own("src/.vega_helper.py")
+
+
+def test_a_question_followed_by_a_sentence_counts_as_asking() -> None:
+    asks = evals._ASKS_USER.search
+    assert asks("Which list should hide them? I'll wait for your answer before changing anything.")
+    assert asks("Should rounding be half-up or half-even?\n\nThe README and the code disagree.")
+    assert asks("Do you mean `connect_timeout`?")
+    assert not asks("Fixed. The endpoint is /items?id=1 and the tests pass.")
+    assert not asks("Done: renamed the function and updated its callers.")
+
+
+def test_response_check_grades_the_reply_on_stdin(tmp_path: Path) -> None:
+    script = ("import sys\nreply = sys.stdin.read()\n"
+              "if 'Where should it live' in reply:\n    print('asks where the code lives')\n"
+              "    raise SystemExit(1)\n")
+    case = {"files": {}, "response_check": script}
+    assert evals._check(case, tmp_path, "1. Which returns? a) IRR") == ""
+    assert evals._check(case, tmp_path, "2. Where should it live?") == (
+        "response_check failed: asks where the code lives")
+
+
+def test_attempt_records_acted_and_a_stable_project_root(tmp_path, monkeypatch) -> None:
+    """Every attempt says which tracked switches acted (vega_lab.ab_savings skips an A/B's
+    WITHOUT arm where the toggled one did not); with VEGA_EVAL_STABLE_ROOT the project root in the
+    system prompt is the same in every run (a random one made A/B arms differ at temperature 0)."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    monkeypatch.setenv("VEGA_EVAL_STABLE_ROOT", "1")
+    case = {"id": "stable-root", "task": "List the files.", "files": {"app.py": "X = 1\n"},
+            "python_check": "assert True\n"}
+    prompts = []
+    for _ in range(2):
+        seen: list = []
+        attempt = evals.run_attempt(case, agent_factory=scripted([[call("list_files"), text("app.py only.")]], seen))
+        prompts.append(seen[0]["agent"].messages[0]["content"])
+        assert isinstance(attempt["acted"], dict)
+        assert attempt["acted"]["elision_guard"] is False and attempt["acted"]["repeat_stop_reads"] is False
+    assert prompts[0] == prompts[1] and str(tmp_path / "vega-eval-stable-root") in prompts[0]

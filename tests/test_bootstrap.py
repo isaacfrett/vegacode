@@ -260,7 +260,7 @@ def test_consented_setup_makes_a_venv_installs_links_and_runs_vega(tmp_path: Pat
     assert machine.execs == [(link, ["run", "fix it"])]
     assert os.readlink(link) == str(machine.venv / "bin/vega")
     err = capsys.readouterr().err
-    assert "~/.local/bin is not on your PATH" in err and "~/.zshrc" in err
+    assert "Added ~/.local/bin to PATH in ~/.zshrc" in err and "PATH:" in err
 
 
 def test_second_run_goes_straight_to_vega(tmp_path: Path, capsys) -> None:
@@ -285,6 +285,18 @@ def test_a_new_launcher_version_updates_the_venv_without_recreating_it(tmp_path:
     assert machine.boot.main([]) == 0
     assert machine.commands == [[str(machine.venv / "bin/python"), "-m", "pip", "install",
                                  "--disable-pip-version-check", "vegacode==0.3.2"]]
+
+
+def test_an_older_launcher_never_downgrades_an_updated_environment(tmp_path: Path) -> None:
+    """After `vega update`, macOS's Python 3.9 launcher copy is older than the environment: it
+    must run the environment, not reinstall its own older version into it."""
+    machine = Machine(tmp_path, env={"VEGA_BOOTSTRAP_YES": "1"}, version="0.3.1")
+    machine.boot.main([])
+    machine.commands.clear()
+    machine.installed_version = "0.3.2"
+    machine.boot.version = lambda: "0.3.1"
+    assert machine.boot.main([]) == 0
+    assert machine.commands == []
 
 
 def test_interactive_consent_and_refusal(tmp_path: Path, capsys) -> None:
@@ -334,9 +346,13 @@ def test_no_python_offers_brew_only_in_a_terminal(tmp_path: Path, capsys,
 
     declined = Machine(tmp_path / "b", pythons={}, tty=True, answers=[False])
     assert declined.boot.main([]) == 1 and declined.commands == []
-    assert declined.questions == ["Run it now?"]
+    assert declined.questions == ["Set up Vega now?"]
+    err = capsys.readouterr().err
+    assert "Nothing changed" in err and "brew install python@3.12" in err
 
-    agreed = Machine(tmp_path / "c", pythons={}, tty=True, answers=[True, True])
+    # One plan, one question (the 0.3.1 laptop test saw two: "Run it now?" for Homebrew's
+    # Python, then "Set up Vega now?" naming the Python 3.12 it had just installed).
+    agreed = Machine(tmp_path / "c", pythons={}, tty=True, answers=[True])
     real_run = agreed._run
 
     def run(command: list[str]) -> int:
@@ -348,13 +364,37 @@ def test_no_python_offers_brew_only_in_a_terminal(tmp_path: Path, capsys,
 
     agreed.boot.run_command = run
     assert agreed.boot.main([]) == 0
+    assert agreed.questions == ["Set up Vega now?"]
     assert agreed.commands[0] == ["/opt/homebrew/bin/brew", "install", "python@3.12"]
     assert agreed.commands[1][1:3] == ["-m", "venv"]
+    err = capsys.readouterr().err
+    plan = err[:err.index("Nothing is installed")]
+    assert ("Python:      Python 3.12, installed by Homebrew first (brew install python@3.12; "
+            "about 110 MB with its dependencies, in /opt/homebrew)") in plan
+    assert "Environment: ~/.local/share/vega/venv" in plan and "PATH:" in plan
+    assert "Run it now?" not in err
+
+
+def test_a_failed_python_install_stops_before_the_venv(tmp_path: Path, capsys,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(boot, "find_brew", lambda env: "/opt/homebrew/bin/brew")
+    monkeypatch.setattr(boot, "find_uv", lambda env, home: None)
+    machine = Machine(tmp_path, pythons={}, tty=True, answers=[True])
+
+    def run(command: list[str]) -> int:
+        machine.commands.append(command)
+        return 1
+
+    machine.boot.run_command = run
+    assert machine.boot.main([]) == 1
+    assert machine.commands == [["/opt/homebrew/bin/brew", "install", "python@3.12"]]
+    assert "`install python@3.12` failed" in capsys.readouterr().err
+    assert not machine.venv.exists() and machine.execs == []
 
 
 def test_no_python_offers_uv_before_brew(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(boot, "find_brew", lambda env: "/opt/homebrew/bin/brew")
-    machine = Machine(tmp_path, pythons={}, tty=True, answers=[True, True])
+    machine = Machine(tmp_path, pythons={}, tty=True, answers=[True])
     uv = _exe(machine.home / ".local" / "bin" / "uv")
     managed = machine.home / ".local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3"
     real_run = machine._run
@@ -369,6 +409,7 @@ def test_no_python_offers_uv_before_brew(tmp_path: Path, monkeypatch: pytest.Mon
 
     machine.boot.run_command = run
     assert machine.boot.main([]) == 0
+    assert machine.questions == ["Set up Vega now?"]
     assert machine.commands[0] == [str(uv), "python", "install", "3.12"]
     assert machine.commands[1] == [str(managed), "-m", "venv", str(machine.venv)]
 
@@ -448,3 +489,41 @@ def test_distribution_metadata_lets_old_pythons_install_only_the_launcher() -> N
     requirements = project["dependencies"] + [
         req for extra in project["optional-dependencies"].values() for req in extra]
     assert requirements and all(req.endswith("; " + marker) for req in requirements)
+
+
+# --- PATH added during setup ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("shell,system,rcname,line", [
+    ("/bin/zsh", "Darwin", ".zshrc", 'export PATH="$HOME/.local/bin:$PATH"'),
+    ("/bin/bash", "Darwin", ".bash_profile", 'export PATH="$HOME/.local/bin:$PATH"'),
+    ("/bin/bash", "Linux", ".bashrc", 'export PATH="$HOME/.local/bin:$PATH"'),
+    ("/usr/bin/fish", "Linux", ".config/fish/conf.d/vega.fish", "fish_add_path $HOME/.local/bin"),
+    ("", "Linux", ".profile", 'export PATH="$HOME/.local/bin:$PATH"'),
+])
+def test_add_to_path_writes_once_for_the_shell(tmp_path: Path, shell: str, system: str,
+                                               rcname: str, line: str) -> None:
+    folder = tmp_path / ".local" / "bin"
+    env = {"PATH": "/usr/bin", "SHELL": shell}
+    rc = tmp_path / rcname
+    if rcname == ".zshrc":
+        rc.write_text("alias ll='ls -l'")  # no trailing newline: the block starts on its own line
+    assert boot.add_to_path(folder, env, tmp_path, system) == rc
+    text = rc.read_text()
+    assert text.count(line) == 1 and boot.PATH_MARK in text
+    if rcname == ".zshrc":
+        assert text.startswith("alias ll='ls -l'\n")
+    assert boot.add_to_path(folder, env, tmp_path, system) is None  # idempotent
+    assert rc.read_text() == text
+    assert boot.shell_rc_has_line(env, tmp_path, system)
+
+
+def test_add_to_path_skips_when_on_path_or_line_present(tmp_path: Path) -> None:
+    folder = tmp_path / ".local" / "bin"
+    assert boot.add_to_path(folder, {"PATH": f"/usr/bin:{folder}", "SHELL": "/bin/zsh"},
+                            tmp_path, "Darwin") is None
+    assert not (tmp_path / ".zshrc").exists()
+    (tmp_path / ".zshrc").write_text('export PATH="$HOME/.local/bin:$PATH"\n')
+    assert boot.add_to_path(folder, {"PATH": "/usr/bin", "SHELL": "/bin/zsh"},
+                            tmp_path, "Darwin") is None
+    assert boot.add_to_path(tmp_path / "elsewhere", {"PATH": "/usr/bin", "SHELL": "/bin/zsh"},
+                            tmp_path, "Darwin") is None

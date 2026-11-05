@@ -56,3 +56,22 @@ def test_a_profile_can_switch_a_default_off_and_never_overrides_the_user(monkeyp
     monkeypatch.setenv(features.ENV, "")  # the user's own choice: nothing off
     assert models.apply_feature_defaults("vega-granite-8b") == []
     assert features.on("plan")
+
+
+def test_profile_off_defaults_are_added_to_the_users_off_list(tmp_path, monkeypatch) -> None:
+    # 2026-11-04: VEGA_FEATURES_OFF=x replaced Granite's `plan` default, so A/B arms changed two things
+    toml = tmp_path / "models.toml"
+    toml.write_text('default = "g"\n[profiles.g]\nbase = "x"\nfeatures_off = ["plan"]\n')
+    monkeypatch.setattr(models, "PROFILES_FILE", toml)
+    monkeypatch.setattr(models, "active_profile", lambda: "g")
+    for name in ("_APPLIED_OFF", "_USER_OFF"):
+        monkeypatch.setattr(models, name, None)
+    assert models.apply_feature_defaults("vega") == ["-plan"] and not features.on("plan")
+    monkeypatch.setenv(features.ENV, "lint")  # an A/B arm's own switch
+    assert models.apply_feature_defaults("vega") == ["-plan"]
+    assert not features.on("plan") and not features.on("lint")
+    assert models.apply_feature_defaults("vega") == ["-plan"]  # idempotent: env now holds both
+    assert os.environ[features.ENV] == "lint,plan"
+    monkeypatch.setenv("VEGA_PROFILE_FEATURES_OFF", "0")
+    monkeypatch.setenv(features.ENV, "lint")
+    assert models.apply_feature_defaults("vega") == [] and features.on("plan")

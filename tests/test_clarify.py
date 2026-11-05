@@ -106,7 +106,8 @@ def test_vague_request_gets_one_clarifying_reply_and_no_tools(tmp_path: Path, ga
     assert 2 <= len(numbered) <= 4
     assert reply.rstrip().endswith("?")
     assert "data/events.csv" in reply  # options come from the project
-    assert "python -m pytest -q" in reply
+    # never where it lives or how to verify it (owner feedback 2026-10-24): Vega decides
+    assert "pytest" not in reply and "live?" not in reply and "verify" not in reply.lower()
     assert "loop" in reply.lower()
     assert agent.messages[-1] == {"role": "assistant", "content": reply}
 
@@ -120,6 +121,36 @@ def test_answer_to_the_questions_goes_to_the_agent_with_the_request(tmp_path: Pa
     goal = seen[0][-1]["content"]
     assert goal.startswith("build an application") and goal.endswith("1a, 2b, 3a")
     assert agent._clarify_pending is None
+
+
+def test_go_with_your_picks_becomes_the_recommended_options(tmp_path: Path, gate_on,
+                                                          monkeypatch) -> None:
+    from vega import extensions
+
+    def verdict(task, verdict, **_):
+        return clarify.Verdict(clarify.VAGUE, ["x"], questions=[("Which returns?", ["a", "b"])],
+                               reply="Which returns?\n   a) a  (recommended)\n   b) b",
+                               defaults="1. Which returns? a.")
+    monkeypatch.setattr(extensions, "clarify_verdict", verdict)
+    agent, seen = agent_with(tmp_path, [call("list_files"), text("Built it.")])
+    assert agent.run("build an application").startswith("Which returns?")  # the reply as given
+    assert agent.run("go with your picks") == "Built it."
+    goal = next(m["content"] for m in seen[0] if m["role"] == "user"
+                and m["content"].startswith("build an application\n"))
+    assert goal.endswith("(your recommended options):\n1. Which returns? a.")
+
+
+def test_an_extensions_assumptions_reach_the_request_and_open_the_reply(tmp_path: Path, gate_on,
+                                                                       monkeypatch) -> None:
+    from vega import extensions
+
+    monkeypatch.setattr(extensions, "clarify_verdict", lambda task, verdict, **_: clarify.Verdict(
+        clarify.CLEAR, [], assumptions=["Python 3", "a command-line program"]))
+    agent, seen = agent_with(tmp_path, [call("list_files"), text("Built it.")])
+    answer = agent.run("Make a converter for cooking measurements like cups and grams.")
+    assert answer == "Assumptions:\n- Python 3\n- a command-line program\n\nBuilt it."
+    assert any("build it with these assumptions" in str(m["content"]) for m in seen[0]
+               if m["role"] == "user")
 
 
 def test_clear_request_is_not_asked_and_not_slowed(tmp_path: Path, gate_on) -> None:

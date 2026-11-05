@@ -1,0 +1,151 @@
+/* Chat (the default layout since 2026-10-24; 2026-10-28 mockup): one centred conversation column,
+   the message box in a thin frame and a dim one-line status under it. No boxes around messages;
+   colours come from the theme, by default the terminal's own (ANSI
+   default foreground and background). Panels are opt-in (/panel): they open in side columns
+   that sit behind a single rule, each with its title on a top rule.
+
+   Three chat styles (App class style-<name>, /style): rail (default; your messages carry the
+   prompt's mark), gutter (speaker names and a title line), bubbles (your messages on the right
+   in a light frame). */
+
+.layout-chat #header { display: none; }
+.layout-chat #side { display: none; }
+
+/* conversation: the content, nothing around it, in one centred reading column (2026-10-28):
+   at most 88 cells wide (tui.CHAT_COLUMN), the full width on a narrow window. The message box
+   and the status line under it take the same width when the conversation is alone on screen. */
+.layout-chat #conversation { padding: 1 2 0 2; align-horizontal: center; }
+.layout-chat #conversation > * { max-width: 88; }
+.layout-chat Screen.narrow #conversation { padding: 1 1 0 1; }
+.layout-chat Screen.no-left.no-right #input-row,
+.layout-chat Screen.no-left.no-right #status,
+.layout-chat Screen.narrow #input-row,
+.layout-chat Screen.narrow #status,
+.layout-chat Screen.panel-hidden #input-row,
+.layout-chat Screen.panel-hidden #status { max-width: 88; }
+.layout-chat .message { margin-bottom: 1; }
+.layout-chat .gutter { width: 2; }
+.layout-chat .gutter.you { color: $accent; }
+.layout-chat .user-text { text-style: bold; }
+.layout-chat .turn-changes { display: block; color: $vega-muted; }
+.layout-chat .turn-changes.-empty { display: none; }
+
+/* input: a thin rounded box, one line tall until you type more, "> " in the accent; the
+   status line under it is dim (live resources, /resources) */
+.layout-chat #input-row {
+    border: round $vega-rule;
+    padding: 0 1;
+}
+.layout-chat #input-row:focus-within { border: round $vega-muted; }
+.layout-chat #status { padding: 0 1; }
+.layout-chat #readouts { color: $vega-muted; }
+
+/* panels (opt-in): side columns behind one rule; each pane has its title on a top rule */
+.layout-chat #left,
+.layout-chat #right {
+    display: block;
+    height: 100%;
+}
+.layout-chat #left { border-right: solid $vega-rule; }
+.layout-chat #right { border-left: solid $vega-rule; }
+.layout-chat Screen.no-left #left,
+.layout-chat Screen.no-right #right { display: none; }
+.layout-chat .wb-pane {
+    height: 1fr;
+    border-top: solid $vega-rule;
+    border-title-color: $vega-muted;
+    border-title-style: bold;
+    background: $background;
+}
+.layout-chat .wb-pane:focus,
+.layout-chat .wb-pane:focus-within { border-top: solid $accent; border-title-color: $accent; }
+.layout-chat .wb-text { padding: 0 1; scrollbar-size-vertical: 1; }
+.layout-chat #preview { height: 2fr; }
+.layout-chat .wb-plan,
+.layout-chat .wb-machine,
+.layout-chat .wb-session { height: auto; max-height: 60%; }
+.layout-chat .wb-loops,
+.layout-chat .wb-git { height: auto; max-height: 40%; }
+.layout-chat .wb-context { height: auto; max-height: 70%; }
+.layout-chat .wb-git:first-child:last-child,
+.layout-chat .wb-context:first-child:last-child { max-height: 100%; }
+.layout-chat .wb-product { height: auto; max-height: 70%; }
+.layout-chat .wb-release { height: 1fr; padding: 0 1; }
+.layout-chat OptionList { scrollbar-size-vertical: 1; background: $background; border: none; }
+.layout-chat OptionList:focus { border: none; }
+.layout-chat OptionList.wb-pane, .layout-chat OptionList.wb-pane:focus { border: none; border-top: solid $vega-rule; }
+.layout-chat OptionList.wb-pane:focus { border-top: solid $accent; }
+.layout-chat OptionList > .option-list--option-highlighted { background: $background; text-style: none; }
+.layout-chat OptionList:focus > .option-list--option-highlighted { text-style: bold underline; }
+.layout-chat OptionList > .option-list--option-disabled { color: $vega-muted; }
+.layout-chat OptionList > .option-list--option-hover { background: $background; text-style: underline; }
+
+/* a window too narrow for the open panels: the conversation alone, Ctrl+P shows the details */
+.layout-chat Screen.narrow #left,
+.layout-chat Screen.narrow #right,
+.layout-chat Screen.panel-hidden #left,
+.layout-chat Screen.panel-hidden #right { display: none; }
+.layout-chat Screen.narrow.panel-overlay #side { display: block; }
+.layout-chat Screen.narrow.product-mode #strip {
+    display: block;
+    border-bottom: solid $vega-rule;
+}
+
+/* gutter: a title line on top, speaker names in a margin, the input between two rules */
+.layout-chat.style-gutter #header {
+    display: block;
+    height: 1;
+    border-bottom: none;
+    padding: 0 1;
+}
+.layout-chat.style-gutter #brand { color: $accent; padding-right: 2; }
+.layout-chat.style-gutter #path { color: $vega-muted; }
+.layout-chat.style-gutter #model { padding: 0 2; }
+.layout-chat.style-gutter .gutter { width: 6; }
+.layout-chat.style-gutter .gutter.you { color: $vega-muted; }
+.layout-chat.style-gutter .gutter.vega { color: $accent; }
+.layout-chat.style-gutter .user-text { text-style: none; }
+.layout-chat.style-gutter #conversation { padding: 1 1 0 1; }
+.layout-chat.style-gutter #input-row {
+    border: none;
+    border-top: solid $vega-rule;
+    border-bottom: solid $vega-rule;
+}
+
+/* bubbles: your messages on the right in a light frame; Vega's replies full width */
+.layout-chat.style-bubbles .gutter { display: none; }
+.layout-chat.style-bubbles .message.user { align-horizontal: right; }
+.layout-chat.style-bubbles .user-text {
+    width: auto;
+    max-width: 72%;
+    border: round $vega-rule;
+    padding: 0 1;
+    text-style: none;
+}
+.layout-chat.style-bubbles #input-row { margin: 0 1; }
+.layout-chat.style-bubbles #input-row:focus-within { border: round $accent; }
+
+/* a reply's details: no "no tools used" line; code behind a rule in the margin */
+.layout-chat .toggle.-empty { display: none; }
+.layout-chat .answer MarkdownFence {
+    margin: 1 0;
+    padding: 0;
+    border-left: solid $vega-rule;
+    background: transparent;
+}
+.layout-chat .answer MarkdownFence > Label { padding: 0 1 0 1; }
+
+/* headings in a reply: bold in the text colour, a blank line above; no Textual banner colours */
+.layout-chat .answer MarkdownH1,
+.layout-chat .answer MarkdownH2,
+.layout-chat .answer MarkdownH3,
+.layout-chat .answer MarkdownH4 {
+    color: $foreground;
+    background: transparent;
+    content-align: left top;
+    text-style: bold;
+    margin: 1 0 1 0;
+    padding: 0;
+}
+.layout-chat .answer MarkdownH1 { text-style: bold underline; }
+.layout-chat .answer MarkdownH4 { text-style: bold italic; }

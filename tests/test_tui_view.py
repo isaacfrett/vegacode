@@ -31,8 +31,10 @@ def ids(column) -> list[str]:
 
 # -- settings ------------------------------------------------------------------------------------
 
-def test_workbench_is_the_default_layout(monkeypatch) -> None:
+def test_chat_is_the_default_layout(monkeypatch) -> None:
     monkeypatch.delenv("VEGA_LAYOUT", raising=False)
+    assert layout_from_env() == "" and view.DEFAULT_LAYOUT == "chat"  # then view.json, then chat
+    monkeypatch.setenv("VEGA_LAYOUT", "workbench")
     assert layout_from_env() == "workbench"
 
 
@@ -206,50 +208,3 @@ def test_preset_screens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: s
 
     drive(app, script, size=(140, 40))
     assert (out / f"preset-{name}.svg").exists()
-
-
-def test_window_fills_the_screen_only_on_a_real_terminal(monkeypatch) -> None:
-    import io
-
-    from vega import tui
-
-    class Tty(io.StringIO):
-        def isatty(self) -> bool:
-            return True
-
-    for name in ("VEGA_WINDOW", "TMUX", "STY"):
-        monkeypatch.delenv(name, raising=False)
-    assert tui._window_resizable(Tty())
-    assert not tui._window_resizable(io.StringIO())  # piped
-    monkeypatch.setenv("VEGA_WINDOW", "keep")
-    assert not tui._window_resizable(Tty())
-    monkeypatch.delenv("VEGA_WINDOW")
-    monkeypatch.setenv("TMUX", "/tmp/tmux-1/default,1,0")
-    assert not tui._window_resizable(Tty())
-    out = Tty()
-    tui._resize_window(40, 120, out)
-    assert out.getvalue() == "\x1b[8;40;120t"
-
-
-def test_waits_for_the_terminal_to_finish_resizing() -> None:
-    from types import SimpleNamespace
-
-    from vega import tui
-
-    t = {"now": 0.0}
-    sizes = [(30, 100)] * 3 + [(50, 160)] * 2 + [(60, 220)] * 20  # grows in two steps, then settles
-
-    def size(_fd):
-        rows, cols = sizes.pop(0) if len(sizes) > 1 else sizes[0]
-        return SimpleNamespace(lines=rows, columns=cols)
-
-    def sleep(seconds: float) -> None:
-        t["now"] += seconds
-
-    final = tui._wait_for_new_size((30, 100), 1, size=size, sleep=sleep, clock=lambda: t["now"])
-    assert final == (60, 220)
-    # a terminal that ignores the request: gives up after the limit with the old size
-    t["now"] = 0.0
-    still = tui._wait_for_new_size((30, 100), 1, limit=0.3, size=lambda _fd: SimpleNamespace(lines=30, columns=100),
-                                   sleep=sleep, clock=lambda: t["now"])
-    assert still == (30, 100)

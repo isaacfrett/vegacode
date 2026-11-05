@@ -192,22 +192,15 @@ def test_no_tests_collected_is_not_a_failure(tmp_path: Path, monkeypatch) -> Non
     assert answer == "Changed calc.py; the project has no tests, so no test ran."
 
 
-def test_no_tests_switch_off_spends_the_repair_rounds(tmp_path: Path, monkeypatch) -> None:
-    # unchanged_rounds off too: every round here rewrites the same file
-    monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance,project_no_tests,unchanged_rounds")
-    task = untested_project(tmp_path)
-    agent, calls = scripted(tmp_path, [CALC_PLAN, CALC_WRITE] * (project_pipeline.REPAIRS + 1))
-    answer = project_pipeline.run(agent, task)
-    assert len(calls) == 2 * (project_pipeline.REPAIRS + 1)
-    assert "still fail" in answer
-
-
 def test_an_unchanged_round_tells_the_writer_then_ends_the_loop(tmp_path: Path,
                                                                 monkeypatch) -> None:
     # unchanged_rounds: round 2's write is byte-identical -> no checks and no replan, its writer
     # is told; round 3 identical again -> the loop ends (5 calls instead of 8)
-    monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance,project_no_tests")
+    monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance")
     task = untested_project(tmp_path)
+    # a test the writes never satisfy keeps the rounds going
+    (tmp_path / "test_calc.py").write_text("from calc import double\n\n\n"
+                                           "def test_double():\n    assert double(2) == 5\n")
     agent, calls = scripted(tmp_path, [CALC_PLAN, CALC_WRITE, CALC_PLAN, CALC_WRITE, CALC_WRITE])
     answer = project_pipeline.run(agent, task)
     assert len(calls) == 5  # plan, write (checked), replan, write (unchanged), write (unchanged)
@@ -272,7 +265,7 @@ def test_a_failing_script_goes_back_to_the_writer(tmp_path: Path, monkeypatch) -
 
 
 def test_script_switch_off_lets_the_writer_hand_write_it(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance,project_run_script,project_no_tests")
+    monkeypatch.setenv("VEGA_FEATURES_OFF", "acceptance,project_run_script")
     monkeypatch.setattr(project_pipeline, "REPAIRS", 0)
     task = report_project(tmp_path)
     agent, _ = scripted(tmp_path, [REPORT_PLAN, MEAN, REPORT, HAND])

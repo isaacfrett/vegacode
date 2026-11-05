@@ -111,3 +111,41 @@ def test_git_repo_fixture_commits_files_then_writes_uncommitted(tmp_path: Path) 
     status = subprocess.run(["git", "status", "--short", "--branch"], cwd=tmp_path,
                             capture_output=True, text=True, check=True).stdout
     assert status.splitlines() == ["## main", " M a.py", "?? new.txt"]
+
+
+SANDBOX_CASE = {
+    "id": "sandbox-commit", "task": "Commit my change to a.txt with the message Save.",
+    "files": {}, "commands": "sandbox", "commands_forbid": [r"\bgit\s+push\b"],
+    "git_history": [{"commit": "Start", "files": {"a.txt": "a\n"}}, {"write": {"a.txt": "b\n"}}],
+    "python_check": ("import subprocess\n"
+                     "out = subprocess.run(['git', 'log', '--format=%s'], capture_output=True,"
+                     " text=True).stdout.split()\n"
+                     "assert out == ['Save', 'Start'], out\n"),
+}
+needs_sandbox = pytest.mark.skipif(not evals.sandbox.available(), reason="needs the macOS sandbox")
+
+
+@needs_git
+@needs_sandbox
+def test_sandbox_case_runs_commands_in_the_project() -> None:
+    seen: list = []
+    attempt = evals.run_attempt(SANDBOX_CASE, agent_factory=scripted(
+        [[call("run_command", command="git commit -q -am Save"), text("Committed.")]], seen))
+    assert tool_results(seen[0]["agent"])[0].startswith("exit code: 0")
+    assert attempt["commands_requested"] == [
+        {"step": 1, "command": "git commit -q -am Save", "ran": True}]
+    assert attempt["passed"], attempt
+
+
+@needs_git
+@needs_sandbox
+def test_sandbox_case_declines_and_fails_a_forbidden_command() -> None:
+    seen: list = []
+    attempt = evals.run_attempt(SANDBOX_CASE, agent_factory=scripted(
+        [[call("run_command", command="git commit -q -am Save"),
+          call("run_command", command="git push origin main"), text("Committed and pushed.")]],
+        seen))
+    assert tool_results(seen[0]["agent"])[1].startswith("User declined")
+    assert [r["ran"] for r in attempt["commands_requested"]] == [True, False]
+    assert not attempt["passed"]
+    assert attempt["detail"].startswith("requested forbidden command 'git push origin main'")

@@ -67,6 +67,8 @@ def make_app(project: Path, agent: CodingAgent, tmp: Path, **options: Any) -> Ve
     # Most tests were written against the classic layout; the app's own default is workbench
     # (tests/test_tui_view.py covers that).
     options.setdefault("layout", "classic")
+    # ... and each layout's own palette; the terminal theme (the default) has test_tui_chat.py
+    options.setdefault("theme", "layout")
     options.setdefault("memory_probe", lambda: 5.1 * 1024)
     options.setdefault("total_memory_gb", 16.0)
     return VegaApp(project, agent=agent, session_log=SessionLog(tmp / "sessions", project),

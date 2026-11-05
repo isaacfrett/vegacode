@@ -71,11 +71,22 @@ def test_linked_venv_is_not_writable(tmp_path: Path) -> None:
     assert (tmp_path / "node_modules" / "lib.js").read_text() == "ok"
 
 
-def test_clone_is_removed(tmp_path: Path) -> None:
+def test_clone_is_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only this check's own clone: another process's vega-check-* folder may be in the temp dir.
+    made: list[Path] = []
+    mkdtemp = sandbox.tempfile.mkdtemp
+
+    def recording(*args, **kwargs) -> str:
+        path = mkdtemp(*args, **kwargs)
+        made.append(Path(path))
+        return path
+
+    monkeypatch.setattr(sandbox.tempfile, "mkdtemp", recording)
     result = check(tmp_path, "python -c \"import os; print(os.getcwd())\"")
     assert result.startswith("exit code: 0")
-    leftovers = [p for p in Path(sandbox.tempfile.gettempdir()).glob("vega-check-*")]
-    assert not leftovers
+    clones = [path for path in made if path.name.startswith("vega-check-")]
+    assert len(clones) == 1
+    assert not clones[0].exists()
 
 
 @pytest.mark.parametrize("command", [
@@ -191,7 +202,7 @@ def test_run_check_refuses_shell_syntax_that_would_run_nothing(tmp_path: Path) -
     assert isinstance(parse_command("python check.py", tmp_path), list)
 
 
-# -- sandbox_toolchains (broad sample 2026-10-17) ----------------------------------------------------
+# -- toolchains (broad sample 2026-10-17) ----------------------------------------------------------------
 
 def test_toolchain_programs_are_allowed_with_the_same_rules(tmp_path: Path) -> None:
     from vega.sandbox import parse_command
@@ -212,20 +223,10 @@ def test_toolchain_programs_are_allowed_with_the_same_rules(tmp_path: Path) -> N
     assert isinstance(parse_command("javac A.java | tee x", tmp_path), str)  # no shell, as before
 
 
-def test_toolchains_switch_off(tmp_path: Path, monkeypatch) -> None:
-    from vega import features
-    from vega.sandbox import parse_command
-
-    monkeypatch.setenv(features.ENV, "sandbox_toolchains")
-    (tmp_path / "main.js").write_text("console.log(1)\n")
-    assert parse_command("node main.js", tmp_path) == "`node` is only allowed with: --test."
-    assert "only runs test/check programs" in parse_command("javac A.java", tmp_path)
-
-
-def test_go_caches_are_inside_the_clone(tmp_path: Path) -> None:
-    env = sandbox.toolchain_env(tmp_path / ".vega-tmp")
+def test_go_caches_are_in_the_private_temp(tmp_path: Path) -> None:
+    env = sandbox.toolchain_env(tmp_path / "tmp")
     for name in ("GOCACHE", "GOPATH", "GOMODCACHE"):
-        assert env[name].startswith(str(tmp_path / ".vega-tmp")), name
+        assert env[name].startswith(str(tmp_path / "tmp")), name
     assert env["GOPROXY"] == "off" and env["GOTOOLCHAIN"] == "local"
 
 
@@ -264,12 +265,46 @@ def test_clone_with_read_only_dirs_is_removed(tmp_path: Path) -> None:
 
 def test_vega_settings_do_not_reach_the_check(tmp_path: Path,
                                               monkeypatch: pytest.MonkeyPatch) -> None:
-    """An eval's pinned VEGA_SEED must not reach the tests a check runs."""
+    """An eval's pinned VEGA_SEED must not reach the tests a check runs (plain code, no switch)."""
     (tmp_path / "test_env.py").write_text(
         "import os\n\ndef test_env():\n"
         "    assert 'VEGA_SEED' not in os.environ and os.environ['OTHER_SETTING'] == '1'\n")
     monkeypatch.setenv("VEGA_SEED", "7")
     monkeypatch.setenv("OTHER_SETTING", "1")
     assert check(tmp_path, "python -m pytest -q -p no:cacheprovider").startswith("exit code: 0")
-    monkeypatch.setenv("VEGA_FEATURES_OFF", "sandbox_env_scrub")
-    assert check(tmp_path, "python -m pytest -q -p no:cacheprovider").startswith("exit code: 1")
+
+
+def test_core_temp_folder_is_inside_the_clone_and_removed(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """0.3.1's layout: the clone is the workspace itself and TMPDIR its .vega-tmp folder (an extension
+    may put it beside the clone through extensions.check_workspace)."""
+    made: list[Path] = []
+    mkdtemp = sandbox.tempfile.mkdtemp
+
+    def recording(*args, **kwargs) -> str:
+        path = mkdtemp(*args, **kwargs)
+        made.append(Path(path))
+        return path
+
+    monkeypatch.setattr(sandbox.tempfile, "mkdtemp", recording)
+    script = ("import os, tempfile; d = tempfile.mkdtemp(); open(os.path.join(d, 'f'), 'w')"
+              ".write('x'); print('TMP', d); print('CWD', os.getcwd())")
+    result = sandbox.run_check(f'python -c "{script}"', tmp_path)
+    assert result.startswith("exit code: 0"), result
+    assert "TMP ./.vega-tmp/" in result and "CWD ." in result, result
+    workspaces = [path for path in made if path.name.startswith("vega-check-")]
+    assert len(workspaces) == 1 and not workspaces[0].exists()
+
+
+def test_check_workspace_hook_needs_two_separate_folders_inside_the_workspace(tmp_path: Path,
+                                                                           monkeypatch) -> None:
+    from vega import extensions
+
+    for result, ok in (((tmp_path / "a", tmp_path / "b"), True), ((tmp_path / "a", tmp_path / "a"), False),
+                       ((tmp_path / "a", tmp_path / "a" / "t"), False), ((tmp_path.parent, tmp_path / "b"), False),
+                       ("nope", False)):
+        monkeypatch.setattr(extensions, "_impl", lambda name, r=result: (lambda root: r)
+                            if name == "check_workspace" else None)
+        assert (extensions.check_workspace(tmp_path) is not None) is ok, result
+
+

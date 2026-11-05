@@ -1,27 +1,49 @@
-# Vega's model catalogue: local models under 10B parameters that run free on a laptop. Shipped
-# with Vega; read by `vega model list|pull|recommend|watch` and the
-# Models pane. Edit it like models.toml: one [models.NAME] table per model, NAME being the profile
-# name the model gets when it is pulled or queued.
+# Vega's model catalogue: local models that run free on a laptop. Shipped with Vega; read by
+# `vega model list|pull|recommend|watch` and the Models pane. Edit it like models.toml: one
+# [models.NAME] table per model, NAME being the profile name the model gets when it is pulled or
+# queued.
+#
+# Minimum requirements: a 16 GB Apple silicon Mac. A model qualifies when it runs there within the
+# memory budget: its loaded size at its quantization (Ollama /api/ps) is at most 10 GB
+# (model_store.MEMORY_BUDGET_GB; VEGA_MODEL_MEMORY_BUDGET_GB changes it), measured with Vega's
+# harness and HQ running (`vega lab bench model-screen PROFILE`). Until measured, the estimate is
+# ram_gb below. Models over the budget are listed as out of scope, never as comparison targets.
+# Parameter count does not decide: a mixture-of-experts (MoE) model needs memory for its TOTAL
+# parameters (every expert is loaded) and runs at the speed of its ACTIVE parameters.
 #
 # Fields
-#   tag          the Ollama model to pull (`ollama pull <tag>`)
+#   label        display name (first-run setup and lists)
+#   tag          the Ollama model to pull (`ollama pull <tag>`; hf.co/... pulls a Hugging Face GGUF)
 #   family       library family, for `vega model watch --online`
-#   params_b     parameters, billions (Vega uses models under 10B only)
+#   params_b     total parameters, billions
+#   active_params_b  MoE: parameters used per token, billions (speed follows these)
+#   architecture dense (default), moe, hybrid (recurrent/conv + attention) or hybrid-moe
+#   quant        quantization of the download (Q4_K_M, MXFP4, ...)
 #   download_gb  approximate download / disk size in GB (10^9 bytes). Measured on this machine
 #                where `size_source = "measured"`, otherwise the Ollama library listing.
 #                `vega model pull` asks the registry for the exact size before downloading.
 #   ram_gb       RAM the fit rule says it needs: download_gb x 1.25 + 2 GB (weights, an 8K
-#                context cache and runtime). Fits: <= 60% of total RAM; tight: <= 85%.
+#                context cache and runtime). Fits: <= 60% of total RAM; tight: <= 85%. Also the
+#                memory-budget estimate until loaded_gb is measured.
+#   loaded_gb    measured loaded size (/api/ps) on the minimum-requirements machine; decides the
+#                memory budget when present
+#   tool_calling Ollama tool calling: yes / no / unverified (the screen's probe measures it)
+#   status       shown with the entry, e.g. "not screened" or "out of scope: over the budget"
+#   verified     which fields were checked, where and when; every other field is unverified
 #   licence      the weights' licence (all free to run locally; read the terms for commercial use)
 #   default      the model Vega ships with (one entry); fallback: the next choice
-#   num_ctx / request / features_on / temperature   profile settings when Vega adds it
+#   num_ctx / request / features_on / features_off / temperature   profile settings when Vega adds it
+#   renderer / parser  Ollama's built-in prompt renderer and reply parser for the profile's Modelfile
+#                (RENDERER / PARSER): a Hugging Face GGUF whose hf.co template has no tool format gets
+#                the same wiring as the family's library build. Library models keep their own (FROM).
 #
 # Eval scores are not kept here: model_store merges them from a separate scores file when one
 # exists (model_store.SCORES_FILE). Without it the catalogue lists models with no scores.
 
-updated = "2026-10-16"
+updated = "2026-11-04"
 
 [models.granite-8b]
+label = "Granite 8B"
 tag = "granite4.1:8b"
 family = "granite"
 params_b = 8.8
@@ -34,6 +56,7 @@ num_ctx = 8192
 notes = "Shipped default since 2026-10-15."
 
 [models.coder-7b]
+label = "Qwen2.5-Coder 7B"
 tag = "qwen2.5-coder:7b-instruct-q4_K_M"
 family = "qwen"
 params_b = 7.6
@@ -48,6 +71,7 @@ features_on = ["constrained"]
 notes = "Default until 2026-10-15, now the fallback; ~5 GB loaded (measured)."
 
 [models.qwen3-8b-nothink]
+label = "Qwen3 8B (thinking off)"
 tag = "qwen3:8b"
 family = "qwen"
 params_b = 8.2
@@ -60,6 +84,7 @@ request = { reasoning_effort = "none" }
 notes = "Thinking off. With thinking on it spent 2,048 tokens per reply on hidden reasoning (unusable here)."
 
 [models.granite-micro]
+label = "Granite Micro 3B"
 tag = "granite4:micro"
 family = "granite"
 params_b = 3.4
@@ -71,6 +96,7 @@ num_ctx = 8192
 notes = "Small Granite for 8 GB machines."
 
 [models.llama31-8b]
+label = "Llama 3.1 8B"
 tag = "llama3.1:8b"
 family = "llama"
 params_b = 8.0
@@ -81,6 +107,7 @@ licence = "Llama 3.1 Community License"
 num_ctx = 8192
 
 [models.gemma3-4b]
+label = "Gemma 3 4B"
 tag = "gemma3:4b"
 family = "gemma"
 params_b = 4.3
@@ -91,6 +118,7 @@ licence = "Gemma Terms of Use"
 num_ctx = 8192
 
 [models.phi4-mini]
+label = "Phi-4-mini 3.8B"
 tag = "phi4-mini:3.8b"
 family = "phi"
 params_b = 3.8
@@ -101,6 +129,7 @@ licence = "MIT"
 num_ctx = 8192
 
 [models.mistral-7b]
+label = "Mistral 7B"
 tag = "mistral:7b"
 family = "mistral"
 params_b = 7.2
@@ -112,6 +141,7 @@ num_ctx = 8192
 notes = "Older (2023-24) general model; a baseline rather than a candidate."
 
 [models.deepseek-coder-6b]
+label = "DeepSeek-Coder 6.7B"
 tag = "deepseek-coder:6.7b"
 family = "deepseek-coder"
 params_b = 6.7
@@ -121,3 +151,115 @@ ram_gb = 6.8
 licence = "DeepSeek License"
 num_ctx = 8192
 notes = "Older (2023) code model; a baseline rather than a candidate."
+
+# --- Mixture-of-experts candidates (added 2026-10-28) ------------------------------------------
+# Checked 2026-10-28 against registry.ollama.ai manifests, model configs, templates and licence
+# blobs, and the Hugging Face model API (exact GGUF sizes). `verified` says which fields; the rest
+# (mainly active parameters) come from the model names / vendors' cards and are unverified.
+
+[models.granite-tiny-h]
+label = "Granite 4 H-Tiny 7B-A1B"
+tag = "granite4:tiny-h"
+family = "granite"
+params_b = 6.9
+active_params_b = 1.0
+architecture = "hybrid-moe"
+quant = "Q4_K_M"
+download_gb = 4.2
+size_source = "measured"
+ram_gb = 7.3
+licence = "Apache-2.0"
+tool_calling = "yes"
+num_ctx = 8192
+status = "not screened"
+verified = "2026-10-28 registry: 4.23 GB, Q4_K_M, 6.9B, family granitehybrid, template has tools, Apache-2.0; local ollama list 4.2 GB. active_params_b unverified (tag alias 7b-a1b-h)."
+notes = "Mamba-2 + attention hybrid MoE (= granite4:7b-a1b-h); already a models.toml profile. Run `vega lab bench cache-check granite-tiny-h` before quality comparisons."
+
+[models.lfm2-8b-a1b]
+label = "LFM2 8B-A1B"
+tag = "hf.co/LiquidAI/LFM2-8B-A1B-GGUF:Q4_K_M"
+family = "lfm2"
+params_b = 8.3
+active_params_b = 1.5
+architecture = "hybrid-moe"
+quant = "Q4_K_M"
+download_gb = 5.0
+size_source = "library"
+ram_gb = 8.3
+licence = "LFM Open License v1.0"
+tool_calling = "unverified"
+num_ctx = 8192
+status = "not screened"
+verified = "2026-10-28 Hugging Face model page: LFM2-8B-A1B-Q4_K_M.gguf 5.04 GB, licence lfm1.0; registry (community copy jrh20001/lfm2-8b-a1b-q4_k_m): 8.3B, family lfm2moe, no template. Not in Ollama's official library (lfm2 there is 24b only). active_params_b and architecture unverified (vendor card)."
+notes = "Pulled from Hugging Face; Ollama's lfm2 renderer/parser is only wired up for library tags, so tool calling must be measured (screen probe)."
+
+[models.olmoe-1b-7b]
+label = "OLMoE 1B-7B (0125 Instruct)"
+tag = "hf.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF:Q4_K_M"
+family = "olmoe"
+params_b = 6.9
+active_params_b = 1.3
+architecture = "moe"
+quant = "Q4_K_M"
+download_gb = 4.2
+size_source = "library"
+ram_gb = 7.3
+licence = "Apache-2.0"
+tool_calling = "unverified"
+num_ctx = 4096
+status = "not screened"
+verified = "2026-10-28 Hugging Face model page: OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf 4.21 GB, base model apache-2.0; registry (community copy lly/olmoe-1b-7b-0125-instruct): 6.9B, family olmoe, template without tools. Not in Ollama's official library. active_params_b unverified (name); context length unverified (4K per the model card)."
+notes = "Open data/weights MoE; likely weak at tool calls (no tool format in its template): the screen's probe decides."
+
+[models.gpt-oss-20b]
+label = "gpt-oss 20B"
+tag = "gpt-oss:20b"
+family = "gpt-oss"
+params_b = 20.9
+active_params_b = 3.6
+architecture = "moe"
+quant = "MXFP4"
+download_gb = 13.8
+size_source = "library"
+ram_gb = 19.2
+licence = "Apache-2.0"
+tool_calling = "yes"
+num_ctx = 8192
+status = "not screened (not planned now); over the memory budget unless measured under"
+verified = "2026-10-28 registry: 13.79 GB, MXFP4, 20.9B, family gpt-oss, template has tools, Apache-2.0. active_params_b unverified (vendor card)."
+
+[models.qwen3-30b-a3b]
+label = "Qwen3 30B-A3B"
+tag = "qwen3:30b-a3b"
+family = "qwen"
+params_b = 30.5
+active_params_b = 3.3
+architecture = "moe"
+quant = "Q4_K_M"
+download_gb = 18.6
+size_source = "library"
+ram_gb = 25.2
+licence = "Apache-2.0"
+tool_calling = "yes"
+num_ctx = 8192
+status = "out of scope: over the memory budget (needs a bigger machine than the minimum)"
+verified = "2026-10-28 registry: 18.56 GB, Q4_K_M, 30.5B, family qwen3moe, template has tools, Apache-2.0. active_params_b unverified (tag name a3b)."
+
+[models.deepseek-v2-lite]
+label = "DeepSeek-V2-Lite 16B"
+tag = "deepseek-v2:16b"
+family = "deepseek-v2"
+params_b = 15.7
+active_params_b = 2.4
+architecture = "moe"
+quant = "Q4_0"
+download_gb = 8.9
+size_source = "library"
+ram_gb = 13.1
+licence = "DeepSeek License"
+tool_calling = "no"
+num_ctx = 8192
+status = "out of scope: over the memory budget (needs a bigger machine than the minimum)"
+verified = "2026-10-28 registry: 8.91 GB, Q4_0, 15.7B, family deepseek2, template without tools, DeepSeek License Agreement. active_params_b unverified (vendor card)."
+
+

@@ -14,13 +14,15 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from . import external, features, models, server
+from . import extensions, external, features, models, server
 from .model_store import WATCH_FAMILIES
 from .resources import Guard
+from . import first_run
 from .transcripts import SessionLog
 from .agent import CodingAgent
 from .autopilot import autopilot_command
-from .evals import MODEL_TEMPERATURE, SCREEN_MIN, compare_runs, merge_runs, run_ab, run_evaluations
+from .evals import (MODEL_TEMPERATURE, SCREEN_MIN, compare_runs, install_stop_signal, merge_runs, run_ab,
+                    run_evaluations)
 from .tools import execute, is_project
 from .training import training_app
 from .ui import TerminalRenderer, undo_note
@@ -121,6 +123,24 @@ def _select_model(value: str | None) -> None:
     models.apply_feature_defaults(os.environ["VEGA_MODEL"])  # defaults follow the chosen model
 
 
+def _match_window() -> None:
+    """Before a model run: the server's window must be Vega's (context.match_window). With
+    VEGA_NUM_CTX set to another window, run the model's window alias (vega-granite-8b-16k) when
+    the server has it; otherwise refuse, saying how to build it."""
+    from . import context
+
+    model = server.model_name()
+    check = context.match_window(model)
+    if check.error:
+        console.print(f"[red]{check.error}[/red]", highlight=False)
+        raise typer.Exit(2)
+    if check.model != model:
+        os.environ["VEGA_MODEL"] = check.model
+        models.apply_feature_defaults(check.model)
+        console.print(f"[dim]VEGA_NUM_CTX={check.budget}: running {check.model} (same weights, a "
+                      f"{check.budget:,}-token window).[/dim]", highlight=False)
+
+
 ReviewOption = typer.Option(
     False, "--review", help="Show each file edit as a diff and ask before applying it.",
 )
@@ -167,9 +187,29 @@ def _start_chat(project: Path, *, review: bool, plain: bool, teach: bool = False
         _interactive_session(project, review=review, teach=teach)
         return
     _ensure_server()
+    _match_window()
     from .tui import run_tui  # imported here: Textual is only needed for the full-screen chat
 
     run_tui(project, review=review, undo_depth=UNDO_DEPTH, teach=True if teach else None)
+
+
+def _show_version(value: bool) -> None:
+    if value:
+        from . import version
+
+        console.print(f"vegacode {version()}", highlight=False)
+        raise typer.Exit()
+
+
+# Commands that start work with a model (`vega` alone is None): extensions.before_start runs
+# before them. Everything else (model, server, ...) runs as is.
+START_COMMANDS = {None, "chat", "run", "auto"}
+
+
+def _before_start(command: str | None, model_given: bool) -> None:
+    code = extensions.before_start(command, model_given=model_given)
+    if code:
+        raise typer.Exit(code)
 
 
 @app.callback()
@@ -178,15 +218,23 @@ def main(
     model: str = ModelOption, plain: bool = PlainOption, teach: bool = TeachOption,
     debug: bool = typer.Option(False, "--debug", help="Log every model request, reply and tool "
                                "call live to ~/.vega/debug; watch it with `vega debug watch`."),
+    version: bool = typer.Option(False, "--version", callback=_show_version, is_eager=True,
+                                 help="Print Vega's version and exit."),
 ) -> None:
     """Start an interactive chat when no command is given."""
+    first_run.at_start(ctx, model)  # `vega`, chat, run, auto: Ollama and the model first
     if debug:
         os.environ["VEGA_DEBUG"] = "1"
+    if ctx.invoked_subcommand in START_COMMANDS and not ctx.resilient_parsing:
+        _before_start(ctx.invoked_subcommand, bool(model or os.environ.get("VEGA_MODEL")))
     _select_model(model)
     models.apply_feature_defaults(server.model_name())
     ctx.obj = {"plain": plain, "teach": teach}
     if ctx.invoked_subcommand is None:
         _start_chat(_resolve_project(project), review=review, plain=plain, teach=teach)
+
+
+app.command("setup")(first_run.setup_command)
 
 
 @app.command()
@@ -213,6 +261,7 @@ def run(
     project = _resolve_project(project)
     _select_model(model)
     _ensure_server()
+    _match_window()
     CodingAgent(project, stream=True, on_event=TerminalRenderer(console), review=review,
                 teach=True if teach else None, web_research=True).run(task)
 
@@ -265,8 +314,9 @@ def _set_teach(agent: CodingAgent, argument: str) -> None:
 
 def _interactive_session(project: Path, *, review: bool = False, teach: bool = False) -> None:
     _ensure_server()
+    _match_window()
     agent = CodingAgent(
-        project, stream=True, on_event=TerminalRenderer(console),
+        project, stream=True, on_event=TerminalRenderer(console, hold_questions=True),
         review=review, undo_depth=UNDO_DEPTH, teach=True if teach else None,
         web_research=True,
     )
@@ -293,12 +343,16 @@ def _interactive_session(project: Path, *, review: bool = False, teach: bool = F
 
 
 def _chat_loop(agent: CodingAgent, project: Path, session_log: SessionLog) -> None:
+    reply = ""  # the user's reply to Vega's questions, given through extensions.present_questions
     while True:
-        try:
-            message = console.input("[bold cyan]you> [/bold cyan]").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]Vega session ended.[/dim]")
-            break
+        if reply:
+            message, reply = reply, ""
+        else:
+            try:
+                message = console.input("[bold cyan]you> [/bold cyan]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]Vega session ended.[/dim]")
+                break
         if not message:
             continue
         command, _, argument = message.lower().partition(" ")
@@ -336,6 +390,23 @@ def _chat_loop(agent: CodingAgent, project: Path, session_log: SessionLog) -> No
         answer = agent.run(message)
         session_log.record_turn(message, answer, time.monotonic() - started, list(agent.request_log))
         session_log.save(agent.messages)
+        reply = _questions_reply(agent)
+
+
+def _questions_reply(agent: CodingAgent) -> str:
+    """An answer that asks questions was held back by the renderer: an extension may present the
+    questions and return the user's reply; else the answer is shown as any other."""
+    renderer = agent.on_event
+    held = renderer.take_held() if isinstance(renderer, TerminalRenderer) else None
+    if held is None:
+        return ""
+    text, questions = held
+    reply = extensions.present_questions(console, questions, text=text, agent=agent,
+                                         send=lambda _reply: None)
+    if reply is None:
+        renderer.show_answer(text)
+        return ""
+    return reply.strip()
 
 
 @app.command()
@@ -490,6 +561,9 @@ def evaluate(
         os.environ[external.AGENT_ENV] = agent.strip().lower()
     _ensure_server(model, ab_model)
     _select_model(model)
+    _match_window()  # a VEGA_NUM_CTX the server does not run refuses here, before any case
+    # SIGTERM/SIGINT: the run writes a `stopped` record of its finished cases before it exits
+    restore_signals = install_stop_signal()
     try:
         paired = (ab is not None or ab_on is not None or ab_model is not None
                   or ab_agent is not None)
@@ -508,7 +582,10 @@ def evaluate(
             run_evaluations(repeat=repeat, only=case, suite=suite or "fixes", guard=guard,
                             cooldown=cooldown, screen=screen, screen_min=screen_min)
     finally:
-        if server.unload():
+        restore_signals()
+        # VEGA_EVAL_KEEP_LOADED=1: another eval shares the server at the same time (parallel
+        # serving bench, concurrent A/B arms); unloading here would make it reload the model.
+        if os.environ.get("VEGA_EVAL_KEEP_LOADED") != "1" and server.unload():
             console.print("[dim]Model unloaded from memory.[/dim]")
 
 
@@ -539,6 +616,8 @@ def auto(
 ) -> None:
     """Work toward a goal on a new Git branch, committing each round whose check passes."""
     _select_model(model)
+    _ensure_server()
+    _match_window()
     autopilot_command(goal, _resolve_project(project), branch, max_rounds, check)
 
 
@@ -608,7 +687,7 @@ def model_list(
     for row in store.rows:
         marks = [label for label, on in (("active", row.active), ("default", row.default),
                                          ("shipped", row.shipped_default),
-                                         ("over 10B", row.over_limit)) if on]
+                                         ("over memory budget", row.over_limit)) if on]
         label = row.name + (f" ({', '.join(marks)})" if marks else "")
         style = "bold" if row.active else ""
         size = "—" if row.size_gb is None else \
@@ -627,6 +706,8 @@ def model_list(
               "latest run in evals/runs.jsonl. " if scored else "")
     console.print(f"[dim]RAM: {model_store.FIT_RULE}. {legend}"
                   "On disk: built = vega-<profile> exists. ~ = estimated from the parameter count.[/dim]", highlight=False)
+    console.print(f"[dim]Over memory budget = out of scope: {model_store.BUDGET_RULE}.[/dim]",
+                  highlight=False)
     if notes:
         for row in store.rows:
             if row.note:
@@ -676,7 +757,13 @@ def model_use(profile: str = typer.Argument(..., help="Profile name from models.
 
 
 @model_app.command("build")
-def model_build(profile: str = typer.Argument(..., help="Profile name from models.toml.")) -> None:
+def model_build(
+    profile: str = typer.Argument(..., help="Profile name from models.toml."),
+    num_ctx: int = typer.Option(
+        None, "--num-ctx", min=512,
+        help="Build the profile's window alias instead: the same weights served with this window "
+        "(e.g. 16384 builds vega-<profile>-16k; Vega runs it when VEGA_NUM_CTX=16384)."),
+) -> None:
     """Build vega-<profile> alongside the default, for comparison with --model."""
     try:
         chosen = models.get(profile)
@@ -684,12 +771,63 @@ def model_build(profile: str = typer.Argument(..., help="Profile name from model
             console.print(f"Nothing to build: {profile!r} runs on {chosen.endpoint}. Use it with "
                           f"--model {profile}.", highlight=False)
             return
-        code = models.build(chosen, models.ollama_name(profile))
+        if num_ctx is not None:
+            target, code = models.build_window_alias(profile, num_ctx)
+        else:
+            target, code = models.ollama_name(profile), models.build(chosen, models.ollama_name(profile))
     except (ValueError, RuntimeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if code:
         raise typer.Exit(code)
-    console.print(f"[green]Built {models.ollama_name(profile)}; use it with --model {profile}.[/green]")
+    if num_ctx is not None and target != models.ollama_name(profile):
+        console.print(f"[green]Built {target} ({num_ctx:,}-token window); Vega runs it when "
+                      f"VEGA_NUM_CTX={num_ctx}.[/green]", highlight=False)
+        return
+    console.print(f"[green]Built {target}; use it with --model {profile}.[/green]")
+
+
+@model_app.command("fit-window")
+def model_fit_window(
+    num_ctx: int = typer.Option(
+        None, "--num-ctx", min=512, help="The window to serve (default: VEGA_NUM_CTX)."),
+) -> None:
+    """Make the server run the current model (`vega`, or --model) with Vega's window: builds the
+    window alias (e.g. vega-granite-8b-16k, same weights) when the model's own num_ctx differs.
+    Nothing to do when they already match. Night A/B items that set VEGA_NUM_CTX run this first."""
+    from . import context
+
+    window = num_ctx or int(os.environ.get("VEGA_NUM_CTX", "0") or 0)
+    if window <= 0:
+        raise typer.BadParameter("Give --num-ctx or set VEGA_NUM_CTX.")
+    model = server.model_name()
+    if not models.uses_ollama(model):
+        console.print(f"Nothing to build: {model!r} runs on its own server; set its window there.",
+                      highlight=False)
+        return
+    _ensure_server(model)
+    served = server.context_length(model)
+    if served == window:
+        console.print(f"{model} already runs with a {window:,}-token window.", highlight=False)
+        return
+    alias = models.window_alias(model, window)
+    profile = models.window_profile_name(model)
+    if alias is None or profile is None:
+        raise typer.BadParameter(f"{model!r} is not built from a models.toml profile; create an Ollama "
+                                 f"model from it with `PARAMETER num_ctx {window}` instead.")
+    if server.context_length(alias) != window:
+        try:
+            alias, code = models.build_window_alias(profile, window)
+        except (ValueError, RuntimeError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if code:
+            raise typer.Exit(code)
+    os.environ["VEGA_NUM_CTX"] = str(window)
+    check = context.match_window(model)
+    if check.error:
+        console.print(f"[red]{check.error}[/red]", highlight=False)
+        raise typer.Exit(2)
+    console.print(f"[green]{check.model} serves {model}'s weights with a {window:,}-token window.[/green]",
+                  highlight=False)
 
 
 RequestFieldOption = typer.Option(
@@ -807,6 +945,9 @@ def model_pull(
     size_gb: float = typer.Option(None, "--size-gb", help="Download size when the registry and "
                                   "the catalogue do not know it."),
     build: bool = typer.Option(True, "--build/--no-build", help="Build vega-<profile> after."),
+    measure: bool = typer.Option(False, "--measure", help="Download a model the estimate puts "
+                                 "over the memory budget anyway, to measure its real loaded size "
+                                 "(vega lab bench model-screen)."),
 ) -> None:
     """Download a model through Ollama, then build vega-<profile>. Shows the size and free disk
     first and refuses when less than 12 GB would stay free (VEGA_GUARD_MIN_DISK_GB)."""
@@ -817,7 +958,7 @@ def model_pull(
     _ensure_ollama()
     try:
         plan = model_store.plan_pull(
-            target, size_lookup=(lambda _tag: size_gb) if size_gb else None)
+            target, size_lookup=(lambda _tag: size_gb) if size_gb else None, measure=measure)
     except (ValueError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if plan.already:
@@ -943,7 +1084,8 @@ QueueOption = typer.Option(None, "--queue", help="Queue the standard comparison 
 @model_app.command("watch")
 def model_watch(
     online: bool = typer.Option(False, "--online", help="Also ask ollama.com's library for new "
-                                "tags of: " + ", ".join(WATCH_FAMILIES) + " (under 10B)."),
+                                "tags of: " + ", ".join(WATCH_FAMILIES) + " (within the memory budget, or of "
+                                "unknown size)."),
     queue: list[str] = QueueOption,
 ) -> None:
     """New models to try. Offline by default: catalogue models without a profile and models in
@@ -958,12 +1100,14 @@ def model_watch(
     if not candidates:
         console.print("No candidates: every catalogue and installed model has a profile.")
     table = Table(title="Candidates", title_justify="left")
-    columns = ("Model", "From", "Params", "Size", *(("New",) if online else ()), "Profile name")
+    columns = ("Model", "From", "Params", "Size", "Loaded vs budget", *(("New",) if online else ()),
+               "Profile name")
     for column in columns:
         table.add_column(column, no_wrap=True)
     for item in candidates:
         cells = [item.tag, item.source, "—" if item.params_b is None else f"{item.params_b:g}B",
-                 "—" if item.size_gb is None else f"{item.size_gb:.1f} GB"]
+                 "—" if item.size_gb is None else f"{item.size_gb:.1f} GB",
+                 _budget_cell(item.budget)]
         if online:
             cells.append("new since the last check" if item.new and item.source == "online"
                          else "")
@@ -976,6 +1120,13 @@ def model_watch(
         console.print(f"[yellow]{error}[/yellow]", highlight=False)
     for target in queue or []:
         _queue(target)
+
+
+def _budget_cell(budget) -> str:  # budget: model_store.Budget
+    if budget.state == "unknown":
+        return "size unknown, measure first"
+    mark = "" if budget.measured else "~"
+    return f"{mark}{budget.loaded_gb:.1f} GB {'ok' if budget.state == 'within' else 'over'}"
 
 
 @model_app.command("queue")
@@ -1015,6 +1166,59 @@ def models_command(
 ) -> None:
     """Same as `vega model list`."""
     model_list(notes=notes)
+
+
+def _tty() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _ask_text(question: str) -> str:
+    try:
+        return input(question)
+    except EOFError:
+        return ""
+
+
+@app.command("update")
+def update_command(
+    check: bool = typer.Option(False, "--check", help="Only report whether PyPI has a newer "
+                               "vegacode; change nothing."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Update without asking."),
+) -> None:
+    """Update Vega from PyPI with the installer it came from (pip, pipx, uv or the launcher's
+    environment), then check the new `vega --version`."""
+    from . import lifecycle
+
+    code = lifecycle.update(lifecycle.Host.current(), check=check, yes=yes,
+                            ask=lambda q, d: typer.confirm(q, default=d), interactive=_tty(),
+                            say=typer.echo)
+    raise typer.Exit(code)
+
+
+@app.command("uninstall")
+def uninstall_command(
+    dry_run: bool = typer.Option(False, "--dry-run", help="List what would be removed, with "
+                                 "sizes; change nothing."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Take each group's default without "
+                             "asking: remove Vega, its PATH line and LaunchAgents; keep your data "
+                             "and Ollama models."),
+    remove_data: bool = typer.Option(False, "--remove-data", help="Also remove your Vega data "
+                                     "(~/.vega or VEGA_HOME)."),
+    remove_models: bool = typer.Option(False, "--remove-models", help="Also remove the Ollama "
+                                       "models Vega pulled or built (never Ollama itself)."),
+) -> None:
+    """Remove Vega: the package or its environment, the PATH line it added, its LaunchAgents and,
+    only if you say so, your data and its Ollama models. Ollama, Python and Homebrew stay."""
+    from . import lifecycle
+
+    code = lifecycle.uninstall(
+        lifecycle.Host.current(), dry_run=dry_run, yes=yes, remove_data=remove_data,
+        remove_models=remove_models, ask=lambda q, d: typer.confirm(q, default=d),
+        ask_text=_ask_text, interactive=_tty(), say=typer.echo)
+    raise typer.Exit(code)
 
 
 @app.command("features")
@@ -1153,7 +1357,7 @@ def lab_run(
 
 
 @lab_app.command("report")
-def lab_report() -> None:
+def labreport() -> None:
     """Write docs/scoreboard.md from the recorded runs."""
     from . import lab
 
@@ -1604,3 +1808,7 @@ def loops_run(
         _print_findings(report.filed, show_loop=False)
     if report.error:
         raise typer.Exit(1)
+
+
+# Commands an installed extension adds (vega.extensions); none without one.
+extensions.cli_commands(app)

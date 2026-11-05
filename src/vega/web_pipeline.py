@@ -43,7 +43,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import css_blocks, debuglog, edits, page_render, sandbox, write_loop
+from . import css_blocks, debuglog, edits, extensions, page_render, sandbox, write_loop
 
 if TYPE_CHECKING:
     from .agent import CodingAgent
@@ -431,6 +431,7 @@ class Snapshot:
 
     errors: dict[str, list[str]] = field(default_factory=dict)
     ids: dict[str, list[str]] = field(default_factory=dict)
+    extra: dict[str, dict[str, Any]] = field(default_factory=dict)  # page -> an extension's measurements
     unsupported: list[str] = field(default_factory=list)
     declarations_checked: bool = False
     motion_off: dict[str, list[dict[str, Any]]] = field(default_factory=dict)  # load + each click
@@ -483,6 +484,9 @@ def _measure_page(renderer: page_render.Renderer, html: str, probes: Probes, sna
         if probes.motion else ""
     page = renderer.page(html, head=motion_head)
     snap.ids[html] = page.eval(IDS_JS)
+    extra = extensions.page_measured(page, html=html)
+    if extra:
+        snap.extra[html] = extra
     if declarations:
         snap.declarations_checked = True
         snap.unsupported += [d for d in page.call(SUPPORTS_JS, declarations)
@@ -524,6 +528,12 @@ def _names(items: list[str]) -> str:
     return ", ".join(shown) + more
 
 
+def page_load_check(name: str) -> bool:
+    """A check compare() makes on every rendered page (new script errors, declarations WebKit
+    drops, ids kept), not one of the probes the task's words switched on."""
+    return name == "declarations" or name.endswith((" script errors", " ids"))
+
+
 def compare(before: Snapshot, after: Snapshot, probes: Probes) -> list[tuple[str, str | None]]:
     """Each rendered check made on `after` (the written files) as (what it checks, its failure
     or None); `before` (the files as they were) for what must not change."""
@@ -541,8 +551,10 @@ def compare(before: Snapshot, after: Snapshot, probes: Probes) -> list[tuple[str
                 "value): " + "; ".join(after.unsupported[:6]) if after.unsupported else None)
     for html, ids in after.ids.items():
         gone = [i for i in before.ids.get(html, []) if i not in ids]
-        verdict(f"{html} ids", f"rendered {html}: element(s) no longer in the page: "
-                + _names(["#" + i for i in gone]) if gone else None)
+        verdict(f"{html} ids", extensions.page_failure(
+            f"{html} ids", f"rendered {html}: element(s) no longer in the page: "
+            + _names(["#" + i for i in gone]), before=before.extra.get(html, {}), gone=gone)
+            if gone else None)
     if probes.motion:
         for html, states in after.motion_on.items():
             clicks = after.clicks.get(html, [])
@@ -750,7 +762,8 @@ def plan(project: Path, task: str, targets: list[str], inputs: list[str], *,
 
 def check_now(project: Path, planned: Plan, *, stop: Any = None) -> write_loop.Checks:
     """Every check on the targets as they are on disk now."""
-    checks = write_loop.Checks()
+    items: list[dict[str, Any]] = []
+    checks = write_loop.Checks(items=items)
     targets = planned.targets
     now = {t: (project / t).read_text(encoding="utf-8") if (project / t).is_file() else None
            for t in targets}
@@ -762,16 +775,22 @@ def check_now(project: Path, planned: Plan, *, stop: Any = None) -> write_loop.C
                 more = len(problems) - STATIC_SHOWN
                 checks.failures.append("\n".join(problems[:STATIC_SHOWN])
                                        + (f"\n... and {more} more" if more > 0 else ""))
+            items.append(write_loop.item("format", f"{target} syntax", not problems,
+                                         checks.failures[-1] if problems else ""))
     modules = module_targets(project, targets, planned.pages)
     if modules:
         checks.kinds["module loads"] = len(modules)
-        checks.failures += module_problems(project, modules)
+        problems = module_problems(project, modules)
+        checks.failures += problems
+        items += write_loop.counted_items("load", "the page's modules", len(modules), problems)
+    tests = set(visible_test_commands(project)) if planned.commands else set()
     for command in planned.commands:
         checks.kinds[f"`{command}`"] = 1
         ok, output = write_loop.command_check(command, project, stop=stop,
                                               timeout=COMMAND_TIMEOUT)
         if not ok:
             checks.failures.append(output)
+        items.append(write_loop.item("command", command, ok, output, tests=command in tests))
     if planned.pages and not planned.before.skipped:
         declarations = [d for t in targets if Path(t).suffix.lower() in CSS and now[t]
                         for d in changed_declarations(planned.originals[t], now[t] or "")]
@@ -782,8 +801,17 @@ def check_now(project: Path, planned: Plan, *, stop: Any = None) -> write_loop.C
         else:
             results = compare(planned.before, after, planned.probes)
             found = [failure for _, failure in results if failure]
-            checks.kinds["rendered checks"] = len(results)
             checks.failures += found
+            # page-load checks (any page) apart from the task's own probes: only the latter
+            # check the behaviour asked for (check_builder's "page" source is not evidence)
+            for source, kind in (("page", "page checks"), ("rendered", "rendered checks")):
+                part = [(name, failure) for name, failure in results
+                        if page_load_check(name) == (source == "page")]
+                if part:
+                    checks.kinds[kind] = len(part)
+                    items += write_loop.counted_items(
+                        source, "the rendered page", len(part),
+                        [failure for _, failure in part if failure])
             debuglog.record("stage", stage="web_pipeline.rendered", checks=len(results),
                             failures=found[:8])
     return checks
@@ -855,6 +883,7 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
 
     config = write_loop.LoopConfig(
         name="web_pipeline", title="Web pipeline", targets=targets, originals=originals,
+        request=task,
         repairs=REPAIRS, produce=produce,
         check=lambda _written: check_now(project, planned, stop=host.stop_flag()),
         no_code="Reply with `File: <path>` and the file in one fenced block for each file you "
@@ -869,7 +898,7 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
     result = write_loop.run_loop(host, config, messages)
     if result is None or result.kept is None:
         return None
-    answer = write_loop.answer_for(result, config, done="Wrote", what="content")
+    answer = write_loop.answer_for(result, config, done="Wrote", what="content", agent=agent)
     if pages and planned.before.skipped:
         answer += f" The page was not rendered ({planned.before.skipped})."
     host.remember(task, answer)

@@ -28,7 +28,7 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import debuglog, edits, sandbox, write_loop
+from . import debuglog, edits, extensions, sandbox, write_loop
 
 if TYPE_CHECKING:
     from .agent import CodingAgent
@@ -152,7 +152,8 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
     debuglog.record("stage", stage="nonpython_pipeline.route", target=target, command=command)
     path = project / target
     original = path.read_text(encoding="utf-8") if path.is_file() else None
-    if not command or (original is not None and len(original) > MAX_FILE_CHARS):
+    max_file = extensions.budget("nonpython_pipeline.MAX_FILE_CHARS", MAX_FILE_CHARS, agent=agent)
+    if not command or (original is not None and len(original) > max_file):
         return None
     host = write_loop.AgentHost(agent)
     suffix = path.suffix.lower()
@@ -187,19 +188,23 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
         return write_loop.Produced({target: write_loop.Write(content)})
 
     def check(written: list[str]) -> write_loop.Checks:
-        checks = write_loop.Checks()
+        items: list[dict[str, Any]] = []
+        checks = write_loop.Checks(items=items)
         if suffix in PARSED:
             checks.kinds["format checks"] = 1
             problem = edits.parse_error(target, path.read_text(encoding="utf-8"))
             if problem is not None:
                 checks.failures.append(f"{target}: {problem.kind} at line {problem.line}: "
                                        f"{problem.message}")
+            items.append(write_loop.item("format", f"{target} parses", problem is None,
+                                         checks.failures[-1] if problem is not None else ""))
         for each in commands:
             checks.kinds[f"`{each}`"] = 1
             ok, output = write_loop.command_check(each, project, stop=host.stop_flag(),
                                                   timeout=COMMAND_TIMEOUT)
             if not ok:
                 checks.failures.append(output)
+            items.append(write_loop.item("command", each, ok, output))
         return checks
 
     config = write_loop.LoopConfig(
@@ -215,6 +220,6 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
     result = write_loop.run_loop(host, config, messages)
     if result is None or result.kept is None:
         return None
-    answer = write_loop.answer_for(result, config, done="Wrote", what="content")
+    answer = write_loop.answer_for(result, config, done="Wrote", what="content", agent=agent)
     host.remember(task, answer)
     return answer

@@ -2,7 +2,7 @@
 
 Ollama silently drops the oldest tokens when a prompt outgrows num_ctx (keeping only a few at the
 start), which loses the system prompt mid-task with no error. This module keeps every request under
-the window instead: before a request whose projected prompt passes COMPACT_AT of the window, older
+the window instead: before a request whose projected prompt passes compact_at() of the window, older
 messages are replaced by one deterministic summary built from the history itself (no model call).
 """
 
@@ -52,6 +52,139 @@ def resolve_num_ctx(model: str) -> tuple[int, str]:
     if discovered and discovered > 0:
         return discovered, "server"
     return DEFAULT_NUM_CTX, "default"
+
+
+def compact_at(num_ctx: int, reply_tokens: int | None = None, projected: int | None = None) -> float:
+    """The share of the window at which history is compacted: COMPACT_AT, unless an extension
+    sets another (extensions.compact_share; `projected`: the prompt about to be measured)."""
+    from . import extensions
+
+    return extensions.compact_share(COMPACT_AT, num_ctx=num_ctx, reply_tokens=reply_tokens,
+                                    projected=projected)
+
+
+# -- the server's window ----------------------------------------------------------------------------
+
+@dataclass
+class WindowCheck:
+    """Vega's budget against the window the server actually runs (match_window)."""
+
+    model: str  # the model to run: the one asked for, or its window alias (vega-granite-8b-16k)
+    budget: int | None  # VEGA_NUM_CTX, when set
+    server: int | None  # the served model's num_ctx (/api/show), None when unknown
+    error: str = ""  # non-empty: the run must not start
+
+
+def match_window(model: str) -> WindowCheck:
+    """Make the server's window match Vega's. Only VEGA_NUM_CTX can make them differ (otherwise
+    the budget is read from the server). When it differs from `model`'s num_ctx, the run uses the
+    window alias of the same weights (models.window_alias) if the server has it; otherwise it must
+    not start: the server would silently cut every prompt past its own window.
+
+    Unknown windows (server unreachable, an endpoint profile, a Modelfile without num_ctx) pass:
+    there is nothing to compare."""
+    raw = os.getenv("VEGA_NUM_CTX", "").strip()
+    try:
+        budget = int(raw) if raw else 0
+    except ValueError:
+        budget = 0
+    if budget <= 0:
+        return WindowCheck(model, None, None)
+    from . import models, server
+
+    if server._endpoint_profile(model) is not None:
+        return WindowCheck(model, budget, None)
+    try:
+        served = server.context_length(model)
+    except Exception:  # noqa: BLE001 - an unreachable server is checked when requests fail
+        served = None
+    if served is None or served == budget:
+        return WindowCheck(model, budget, served)
+    alias = models.window_alias(model, budget)
+    if alias is not None and alias != model:
+        try:
+            alias_window = server.context_length(alias)
+        except Exception:  # noqa: BLE001
+            alias_window = None
+        if alias_window == budget:
+            return WindowCheck(alias, budget, alias_window)
+    profile = models.window_profile_name(model)
+    if alias is not None and profile is not None:
+        fix = (f"build the matching model once (same weights, no download): `vega model fit-window` "
+               f"or `vega model build {profile} --num-ctx {budget}` (creates {alias}); Vega then "
+               f"uses it whenever VEGA_NUM_CTX={budget}")
+    else:
+        fix = (f"create an Ollama model from {model!r} with `PARAMETER num_ctx {budget}` and run it "
+               "with --model")
+    return WindowCheck(model, budget, served, error=(
+        f"VEGA_NUM_CTX={budget} but the server runs {model!r} with num_ctx {served}: "
+        f"prompts past {served:,} tokens would be cut silently (the start of the prompt, with the "
+        f"system prompt and tools, is lost). To fix: {fix}; or unset VEGA_NUM_CTX to use the "
+        "model's own window."))
+
+
+# -- truncation tripwire --------------------------------------------------------------------------
+
+TRUNCATION_MARGIN = 2  # a prompt this close to the window was cut by the server (max seen: 8,191)
+
+
+def truncated(prompt_tokens: int | None, window: int | None) -> bool:
+    """A reply whose prompt_tokens reached window - TRUNCATION_MARGIN: the server dropped part of
+    the prompt (Ollama context shift keeps the first few tokens and the end; no error is sent)."""
+    return bool(prompt_tokens and window and prompt_tokens >= window - TRUNCATION_MARGIN)
+
+
+class TruncationWatch:
+    """Wraps an OpenAI client: every reply whose usage shows a cut prompt (truncated) is logged
+    as a `truncated_prompt` debug stage and reported through on_truncated(prompt_tokens, window).
+    `window` is a callable so the window is discovered lazily (the agent's server window)."""
+
+    def __init__(self, client: Any, window: Any, on_truncated: Any = None):
+        self._client, self._window, self._on = client, window, on_truncated
+        self.chat = type("Chat", (), {})()
+        self.chat.completions = type("Completions", (), {})()
+        self.chat.completions.create = self._create
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    def _check(self, response: Any, kwargs: dict[str, Any]) -> None:
+        prompt = getattr(getattr(response, "usage", None), "prompt_tokens", None)
+        if not isinstance(prompt, int):
+            return
+        try:
+            window = self._window()
+        except Exception:  # noqa: BLE001 - instrumentation never fails a request
+            return
+        if not truncated(prompt, window):
+            return
+        try:
+            from . import debuglog
+
+            debuglog.record("stage", stage="truncated_prompt", prompt_tokens=prompt, window=window,
+                            model=kwargs.get("model"), messages=len(kwargs.get("messages") or []))
+        except Exception:  # noqa: BLE001, S110
+            pass
+        if self._on is not None:
+            self._on(prompt, window)
+
+    def _create(self, **kwargs: Any) -> Any:
+        response = self._client.chat.completions.create(**kwargs)
+        if kwargs.get("stream"):
+            return self._stream(response, kwargs)
+        self._check(response, kwargs)
+        return response
+
+    def _stream(self, chunks: Any, kwargs: dict[str, Any]) -> Any:
+        try:
+            for chunk in chunks:
+                if getattr(chunk, "usage", None) is not None:
+                    self._check(chunk, kwargs)
+                yield chunk
+        finally:
+            close = getattr(chunks, "close", None)
+            if callable(close):
+                close()
 
 
 # -- measuring ------------------------------------------------------------------------------------
@@ -111,7 +244,8 @@ class Budget:
         return int((estimate_tokens(messages) + self.fixed_tokens + extra_tokens) * self.scale)
 
     def over(self, messages: Messages, extra_tokens: int = 0) -> bool:
-        return self.projected(messages, extra_tokens) > COMPACT_AT * self.num_ctx
+        projected = self.projected(messages, extra_tokens)
+        return projected > compact_at(self.num_ctx, projected=projected) * self.num_ctx
 
 
 # -- capping tool results -------------------------------------------------------------------------
@@ -325,6 +459,7 @@ def compact(
     scale: float = 1.0,
     ledger: list[str] | None = None,
     pinned: str = "",
+    keep_tokens: int | None = None,
 ) -> Compaction | None:
     """Rewrite messages as [system, summary, goal, recent...]; None when nothing can be dropped.
 
@@ -332,12 +467,14 @@ def compact(
     turn. Everything between them (earlier turns, earlier summaries) and the oldest exchanges of the
     current turn are folded into `log` and rendered as one summary message. The newest exchanges
     are kept verbatim within KEEP_RECENT of the window, or less when the fixed parts are large, so
-    the compacted prompt stays HEADROOM below the COMPACT_AT trigger. They are kept as whole units,
+    the compacted prompt stays HEADROOM below the compact_at() trigger. They are kept as whole units,
     so a tool call is never separated from its results, and the newest unit is always kept.
     extra_tokens counts text sent with every request outside the message list (tool specs, plan);
     scale converts estimates to the server's measured token counts (Budget.scale).
     pinned (pin_editing_target): the current text of the definitions being edited this turn,
     appended to the summary as it is (not trimmed with the summary; its size counts as fixed).
+    keep_tokens: at most this many tokens of recent history are kept (lab grow_context: a grown
+    window keeps the starting window's share, so its larger window becomes headroom).
     """
     system, goal = messages[0], messages[goal_index]
     earlier = [m for m in messages[1:goal_index] if not _is_summary(m)]
@@ -345,8 +482,10 @@ def compact(
     summary_chars = int(num_ctx * SUMMARY_SHARE * CHARS_PER_TOKEN)
     fixed = estimate_tokens([system, goal]) + extra_tokens + int(summary_chars / CHARS_PER_TOKEN) \
         + int(len(pinned) / CHARS_PER_TOKEN)
-    room = int((COMPACT_AT - HEADROOM) * num_ctx) - int(fixed * scale)
+    room = int((compact_at(num_ctx) - HEADROOM) * num_ctx) - int(fixed * scale)
     keep_budget = max(0, min(int(KEEP_RECENT * num_ctx), room))
+    if keep_tokens is not None:
+        keep_budget = min(keep_budget, max(0, keep_tokens))
     kept: list[Messages] = []
     used = 0
     for unit in reversed(units):

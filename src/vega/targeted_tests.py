@@ -180,7 +180,10 @@ def run_check_hint(command: str, project: Path, timeout: float) -> str:
         count = len(test_files(project))
     except OSError:
         return ""
-    return (f" This is run_check's time limit, not a test failure: this project has {count} test "
+    hint = (f" This is run_check's time limit, not a test failure: this project has {count} test "
             f"files and its whole suite does not finish in {int(timeout)}s. Run the test files "
             f"for what you changed instead (`{command} tests/test_<module>.py ...`); Vega runs "
             "the whole suite itself at finish with a longer limit.")
+    from . import extensions
+
+    return extensions.timeout_hint(hint, command=command, project=project, timeout=timeout)

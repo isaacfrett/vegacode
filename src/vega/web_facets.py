@@ -223,6 +223,7 @@ def _at_least_as_new(hit: Hit, base: list[Hit], option: str = "") -> bool:
     "widget 3.10 released" blog post beat a forum thread titled with another package's 2.6), and
     never a page dated before the newest page of the option already read or picked."""
     if option and features.on("facet_same_option"):
+        features.mark_acted("facet_same_option")  # the option's own versions and dates decide
         dates = [page.known_date for page in base if page.known_date]
         if hit.known_date and dates and hit.known_date < max(dates):
             return False

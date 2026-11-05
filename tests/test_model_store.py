@@ -155,7 +155,9 @@ def test_shipped_catalogue_parses_with_one_default_and_no_scores(no_scores: None
     assert catalog["coder-7b"].fallback
     assert catalog["qwen3-8b-nothink"].request == {"reasoning_effort": "none"}
     for entry in catalog.values():
-        assert entry.params_b < 10
+        assert entry.architecture in model_store.ARCHITECTURES and entry.tool_calling in model_store.TOOL_CALLING
+        if entry.budget.over:  # listed only as out of scope, with a status saying so
+            assert entry.status, entry.name
         assert abs(entry.ram_gb - model_store.ram_needed_gb(entry.download_gb)) < 0.06, entry.name
         assert entry.licence
         assert not entry.scores and not entry.measured_on, entry.name
@@ -195,15 +197,19 @@ def test_real_scores_file_is_dated_and_sourced() -> None:
             assert all(score.commit and score.experiment for score in entry.scores.values())
 
 
-def test_catalogue_rejects_big_models_and_two_defaults(tmp_path: Path) -> None:
-    entry = ('[models.{n}]\ntag = "x:{p}b"\nfamily = "x"\nparams_b = {p}\ndownload_gb = 1.0\n'
+def test_catalogue_rejects_an_over_budget_default_and_two_defaults(tmp_path: Path) -> None:
+    entry = ('[models.{n}]\ntag = "x:{p}b"\nfamily = "x"\nparams_b = {p}\ndownload_gb = {g}\n'
              'ram_gb = 3.25\nlicence = "MIT"\n{d}\n')
     path = tmp_path / "c.toml"
-    path.write_text(entry.format(n="a", p=14, d="default = true"))
-    with pytest.raises(ValueError, match="under 10B"):
+    path.write_text(entry.format(n="a", p=14, g=9.0, d="default = true"))
+    with pytest.raises(ValueError, match="over the 10 GB budget"):
         model_store.load_catalog(path)
-    path.write_text(entry.format(n="a", p=3, d="default = true")
-                    + entry.format(n="b", p=4, d="default = true"))
+    # over 10B parameters but within the memory budget (an MoE at 4 bits): allowed now
+    path.write_text(entry.format(n="a", p=3, g=1.0, d="default = true")
+                    + entry.format(n="moe", p=16, g=5.0, d=""))
+    assert not model_store.load_catalog(path)["moe"].budget.over
+    path.write_text(entry.format(n="a", p=3, g=1.0, d="default = true")
+                    + entry.format(n="b", p=4, g=1.0, d="default = true"))
     with pytest.raises(ValueError, match="exactly one"):
         model_store.load_catalog(path)
 
@@ -294,7 +300,7 @@ def test_pull_refused_when_free_disk_would_drop_below_12_gb(fake: FakeOllama, mo
 
 
 def test_pull_refuses_big_and_unknown_size_models(fake: FakeOllama) -> None:
-    assert "under 10B" in model_store.plan_pull("qwen2.5-coder:14b").refusal
+    assert "over the 10 GB budget" in model_store.plan_pull("qwen2.5-coder:14b").refusal
     plan = model_store.plan_pull("newthing:3b")
     assert "unknown" in plan.refusal and plan.profile is None
     sized = model_store.plan_pull("newthing:3b", size_lookup=lambda tag: 2.0)
@@ -314,6 +320,33 @@ def test_pull_streams_progress_adds_catalogue_profile_and_builds(fake: FakeOllam
     assert model_store.finish_pull(plan) == "vega-phi4-mini"
     assert fake.built == ["vega-phi4-mini"]
     assert models.get("phi4-mini").base == "phi4-mini:3.8b"
+
+
+def test_catalogue_profile_carries_wiring_switches_and_request(fake: FakeOllama) -> None:
+    entry = model_store.CatalogEntry(
+        name="hf-model", tag="hf.co/org/repo:Q4_K_M", family="gemma", params_b=7.5, download_gb=6.2,
+        ram_gb=9.75, licence="Apache-2.0", notes="A GGUF.", request={"reasoning_effort": "none"},
+        features_off=["plan"], renderer="lfm2", parser="lfm2", temperature=0.5)
+    profile = model_store.add_catalog_profile(entry)
+    assert (profile.base, profile.features_off, profile.request) == (
+        "hf.co/org/repo:Q4_K_M", ["plan"], {"reasoning_effort": "none"})
+    assert (profile.renderer, profile.parser, profile.parameters) == ("lfm2", "lfm2", {"temperature": 0.5})
+    assert "RENDERER lfm2\nPARSER lfm2\n" in profile.modelfile()
+
+
+def test_shipped_catalogue_and_profiles_agree() -> None:
+    """A model both in the catalogue and in the repo's models.toml is the same model with the same
+    wiring and request fields there, and the switches the catalogue turns off stay off in the profile
+    (a catalogue pull adds the profile from the entry; a night arm reads models.toml)."""
+    catalog = model_store.load_catalog(scores_path=Path("/nonexistent/scores.toml"))
+    profiles = tomllib.loads(models.CHECKOUT_PROFILES_FILE.read_text(encoding="utf-8"))["profiles"]
+    shared = [name for name in catalog if name in profiles]
+    for name in shared:
+        entry, raw = catalog[name], profiles[name]
+        assert raw["base"] == entry.tag, name
+        assert (raw.get("renderer", ""), raw.get("parser", "")) == (entry.renderer, entry.parser), name
+        assert raw.get("request", {}) == entry.request, name
+        assert set(entry.features_off) <= set(raw.get("features_off", [])), name
 
 
 def test_pull_command_confirms_and_reports_errors(fake: FakeOllama) -> None:
@@ -461,10 +494,14 @@ def test_watch_online_is_mocked_and_marks_new_tags(fake: FakeOllama) -> None:
 
     found, errors = model_store.watch_online(("granite",), fetch=fetch)
     assert errors == []
-    assert [(c.tag, c.new) for c in found] == [("granite4.1:3b", True), ("granite5:8b", True)]
+    # granite5:20b: ~12.4 GB at 4 bits -> ~17.5 GB loaded, over the budget (dropped); granite5:latest
+    # names no size and the page shows none: listed, "size unknown, measure first"
+    assert [(c.tag, c.new) for c in found] == [("granite4.1:3b", True), ("granite5:8b", True),
+                                               ("granite5:latest", True)]
+    assert found[2].note == "size unknown, measure first" and found[2].budget.state == "unknown"
     assert fetched[0] == "https://ollama.com/search?q=granite"
     again, _ = model_store.watch_online(("granite",), fetch=fetch)
-    assert [c.new for c in again] == [False, False]
+    assert [c.new for c in again] == [False, False, False]
 
     def broken(url: str) -> str:
         raise OSError("offline")
@@ -487,7 +524,7 @@ def test_queue_writes_the_standard_comparison_once(fake: FakeOllama) -> None:
     assert models.get("smollm2-1-7b").base == "smollm2:1.7b"
     with pytest.raises(ValueError, match="current default"):
         model_store.queue_comparison("granite-8b")
-    with pytest.raises(ValueError, match="under 10B"):
+    with pytest.raises(ValueError, match="minimum-requirements machine"):
         model_store.queue_comparison("qwen2.5-coder:14b")
     tomllib.loads(fake.experiments.read_text())
     assert fake.calls("POST", "/api/pull") == []  # queueing downloads and runs nothing
@@ -510,3 +547,97 @@ def test_watch_command_online_flag_uses_the_library_check(fake: FakeOllama, monk
     assert calls == [True] and "granite5:8b" in result.output and "new since" in result.output
     assert "fixes-model-granite5-8b" in result.output
     assert models.get("granite5-8b").base == "granite5:8b"
+
+
+# --- The memory budget (owner, 2026-10-28: replaces "under 10B parameters") -------------------
+
+def test_budget_check_measured_beats_estimate_and_unknown_is_kept(monkeypatch) -> None:
+    monkeypatch.delenv("VEGA_MODEL_MEMORY_BUDGET_GB", raising=False)
+    assert model_store.memory_budget_gb() == model_store.MEMORY_BUDGET_GB == 10.0
+    est = model_store.budget_check(5.3)  # 5.3 x 1.25 + 2 = 8.6 GB
+    assert est.state == "within" and not est.measured and abs(est.loaded_gb - 8.625) < 1e-9
+    assert model_store.budget_check(13.8).over  # gpt-oss-20b: ~19.2 GB estimated
+    # a measured loaded size decides, either way
+    assert model_store.budget_check(13.8, loaded_gb=9.8).state == "within"
+    measured_over = model_store.budget_check(4.0, loaded_gb=10.4)
+    assert measured_over.over and measured_over.measured and "measured" in measured_over.text
+    # no size: the total parameter count at 4 bits; nothing at all: unknown, never "over"
+    assert model_store.budget_check(params_b=30.0).over
+    assert not model_store.budget_check(params_b=7.0).over
+    unknown = model_store.budget_check()
+    assert unknown.state == "unknown" and not unknown.over
+    assert unknown.text == "size unknown, measure first"
+
+
+def test_budget_is_configurable(monkeypatch) -> None:
+    monkeypatch.setenv("VEGA_MODEL_MEMORY_BUDGET_GB", "20")
+    assert not model_store.budget_check(13.8).over
+    monkeypatch.setenv("VEGA_MODEL_MEMORY_BUDGET_GB", "nonsense")
+    assert model_store.memory_budget_gb() == 10.0
+    monkeypatch.setenv("VEGA_MODEL_MEMORY_BUDGET_GB", "-1")
+    assert model_store.memory_budget_gb() == 10.0
+
+
+def test_moe_catalogue_entries_parse_with_total_and_active_params(no_scores: None) -> None:
+    catalog = model_store.load_catalog()
+    tiny = catalog["granite-tiny-h"]
+    assert tiny.architecture == "hybrid-moe" and tiny.active_params_b and tiny.active_params_b < tiny.params_b
+    assert tiny.tool_calling == "yes" and not tiny.budget.over and tiny.quant == "Q4_K_M"
+    for name in ("lfm2-8b-a1b", "olmoe-1b-7b"):
+        assert not catalog[name].budget.over and catalog[name].tag.startswith("hf.co/")
+    for name in ("gpt-oss-20b", "qwen3-30b-a3b", "deepseek-v2-lite"):
+        entry = catalog[name]
+        assert entry.budget.over and not entry.budget.measured and entry.status, name
+        assert entry.verified.startswith("2026-10-28"), name
+    assert "not screened" in catalog["gpt-oss-20b"].status
+    # out of scope: never recommended, never offered as a candidate
+    rec = model_store.recommend(64.0, catalog=catalog)
+    assert rec is not None
+    picked = {rec.entry.name} | {e.name for e, _ in rec.others}
+    assert not picked & {"gpt-oss-20b", "qwen3-30b-a3b", "deepseek-v2-lite"}
+
+
+def test_catalogue_validates_moe_fields(tmp_path: Path) -> None:
+    base = ('[models.a]\ntag = "x:1b"\nfamily = "x"\nparams_b = 1\ndownload_gb = 1.0\n'
+            'ram_gb = 3.25\nlicence = "MIT"\ndefault = true\n')
+    path = tmp_path / "c.toml"
+    path.write_text(base + 'architecture = "transformer-ish"\n')
+    with pytest.raises(ValueError, match="architecture"):
+        model_store.load_catalog(path)
+    path.write_text(base + 'tool_calling = "maybe"\n')
+    with pytest.raises(ValueError, match="tool_calling"):
+        model_store.load_catalog(path)
+    path.write_text(base + 'loaded_gb = 4.4\nactive_params_b = 0.4\narchitecture = "moe"\n')
+    entry = model_store.load_catalog(path)["a"]
+    assert entry.loaded_gb == 4.4 and entry.budget.measured
+
+
+def test_pull_over_budget_needs_measure_and_inventory_marks_it(fake: FakeOllama) -> None:
+    plan = model_store.plan_pull("deepseek-v2-lite")
+    assert "over the 10 GB budget" in plan.refusal and "--measure" in plan.refusal
+    measured = model_store.plan_pull("deepseek-v2-lite", measure=True)
+    assert measured.refusal == "" and any("only to measure" in w for w in measured.warnings)
+    tiny = model_store.plan_pull("granite-tiny-h")
+    assert tiny.refusal == "" and tiny.budget is not None and tiny.budget.state == "within"
+    rows = {row.name: row for row in model_store.inventory().rows}
+    assert rows["qwen3-30b-a3b"].over_limit and "out of scope" in rows["qwen3-30b-a3b"].note
+    assert not rows["granite-8b"].over_limit
+    assert not rows["lms"].over_limit and rows["lms"].budget.state == "unknown"  # endpoint
+    result = CliRunner().invoke(cli.app, ["model", "pull", "gpt-oss-20b", "--yes"])
+    assert result.exit_code == 1 and "Refused" in result.output
+    assert fake.calls("POST", "/api/pull") == []
+
+
+def test_watch_online_uses_the_published_size(fake: FakeOllama) -> None:
+    page = ('<a href="/library/mixa:16b-a2b">x</a><span>abc • 5.1GB • 32K context</span>'
+            '<a href="/library/mixa:30b-a3b">x</a><span>abc • 18.6GB • 32K context</span>'
+            '<a href="/library/mixa:tiny">x</a><span>abc • 900MB • 8K context</span>')
+    assert model_store.published_size_gb(page, 0) == 5.1
+
+    def fetch(url: str) -> str:
+        return '<a href="/library/mixa">mixa</a>' if "/search?q=" in url else page
+
+    found, errors = model_store.watch_online(("mixa",), fetch=fetch, remember=False)
+    assert errors == []
+    # 16B total parameters but 5.1 GB published: within the budget (parameters do not decide)
+    assert {c.tag: c.size_gb for c in found} == {"mixa:16b-a2b": 5.1, "mixa:tiny": 0.9}
