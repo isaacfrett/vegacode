@@ -14,8 +14,8 @@ acceptance spec:
 Vega then runs those checks in the sandbox (import, names and parameters with inspect.signature,
 one call on the named input, the commands, the tests) plus a static gate on the files changed this
 turn (undefined names F821 and redefinitions F811 that were not there before) and, with
-`acceptance_stubs`, a static check that no task-named function is still a stub. With
-`acceptance_prose_calls`, `name()` in prose is a name, not a zero-parameter signature. The results go to
+`acceptance_stubs`, a static check that no task-named function is still a stub. `name()` in prose
+is a name, not a zero-parameter signature. The results go to
 the model as evidence; the model decides the fix. Vega never edits the code or overrules the answer.
 
 Why (failures seen with Granite 4.1 8B, 2026-10-15/16): many failed attempts were the
@@ -40,7 +40,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import check_feedback, data_preview, debuglog, features, sandbox, targeted_tests
+from . import (
+    check_feedback,
+    data_preview,
+    debuglog,
+    extensions,
+    features,
+    sandbox,
+    targeted_tests,
+)
 from .tools import _project_files
 
 if TYPE_CHECKING:
@@ -113,11 +121,17 @@ class Spec:
     no_commands: bool = False  # the task says "Do not run commands"
     originals: dict[str, str | None] = field(default_factory=dict)  # file -> text before the turn
     suite_timed_out: int = 0  # targeted_tests: the whole suite did not finish in this many s
+    suite_output: str = ""  # targeted_tests: the last whole-suite run's output this turn
 
     @property
     def runs(self) -> bool:
         """Whether Vega's checks may execute code (else static checks only)."""
-        return not self.no_commands or features.on("acceptance_ignores_no_commands")
+        if not self.no_commands:
+            return True
+        if features.on("acceptance_ignores_no_commands"):
+            features.mark_acted("acceptance_ignores_no_commands", where="acceptance")
+            return True
+        return False
 
     def empty(self) -> bool:
         return not (self.names or self.commands or self.tests)
@@ -237,11 +251,11 @@ def _sentence_around(text: str, start: int, end: int) -> tuple[int, int]:
 
 def _prose_call(text: str, definitions: dict[str, list[_Definition]], path: str,
                 attr: str) -> bool:
-    """acceptance_prose_calls: `name()` in prose is how people name a function ("use it in
+    """`name()` in prose is how people name a function ("use it in
     `format_total()`", 2026-10-17: read as a zero-parameter requirement for a function that
     takes `amounts`). It states "no parameters" only as `def name()`, or when the project's
     definition of that name takes no required parameters already (`create_app()`)."""
-    if not features.on("acceptance_prose_calls") or re.match(r"(?:async\s+)?def\s", text):
+    if re.match(r"(?:async\s+)?def\s", text):
         return False
     defs = [d for d in definitions.get(attr, []) if d.path == path]
     if not defs:
@@ -859,7 +873,9 @@ def extract(project: Path, task: str) -> Spec:
     for match in _BACKTICK.finditer(task):
         command = _command(project, match.group(1), task, match.start(), paths)
         if command and _BARE_MODULE.match(command) and features.on("task_module_commands"):
-            command = _full_invocation(project, task, command)
+            bare, command = command, _full_invocation(project, task, command)
+            if command != bare:
+                features.mark_acted("task_module_commands", where="full_invocation")
         if command and command not in spec.commands:
             spec.commands.append(command)
             absent = absent_inputs(project, task, command)
@@ -903,7 +919,7 @@ def fill_with_model(agent: CodingAgent, spec: Spec) -> None:
                                                      agent.sampling.get("max_tokens", 10**6))}
     try:
         reply = agent.client.chat.completions.create(
-            model=agent.model, **sampling,
+            model=extensions.side_model("acceptance", agent=agent), **sampling,
             messages=[{"role": "system", "content": MODEL_SYSTEM},
                       {"role": "user", "content": f"Request: {spec.task}\n\nProject files:\n"
                                                   + "\n".join(files)}],
@@ -959,6 +975,8 @@ def for_turn(agent: CodingAgent, task: str) -> Spec | None:
         debuglog.record("stage", stage="acceptance.extract_failed", error=str(exc)[:200])
         return None
     debuglog.record("stage", stage="acceptance.spec", **spec.summary())
+    if not spec.empty():  # a spec with content steers the pipelines and baseline (conservative mark)
+        features.mark_acted("acceptance", where="spec")
     return spec
 
 
@@ -1017,13 +1035,24 @@ out = []
 
 def not_ours(exc):
     """A ModuleNotFoundError for a module the project does not hold (a third-party package
-    this environment lacks), not a project module that is missing."""
+    this environment lacks), not a project module that is missing. A missing submodule of a
+    package that is installed (`textual.bindings`, `mcp.server.types`) is the code's mistake:
+    the package is here, the module the code names is not (ui/apimcp runs 2026-10-24)."""
     name = getattr(exc, "name", None) if isinstance(exc, ModuleNotFoundError) else None
     if not name:
         return False
     top = name.split(".")[0]
-    return not any(os.path.exists(os.path.join(root, top)) or
-                   os.path.exists(os.path.join(root, top + ".py")) for root in ("src", "."))
+    if any(os.path.exists(os.path.join(root, top)) or
+           os.path.exists(os.path.join(root, top + ".py")) for root in ("src", ".")):
+        return False
+    if name != top:
+        try:
+            import importlib.util
+            if importlib.util.find_spec(top) is not None:
+                return False
+        except (ImportError, ValueError):
+            pass
+    return True
 
 def where(exc):
     frames = [f for f in traceback.extract_tb(exc.__traceback__)
@@ -1267,6 +1296,8 @@ def _run_names(spec: Spec, project: Path, stop: threading.Event | None,
     command = (f"python -c {shlex.quote(CHECK_SCRIPT)} {shlex.quote(json.dumps(payload))} "
                f"{CALL_SECONDS} {int(features.on('acceptance_uninstalled'))}")
     output = sandbox.run_check(command, project, stop=stop, harness=True)
+    if "module not installed" in output and features.on("acceptance_uninstalled"):
+        features.mark_acted("acceptance_uninstalled")
     marker = output.rfind("VEGA-ACCEPTANCE ")
     if marker >= 0:
         try:
@@ -1507,7 +1538,10 @@ def run(spec: Spec, project: Path, changed: list[str], *, stop: threading.Event 
     result = Result()
     result.items += _static_gate(spec, project, changed)
     if features.on("acceptance_stubs"):
-        result.items += _stub_items(spec, project)
+        stubs = _stub_items(spec, project)
+        if stubs:
+            features.mark_acted("acceptance_stubs", n=len(stubs))
+        result.items += stubs
     if not spec.runs:
         result.items += _static_names(spec, project)
         return result
@@ -1533,11 +1567,16 @@ def _targeted_items(spec: Spec, project: Path, changed: list[str],
     longer timeout scaled to its measured time. A whole suite that does not finish is reported
     as slow, not failing, with the targeted result."""
     assert spec.tests
+    items: list[Item] = []
+    first = extensions.targeted_first(spec, project, changed=changed, stop=stop, item=_command_item)
+    if first is not None:  # e.g. the tests of a function the task names, before the related files
+        items += first["items"]
+        if first["stop"]:
+            return items
     files, related = targeted_tests.select(project, changed)
     debuglog.record("stage", stage="acceptance.targeted", files=files, related=related)
     targeted: tuple[float, int] | None = None
     summary = "no test file relates to the files changed this turn"
-    items: list[Item] = []
     if files:
         shown = ", ".join(files[:3]) + (f" +{len(files) - 3} more" if len(files) > 3 else "")
         cap = f", first {len(files)} of {related} related" if related > len(files) else ""
@@ -1549,6 +1588,16 @@ def _targeted_items(spec: Spec, project: Path, changed: list[str],
         if not item.ok or (stop is not None and stop.is_set()):
             return items  # the targeted failure is the evidence; the whole suite can wait
         summary = f"the targeted tests passed ({item.detail or 'exit code 0'})"
+    if first is not None and first["suite"] is not None:  # what stands in for the whole suite
+        items.append(first["suite"])
+        return items
+    rerun = extensions.suite_rerun(spec, project, changed=changed)
+    if rerun:  # e.g. the whole suite ran earlier this turn: only what failed in it, again
+        item = _command_item(rerun, project, stop, "tests")
+        item.label = f"`{rerun}` (what failed in this turn's whole-suite run, run again)"
+        debuglog.record("stage", stage="acceptance.suite_rerun", command=rerun, ok=item.ok)
+        items.append(item)
+        return items
     label = f"`{spec.tests}` (whole suite)"
     timeout = targeted_tests.full_timeout(project, targeted)
     if spec.suite_timed_out and spec.suite_timed_out >= timeout:
@@ -1566,6 +1615,7 @@ def _targeted_items(spec: Spec, project: Path, changed: list[str],
     else:
         if check_feedback.exit_code(item.output) in (0, 1):  # collected and ran (2+: cut short)
             targeted_tests.record_suite(project, time.monotonic() - started)
+            spec.suite_output = item.output
         item.label = label
     debuglog.record("stage", stage="acceptance.full_suite", timeout=timeout, ok=item.ok,
                     timed_out=item.note)
@@ -1587,10 +1637,12 @@ def _command_item(command: str, project: Path, stop: threading.Event | None, kin
         return Item(kind, label, True, check_feedback.totals(output), output)
     if (code == 2 and kind == "command" and _BARE_MODULE.match(command) and "usage:" in output
             and features.on("task_module_commands")):  # a bare name, run without its arguments
+        features.mark_acted("task_module_commands", where="usage")
         return Item(kind, label, True, "runs (shows its usage without arguments)", output)
     if absent and kind == "command" and features.on("command_absent_inputs"):
         name = _reports_absent(output, project, absent)
         if name:  # an example input the project does not have (engineering A/B 2026-10-21)
+            features.mark_acted("command_absent_inputs", name=name)
             return Item(kind, label, True, f"runs (exit code {code}: reports {name} missing, an "
                         "example input the project does not have)", output)
     body = check_feedback.excerpt(output, 900)

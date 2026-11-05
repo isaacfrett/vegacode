@@ -23,8 +23,8 @@ Added 2026-10-20, each behind its own switch: a script and a File: block that gi
 JSON field different words get one repair round (`deliverable_disagreement`); the task's own
 format rules are checked (`format_rules`, format_rules.py); the script runs under
 deliverable_runner.py, which shows the failing line's values (`script_error_values`) and refuses
-host reads (`sandbox_read_guard`); a script under a deliverable's label is the script
-(`deliverable_code_label`).
+host reads (the read guard, plain code since 2026-11-04); a script under a deliverable's label is
+the script (`deliverable_code_label`).
 """
 
 from __future__ import annotations
@@ -35,7 +35,16 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import acceptance, debuglog, features, format_rules, json_template, sandbox, write_loop
+from . import (
+    acceptance,
+    debuglog,
+    extensions,
+    features,
+    format_rules,
+    json_template,
+    sandbox,
+    write_loop,
+)
 from .pipeline import ask_complete, with_context
 from .tools import _project_files
 
@@ -107,21 +116,6 @@ LOOK_NOTE = (
     "most {limit}, real arguments, no shell syntax); Vega runs them in a sandbox and shows you the "
     "output. Otherwise reply with the script or the File: blocks now."
 )
-RUNNER = """
-import json, os, sys
-from pathlib import Path
-targets = json.loads(sys.argv[1])
-for target in targets:  # the deliverables' folders exist before the script runs
-    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-source = Path(sys.argv[2]).read_text(encoding="utf-8")
-path = os.path.abspath({name!r})  # as if it lived in the project root (cwd)
-namespace = {{"__name__": "__main__", "__file__": path}}
-exec(compile(source, path, "exec"), namespace)
-print({marker!r})
-print(json.dumps({{t: Path(t).read_text(encoding="utf-8") for t in targets if Path(t).is_file()}}))
-"""
-
-
 def _fenced(text: str) -> str:
     """`text` in a fence it cannot close early (a file holding ``` gets ````; fence_lines)."""
     mark = write_loop.fence_for(text)
@@ -140,6 +134,8 @@ def targets(project: Path, task: str) -> list[str]:
         new = not (project / path).exists()
         if new or (wide and (project / path).is_file() and asks_update(task, match.start())):
             found.append(path)
+            if not new:
+                features.mark_acted("deliverable_wide", where="targets", path=path)
     return found
 
 
@@ -162,7 +158,7 @@ def named_commands(project: Path, task: str) -> list[str]:
 
 
 def inputs(project: Path, exclude: set[str], current: set[str] | None = None,
-           budget: int | None = None, numbered: bool = False) -> str:
+           budget: int | None = None, numbered: bool = False, whole_chars: int = 0) -> str:
     """Every project file for the prompt (`current`: deliverables that exist, shown as such).
     deliverable_wide: when the whole text is over `budget` characters, files are shown shorter
     (TIGHT tiers) so the prompt and the reply still fit the window; `numbered`: code files get
@@ -181,7 +177,8 @@ def inputs(project: Path, exclude: set[str], current: set[str] | None = None,
                     texts.append((relative, None, path.stat().st_size))
                 except OSError:
                     continue
-    tiers = [(WHOLE_CHARS, HEAD_LINES), *TIGHT] if wide and budget else [(WHOLE_CHARS, HEAD_LINES)]
+    whole_chars = whole_chars or WHOLE_CHARS  # extensions.budget at the call
+    tiers = [(whole_chars, HEAD_LINES), *TIGHT] if wide and budget else [(whole_chars, HEAD_LINES)]
     shown = ""
     for whole, head_lines in tiers:
         parts = []
@@ -219,19 +216,15 @@ def fixture_root(task: str) -> str:
     return match.group(1) if match else ""
 
 
-def _runner_options(fixture: str) -> dict[str, Any] | None:
-    """The runner's options (deliverable_runner.py), or None for the plain RUNNER (both
-    script_error_values and sandbox_read_guard off)."""
-    values, guard = features.on("script_error_values"), features.on("sandbox_read_guard")
-    if not values and not guard:
-        return None
-    return {"name": SCRIPT_NAME, "marker": MARKER, "values": values, "values_frames": VALUE_FRAMES,
-            "values_width": VALUE_WIDTH, "guard": guard, "fixture_root": fixture,
-            "real_home": str(Path.home())}
+def _runner_options(fixture: str) -> dict[str, Any]:
+    """The runner's options (deliverable_runner.py); the read guard is always on."""
+    return {"name": SCRIPT_NAME, "marker": MARKER, "values": features.on("script_error_values"),
+            "values_frames": VALUE_FRAMES, "values_width": VALUE_WIDTH, "guard": True,
+            "fixture_root": fixture, "real_home": str(Path.home())}
 
 
 def _run_script(project: Path, script: str, wanted: list[str],
-                fixture: str = "") -> tuple[dict[str, str], str]:
+                fixture: str = "", task: str = "") -> tuple[dict[str, str], str]:
     """Run the model's script in the sandbox; (files it wrote, error output or ''). It runs from
     the project root as SCRIPT_NAME there (so `Path(__file__).parent` is the project), with the
     deliverables' folders made first and HOME pointing at the sandbox's copy. `fixture`: the
@@ -240,18 +233,18 @@ def _run_script(project: Path, script: str, wanted: list[str],
     folder.mkdir(exist_ok=True)
     (folder / "make.py").write_text(script, encoding="utf-8")
     options = _runner_options(fixture)
-    if options is None:
-        (folder / "run.py").write_text(RUNNER.format(marker=MARKER, name=SCRIPT_NAME),
-                                       encoding="utf-8")
-        extra = ""
-    else:
-        runner = Path(__file__).with_name("deliverable_runner.py").read_text(encoding="utf-8")
-        (folder / "run.py").write_text(runner, encoding="utf-8")
-        extra = " " + shlex.quote(json.dumps(options))
+    more = extensions.deliverable_runner(project, task, source="deliverable_pipeline",
+                                         fixture=fixture)
+    if more:  # an extension's runner options (deliverable_runner.py), e.g. a `root/` path map
+        options = {**options, **more}
+    runner = Path(__file__).with_name("deliverable_runner.py").read_text(encoding="utf-8")
+    (folder / "run.py").write_text(runner, encoding="utf-8")
     command = (f"python {SCRIPT_DIR}/run.py {shlex.quote(json.dumps(wanted))} "
-               f"{SCRIPT_DIR}/make.py{extra}")
+               f"{SCRIPT_DIR}/make.py {shlex.quote(json.dumps(options))}")
     output = sandbox.run_check(command, project, output_limit=OUTPUT_LIMIT, private_home=True)
     if MARKER not in output:
+        if options.get("values"):  # the error shows the script's source and values
+            features.mark_acted("script_error_values")
         return {}, output[-3000:]
     try:
         files = json.loads(output.split(MARKER, 1)[1].strip().splitlines()[0])
@@ -341,6 +334,7 @@ def file_blocks(reply: str, wanted: list[str]) -> tuple[dict[str, str], list[str
     for language, label, body in write_loop.reply_blocks(reply):
         owner = next((p for p in wanted if label and write_loop._label_matches(label, p)), None)
         if owner is not None and code_label and _script_under_label(language, owner, body):
+            features.mark_acted("deliverable_code_label", where="script", path=owner)
             scripts.append(body)  # "Python script to generate `answers/x.json`": a script
         elif owner is not None:
             first, _, rest = body.lstrip("\n").partition("\n")
@@ -448,8 +442,13 @@ class _Producer:
     """Replies → deliverable files, remembering the last script error for the repair feedback."""
 
     def __init__(self, agent: CodingAgent, task: str, wanted: list[str],
-                 originals: dict[str, str]):
+                 originals: dict[str, str], shown: str = ""):
         self.agent, self.task, self.wanted, self.originals = agent, task, wanted, originals
+        self.shown = shown
+        # extensions.deliverable_direct: from round `direct_from` on, a reply with a File: block
+        # for every deliverable is taken as written and its script is not run (0: never)
+        self.direct_from = 0
+        self.direct_written: list[str] = []  # replies whose File: blocks were written that way
         self.last_reply = ""
         self.last_error = ""
         self.script_errors: list[str] = []  # one per round that ended on a script error
@@ -466,20 +465,27 @@ class _Producer:
         direct, scripts = file_blocks(reply, self.wanted)
         files: dict[str, str] = {}
         disagree: list[str] = []
+        if (scripts and self.direct_from and self.rounds >= self.direct_from
+                and all(path in direct for path in self.wanted)):
+            debuglog.record("stage", stage="deliverable_pipeline.direct_blocks", round=self.rounds)
+            scripts = []  # direct writing: the File: blocks are the answer
         if scripts:  # a script is run whenever there is one; File blocks fill only what it left
             script = max(scripts, key=len)
             self.agent._emit("tool_call", name="run_check",
                              args={"command": "python (deliverable script)"})
             files, error = _run_script(self.agent.project, script, self.wanted,
-                                       self.fixture)
+                                       self.fixture, self.task)
             self.agent._emit("tool_result", name="run_check",
                              args={"command": "python (deliverable script)"},
                              result=error or f"wrote {', '.join(files) or 'nothing'}")
             if error:
                 self.script_errors.append(error)
                 self.failed_last = True
-                return write_loop.Produced(problem=self._script_feedback(error, script,
-                                                                         same_reply))
+                feedback = extensions.deliverable_repair(
+                    self._script_feedback(error, script, same_reply), source="deliverable_pipeline",
+                    project=self.agent.project, task=self.task, wanted=self.wanted, error=error,
+                    script=script)
+                return write_loop.Produced(problem=self._go_direct(feedback))
             if features.on("deliverable_disagreement") and not self.disagreement_asked:
                 differ = disagreement({p: t for p, t in files.items() if p in self.wanted},
                                       direct)
@@ -492,13 +498,43 @@ class _Producer:
                 files.setdefault(path, body)
         else:
             files = dict(direct)
+            if self.direct_from and files:
+                self.direct_written.append(reply)  # written directly, after the switch
         files = {path: content for path, content in files.items() if path in self.wanted}
+        files = extensions.deliverable_files(files, source="deliverable_pipeline",
+                                             project=self.agent.project, task=self.task,
+                                             fixture=self.fixture)
         problems = disagree + check(files, self.wanted, self.originals, self.task)
         writes = {path: write_loop.Write(content) for path, content in files.items()}
         if not writes:
             return write_loop.Produced(problem="\n".join(problems or [
                 "Your reply had no script and no `File: <path>` block."]) + RETRY)
         return write_loop.Produced(writes, problems, checked=len(self.wanted))
+
+    def start_direct(self) -> str:
+        """extensions.deliverable_direct before the first request: its note, or ''."""
+        note = extensions.deliverable_direct(self.task, source="deliverable_pipeline", rounds=0,
+                                             script_errors=[], project=self.agent.project,
+                                             wanted=self.wanted, shown=self.shown)
+        if note:
+            self.direct_from = 1
+            debuglog.record("stage", stage="deliverable_pipeline.direct", round=0)
+        return note
+
+    def _go_direct(self, feedback: str) -> str:
+        """After a script error: extensions.deliverable_direct may switch to direct writing."""
+        if self.direct_from:
+            return feedback
+        note = extensions.deliverable_direct(self.task, source="deliverable_pipeline",
+                                             rounds=self.rounds,
+                                             script_errors=list(self.script_errors),
+                                             project=self.agent.project, wanted=self.wanted,
+                                             shown=self.shown)
+        if not note:
+            return feedback
+        self.direct_from = self.rounds + 1
+        debuglog.record("stage", stage="deliverable_pipeline.direct", round=self.rounds)
+        return feedback.removesuffix(RETRY) + "\n\n" + note
 
     def _script_feedback(self, error: str, script: str, same_reply: bool) -> str:
         last_line = next((line.strip() for line in reversed(_error_core(error).splitlines())
@@ -544,7 +580,10 @@ def _same_form(refusal: str) -> str:
         return (f"Reply again with {path}'s own content (not code) in a `File: {path}` block, or "
                 f"with an unlabelled ```python script that writes {path}.")
 
-    return _SAME_FORM.sub(instead, refusal)
+    changed = _SAME_FORM.sub(instead, refusal)
+    if changed != refusal:
+        features.mark_acted("deliverable_code_label", where="same_form")
+    return changed
 
 
 def refusals(project: Path, files: dict[str, str]) -> dict[str, str]:
@@ -572,6 +611,8 @@ def run(agent: CodingAgent, task: str) -> str | None:
     if not wanted:
         return None
     wide = features.on("deliverable_wide")
+    if wide:  # its own system prompt, input budget and named commands
+        features.mark_acted("deliverable_wide", where="pipeline")
     originals: dict[str, str] = {}
     for path in wanted:
         if (project / path).is_file():
@@ -589,24 +630,37 @@ def run(agent: CodingAgent, task: str) -> str | None:
         budget = max(4000, write_loop.window_chars(host.num_ctx, PROMPT_SHARE) - len(task)
                      - PROMPT_OVERHEAD)
     shown = inputs(project, set(wanted) - set(originals), set(originals), budget,
-                   numbered=wide and bool(_LINES.search(task)))
+                   numbered=wide and bool(_LINES.search(task)),
+                   whole_chars=extensions.budget("deliverable_pipeline.WHOLE_CHARS", WHOLE_CHARS,
+                                                 num_ctx=host.num_ctx))
+    produce = _Producer(agent, task, wanted, originals, shown)
+    extra = extensions.deliverable_prompt(project, task, wanted, source="deliverable_pipeline",
+                                          shown=shown, fixture=produce.fixture)
+    direct_note = produce.start_direct()
+    extra += f"\n\n{direct_note}" if direct_note else ""
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": with_context(agent, WIDE_SYSTEM if wide else SYSTEM)},
         {"role": "user", "content": f"Task:\n{task}\n\nDeliverables to write: "
-                                    f"{', '.join(wanted)}\n\nInput files:\n\n{shown}{look}"},
+                                    f"{', '.join(wanted)}\n\nInput files:\n\n{shown}{extra}"
+                                    f"{look}"},
     ]
     looks = [0] if commands else None
-    produce = _Producer(agent, task, wanted, originals)
     accept_spec = host.acceptance(task)
 
     def check_stage(written: list[str]) -> write_loop.Checks:
-        checks = write_loop.Checks()
+        items: list[dict[str, Any]] = []
+        checks = write_loop.Checks(items=items)
         templated = [path for path in json_template.stated(task) if path in written]
         if templated and features.on("json_template"):  # the task's `X.json as {...}` keys
+            features.mark_acted("json_template", where="deliverable_pipeline")
             checks.kinds["template keys"] = len(templated)
-            checks.failures += json_template.problems(project, task, templated)
+            problems = json_template.problems(project, task, templated)
+            checks.failures += problems
+            items += write_loop.counted_items("format", "the keys the task states",
+                                              len(templated), problems)
         stated_rules = format_rules.rules(task, wanted) if features.on("format_rules") else None
         if stated_rules is not None and stated_rules.count:  # the task's own format rules
+            features.mark_acted("format_rules", where="deliverable_pipeline")
             texts = {}
             for path in written:
                 try:
@@ -614,12 +668,16 @@ def run(agent: CodingAgent, task: str) -> str | None:
                 except (OSError, UnicodeDecodeError):
                     continue
             checks.kinds["format rules"] = stated_rules.count
-            checks.failures += format_rules.problems(task, texts, stated_rules)
+            problems = format_rules.problems(task, texts, stated_rules)
+            checks.failures += problems
+            items += write_loop.counted_items("format", "the format rules the task states",
+                                              stated_rules.count, problems)
         if accept_spec is not None:
             accepted = acceptance.run(accept_spec, project, written, tests=False,
                                       stop=host.stop_flag())
             checks.kinds["task checks"] = len(accepted.items)
             checks.failures += acceptance.pipeline_failures(accepted)
+            items += write_loop.acceptance_items(accepted)
         return checks
 
     def stop_early(round_number: int) -> bool:  # past REPAIRS only while scripts still fail
@@ -649,7 +707,7 @@ def run(agent: CodingAgent, task: str) -> str | None:
             host.emit("notice", message="Deliverable pipeline: nothing it produced would parse ("
                                         + ", ".join(result.refused) + "); using the agent loop.")
         return None
-    answer = write_loop.answer_for(result, config, done="Wrote", what="content")
+    answer = write_loop.answer_for(result, config, done="Wrote", what="content", agent=agent)
     host.remember(task, answer)
     return answer
 

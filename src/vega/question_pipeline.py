@@ -26,7 +26,7 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import debuglog, features, teaching, verbs
+from . import debuglog, extensions, features, home_start, teaching, verbs
 from .pipeline import _QUESTION, _WRITE_VERBS, ask_complete, with_context
 
 if TYPE_CHECKING:
@@ -96,7 +96,8 @@ def is_question(task: str) -> bool:
     asks = bool(_QUESTION.search(task) or _READ_ONLY.search(task) or _ABOUT_VEGA.search(task))
     # in request position only: "why is add wrong?" asks for no change (see verbs)
     changes = bool(verbs.requested(_WRITE_VERBS, task)
-                   or verbs.requested(_ACTION, _strip_negations(task)))
+                   or verbs.requested(_ACTION, _strip_negations(task))
+                   or asks and extensions.change_request(task))
     return asks and not changes
 
 
@@ -115,36 +116,52 @@ def _numbered(lines: list[str], start: int) -> str:
     return "\n".join(f"{start + i}: {line}" for i, line in enumerate(lines))
 
 
-def excerpts(project: Path, task: str) -> str:
-    """Files the question names (whole, if small), then the best search chunks, then a short map."""
+def excerpts(project: Path, task: str, agent: Any = None) -> str:
+    """Files the question names (whole, if small), then the best search chunks, then a short map
+    (sizes: extensions.budget for `agent`'s window)."""
+    file_chars, excerpt_chars, map_chars = (
+        extensions.budget(f"question_pipeline.{name}", default, agent=agent)
+        for name, default in (("FILE_CHARS", FILE_CHARS), ("EXCERPT_CHARS", EXCERPT_CHARS),
+                              ("MAP_CHARS", MAP_CHARS)))
     from .index import build_index
 
     index = build_index(project)
     parts: list[str] = []
     used = 0
     seen: set[tuple[str, int]] = set()
+    shown: list[tuple[str, int, int]] = []  # (path, first line, last line) of each block
     files = {entry.path: entry for entry in index.files}
     for named in dict.fromkeys(_PATH.findall(task)):
         match = next((path for path in files if path == named or path.endswith("/" + named)), None)
         if match is None:
             continue
         text = "\n".join(files[match].lines)
-        if len(text) > FILE_CHARS:
+        if len(text) > file_chars:
             continue
         parts.append(f"{match} (whole file):\n{_numbered(files[match].lines, 1)}")
         used += len(text)
         seen.add((match, 0))
+        shown.append((match, 1, len(files[match].lines)))
     for hit in index.search(task, limit=HITS):
         if (hit.path, 0) in seen or (hit.path, hit.start_line) in seen:
             continue
         lines = files[hit.path].lines[hit.start_line - 1:hit.end_line]
         block = f"{hit.path} lines {hit.start_line}-{hit.end_line}:\n{_numbered(lines, hit.start_line)}"
-        if used + len(block) > EXCERPT_CHARS:
+        if used + len(block) > excerpt_chars:
             break
         parts.append(block)
         used += len(block)
         seen.add((hit.path, hit.start_line))
-    parts.append("Project map:\n" + index.repo_map(max_chars=MAP_CHARS))
+        shown.append((hit.path, hit.start_line, hit.end_line))
+    # an extension may use the rest of the budget (exact names, called definitions, the previous
+    # turn's files: vega_lab.excerpt_fill)
+    for block in extensions.question_excerpts(project, task, index=index, shown=list(shown),
+                                              remaining=excerpt_chars - used, agent=agent):
+        if used + len(block) > excerpt_chars:
+            continue
+        parts.append(block)
+        used += len(block)
+    parts.append("Project map:\n" + index.repo_map(max_chars=map_chars))
     return "\n\n".join(parts)
 
 
@@ -345,8 +362,10 @@ def call_evidence(project: Path, task: str) -> str:
     """The evidence text for the model ('' when there is nothing to run, or nothing ran)."""
     from . import acceptance
 
-    if acceptance._NO_COMMANDS.search(task) and not features.on("acceptance_ignores_no_commands"):
-        return ""
+    if acceptance._NO_COMMANDS.search(task):
+        if not features.on("acceptance_ignores_no_commands"):
+            return ""
+        features.mark_acted("acceptance_ignores_no_commands", where="question_pipeline")
     calls = planned_calls(project, task)
     if not calls:
         return ""
@@ -386,7 +405,7 @@ def run(agent: CodingAgent, task: str) -> str | None:
     """Answer a task routing.route_task sent here; None falls back to the agent loop."""
     agent._emit("notice", message="Answering from the code index")
     try:
-        shown = excerpts(agent.project, task)
+        shown = excerpts(agent.project, task, agent)
     except Exception as exc:  # noqa: BLE001 - fall back to the agent loop
         debuglog.record("stage", stage="question_pipeline.excerpts_failed", error=str(exc))
         return None
@@ -401,6 +420,11 @@ def run(agent: CodingAgent, task: str) -> str | None:
     user = f"Question: {task}\n\nExcerpts:\n{shown}"
     if evidence:
         user += f"\n\n{evidence}"
+    # `shown`: the excerpts as the model sees them; `ran_code`: question_run_code gave evidence
+    extra = home_start.answer_note(agent, task, extensions.answer_context(
+        agent, task, route="question", shown=shown, ran_code=bool(evidence)))
+    if extra:
+        user += f"\n\n{extra}"
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": with_context(agent, QA_SYSTEM)},
         {"role": "user", "content": user},
@@ -419,6 +443,7 @@ def run(agent: CodingAgent, task: str) -> str | None:
         debuglog.record("stage", stage="question_pipeline.code_for_change")
         agent._emit("notice", message="The answer is code for a change; making the change instead.")
         return None
+    answer = extensions.final_answer(answer, source="question_pipeline", agent=agent, task=task)
     agent.messages += [{"role": "user", "content": task}, {"role": "assistant", "content": answer}]
     if getattr(agent, "teach", False):  # teach mode: where the answer came from (real excerpts)
         note = teaching.question_note(shown)

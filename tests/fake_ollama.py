@@ -28,6 +28,7 @@ class FakeOllama:
     blobs: dict[str, dict[str, int]] = field(default_factory=dict)  # model -> {digest: size}
     pull_sizes: dict[str, int] = field(default_factory=dict)  # tag -> bytes the pull streams
     pull_error: str = ""
+    pull_cut: int = 0  # this many pulls stop half way without `success` (an interrupted download)
     requests: list[tuple[str, str, Any]] = field(default_factory=list)
     url: str = ""
     deleted_blobs: list[str] = field(default_factory=list)
@@ -91,6 +92,12 @@ class FakeOllama:
                     line({"error": fake.pull_error})
                     return
                 total = fake.pull_sizes.get(name, 2 * GB)
+                if fake.pull_cut > 0:
+                    fake.pull_cut -= 1
+                    for done in (0, total // 2):
+                        line({"status": "pulling sha256:aa", "digest": "sha256:aa",
+                              "total": total, "completed": done})
+                    return
                 for done in (0, total // 2, total):
                     line({"status": "pulling sha256:aa", "digest": "sha256:aa", "total": total,
                           "completed": done})

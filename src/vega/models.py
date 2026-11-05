@@ -6,10 +6,9 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import subprocess
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ def _profiles_file() -> Path:
 
 
 PROFILES_FILE = _profiles_file()
+_WIRING = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")  # an Ollama renderer / parser name
 DEFAULT_MODEL = "vega"
 _SYSTEM = (
     "You are Vega, a careful software engineering coding assistant. The caller supplies the full "
@@ -61,6 +61,12 @@ class Profile:
     endpoint: str = ""
     api_model: str = ""  # the model name that server expects (default: base)
     allow_remote: bool = False  # endpoint may be a non-local address (local-first: off by default)
+    # Ollama's built-in prompt renderer and reply parser (Modelfile RENDERER / PARSER, e.g. "lfm2"):
+    # for a Hugging Face GGUF, whose hf.co template has no tool format, so tool calls need the same
+    # wiring as the library build of that family. Empty: whatever the base model has (a library model
+    # built FROM keeps its own renderer and parser; checked on Ollama 0.34.3, 2026-11-04).
+    renderer: str = ""
+    parser: str = ""
 
     @property
     def is_endpoint(self) -> bool:
@@ -72,7 +78,10 @@ class Profile:
         return self.api_model or self.base
 
     def modelfile(self) -> str:
-        lines = [f"FROM {self.base}", "", f"PARAMETER num_ctx {self.num_ctx}"]
+        lines = [f"FROM {self.base}"]
+        lines += [f"RENDERER {self.renderer}"] if self.renderer else []
+        lines += [f"PARSER {self.parser}"] if self.parser else []
+        lines += ["", f"PARAMETER num_ctx {self.num_ctx}"]
         for key, value in self.parameters.items():
             lines.append(f"PARAMETER {key} {value}")
         lines += ["", f'SYSTEM """{_SYSTEM}"""', ""]
@@ -107,7 +116,12 @@ def load() -> tuple[str, dict[str, Profile]]:
     except FileNotFoundError as exc:
         raise ValueError(f"No model profiles file at {PROFILES_FILE}.") from exc
     profiles: dict[str, Profile] = {}
-    for name, raw in data.get("profiles", {}).items():
+    listed = dict(data.get("profiles", {}))
+    from . import extensions  # an extension's own profiles (extensions.model_profiles): the file's win
+
+    for name, raw in extensions.model_profiles().items():
+        listed.setdefault(name, raw)
+    for name, raw in listed.items():
         if not isinstance(raw, dict) or not isinstance(raw.get("base"), str):
             raise ValueError(f"Profile {name!r} in {PROFILES_FILE.name} needs a `base` model.")
         profiles[name] = Profile(
@@ -119,7 +133,13 @@ def load() -> tuple[str, dict[str, Profile]]:
             endpoint=str(raw.get("endpoint", "")).strip(),
             api_model=str(raw.get("api_model", "")).strip(),
             allow_remote=bool(raw.get("allow_remote", False)),
+            renderer=str(raw.get("renderer", "")).strip(), parser=str(raw.get("parser", "")).strip(),
         )
+        for key in ("renderer", "parser"):  # one Modelfile word each: never a second line
+            value = getattr(profiles[name], key)
+            if value and not _WIRING.match(value):
+                raise ValueError(f"Profile {name!r} in {PROFILES_FILE.name}: {key} {value!r} is not an Ollama "
+                                 f"{key} name (lowercase letters, digits, . _ -).")
     default = data.get("default")
     if default not in profiles:
         raise ValueError(f"`default` in {PROFILES_FILE.name} must name one of: {', '.join(profiles)}.")
@@ -153,9 +173,10 @@ def active_profile() -> str | None:
 def build(profile: Profile, target: str) -> int:
     """Create (or refresh) Ollama model `target` from a profile; pulls the base model if needed."""
     server.ensure_running()
-    executable = shutil.which("ollama")
+    executable = server.ollama_executable()
     if not executable:
-        raise RuntimeError("Ollama is not installed. Install it from https://ollama.com/download.")
+        raise RuntimeError("Ollama is not installed. Run `vega setup` (or install it from "
+                           "https://ollama.com/download).")
     modelfiles = server.STATE_DIR / "modelfiles"
     modelfiles.mkdir(parents=True, exist_ok=True)
     path = modelfiles / f"{target}.Modelfile"
@@ -218,8 +239,9 @@ def latest_scores(runs_file: Path) -> dict[str, str]:
 
 
 def profile_for_model(model: str) -> Profile | None:
-    """The profile behind an Ollama model name: `vega` is the active (or default) profile and
-    `vega-<name>` is profile <name>; other model names have no profile."""
+    """The profile behind an Ollama model name: `vega` is the active (or default) profile,
+    `vega-<name>` is profile <name> and a window alias `vega-<name>-16k` is profile <name> with
+    num_ctx 16384 (see window_alias); other model names have no profile."""
     try:
         default, profiles = load()
     except (ValueError, OSError):
@@ -228,12 +250,96 @@ def profile_for_model(model: str) -> Profile | None:
         return profiles.get(active_profile() or default)
     name = model.removesuffix(":latest")
     if name.startswith("vega-"):
-        return profiles.get(name[len("vega-"):])
+        found = profiles.get(name[len("vega-"):])
+        if found is not None:
+            return found
+        split = _split_window_alias(name)
+        if split is not None and split[0].startswith("vega-"):
+            base = profiles.get(split[0][len("vega-"):])
+            if base is not None and not base.is_endpoint:
+                return replace(base, num_ctx=split[1])
     return None
+
+
+# --- Window aliases: the same weights served with another context window ---------------------------
+# Vega never sends num_ctx with a request: Ollama's OpenAI-compatible endpoint (/v1, which Vega
+# uses) takes the window from the model's Modelfile (`PARAMETER num_ctx`). A budget of 16K
+# (VEGA_NUM_CTX=16384) against a model built with 8K let prompts reach 8,191 tokens and the server
+# then silently cut them (context shift, system prompt and tools lost; server.log 2026-10-13..28).
+# So a window other than the model's own is served by an alias built from the same profile with
+# only num_ctx changed: `vega-granite-8b-16k` (`vega model build granite-8b --num-ctx 16384`, or
+# `vega model fit-window` for the current model and VEGA_NUM_CTX). Same blob, no download.
+# Not options.num_ctx per request: Ollama's native API takes it, but whether 0.34.3's /v1 layer
+# honours it is unverified (checking needs a model call), and an alias's window can be read back
+# from /api/show before a run starts (context.match_window), which a request field cannot.
+
+_WINDOW_SUFFIX = re.compile(r"^(?P<base>.+)-(?:(?P<k>\d+)k|ctx(?P<n>\d+))$")
+
+
+def window_suffix(num_ctx: int) -> str:
+    """`-16k` for 16384; `-ctx12000` for a window that is not a whole number of K."""
+    return f"-{num_ctx // 1024}k" if num_ctx % 1024 == 0 else f"-ctx{num_ctx}"
+
+
+def _split_window_alias(name: str) -> tuple[str, int] | None:
+    """(model name without the window suffix, window) for `vega-granite-8b-16k`, else None."""
+    match = _WINDOW_SUFFIX.match(name)
+    if not match:
+        return None
+    window = int(match["k"]) * 1024 if match["k"] else int(match["n"])
+    return (match["base"], window) if window >= 512 else None
+
+
+def window_profile_name(model: str) -> str | None:
+    """The profile an Ollama model name is built from (`vega` → the active or default profile,
+    `vega-<p>` and `vega-<p>-16k` → p), or None (not a profile's model, or an endpoint)."""
+    try:
+        default, profiles = load()
+    except (ValueError, OSError):
+        return None
+    name = model.removesuffix(":latest")
+    if name == DEFAULT_MODEL:
+        chosen = active_profile() or default
+    elif name.startswith("vega-") and name[len("vega-"):] in profiles:
+        chosen = name[len("vega-"):]
+    else:
+        split = _split_window_alias(name)
+        chosen = split[0][len("vega-"):] if split and split[0].startswith("vega-") else None
+    profile = profiles.get(chosen) if chosen else None
+    return chosen if profile is not None and not profile.is_endpoint else None
+
+
+def window_alias(model: str, num_ctx: int) -> str | None:
+    """The Ollama model that serves `model`'s weights with a num_ctx-token window:
+    `vega-<profile><suffix>` (e.g. vega-granite-8b-16k), or None when `model` is not built from a
+    profile (Vega cannot build an alias for an arbitrary Ollama model)."""
+    profile = window_profile_name(model)
+    if profile is None:
+        return None
+    _, profiles = load()
+    if profiles[profile].num_ctx == num_ctx:
+        return ollama_name(profile)
+    return ollama_name(profile) + window_suffix(num_ctx)
+
+
+def build_window_alias(profile_name: str, num_ctx: int) -> tuple[str, int]:
+    """Build (or refresh) the alias of a profile with another window: (model name, exit code).
+    The profile's own window builds plain vega-<profile>."""
+    profile = get(profile_name)
+    if profile.is_endpoint:
+        raise ValueError(f"{profile_name!r} runs on {profile.endpoint}: set the window in that "
+                         "server; Vega builds nothing for an endpoint profile.")
+    if num_ctx < 512:
+        raise ValueError("num_ctx must be at least 512.")
+    target = ollama_name(profile_name)
+    if num_ctx != profile.num_ctx:
+        target += window_suffix(num_ctx)
+    return target, build(replace(profile, num_ctx=num_ctx), target)
 
 
 _APPLIED: str | None = None  # what apply_feature_defaults last set (vs a user's own setting)
 _APPLIED_OFF: str | None = None  # the same for the profile's switched-off defaults
+_USER_OFF: str | None = None  # the user's own VEGA_FEATURES_OFF that the defaults are added to
 
 
 def apply_feature_defaults(model: str) -> list[str]:
@@ -244,7 +350,7 @@ def apply_feature_defaults(model: str) -> list[str]:
 
     from . import features
 
-    global _APPLIED, _APPLIED_OFF
+    global _APPLIED, _APPLIED_OFF, _USER_OFF
     profile = profile_for_model(model)
     applied: list[str] = []
     current = os.environ.get(features.ENV_ON)
@@ -256,15 +362,28 @@ def apply_feature_defaults(model: str) -> list[str]:
             os.environ.pop(features.ENV_ON, None)
             _APPLIED = None
         applied += names
+    # The profile's switched-off defaults are ADDED to the user's own VEGA_FEATURES_OFF, never
+    # replaced by it (2026-11-04: an A/B arm with VEGA_FEATURES_OFF=x on Granite also turned `plan`
+    # back on, so every core inverted A/B changed two things). VEGA_PROFILE_FEATURES_OFF=0 or an
+    # explicitly empty VEGA_FEATURES_OFF="" drops them.
     current_off = os.environ.get(features.ENV)
-    if current_off is None or current_off == _APPLIED_OFF:
-        off = [name for name in (profile.features_off if profile else []) if name in features.FEATURES]
-        if off:
-            os.environ[features.ENV] = _APPLIED_OFF = ",".join(off)
-        elif current_off is not None:
-            os.environ.pop(features.ENV, None)
-            _APPLIED_OFF = None
-        applied += [f"-{name}" for name in off]
+    if current_off is not None and current_off != _APPLIED_OFF:
+        _USER_OFF = current_off  # the user set it since the last apply
+    elif current_off is None:
+        _USER_OFF = None
+    user = [n for n in (_USER_OFF or "").split(",") if n.strip()] if _USER_OFF is not None else []
+    use_profile = (_USER_OFF != ""  # an explicitly empty list is the user's "nothing off"
+                   and os.environ.get("VEGA_PROFILE_FEATURES_OFF", "1").strip().lower() not in ("0", "off", "no"))
+    off = [name for name in (profile.features_off if profile and use_profile else [])
+           if name in features.FEATURES and name not in user]
+    if user or off:
+        os.environ[features.ENV] = _APPLIED_OFF = ",".join(user + off)
+    elif _USER_OFF is not None:  # the user's own (empty) choice stays as set
+        os.environ[features.ENV] = _APPLIED_OFF = _USER_OFF
+    elif current_off is not None:
+        os.environ.pop(features.ENV, None)
+        _APPLIED_OFF = None
+    applied += [f"-{name}" for name in off]
     return applied
 
 

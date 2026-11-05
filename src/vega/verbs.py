@@ -13,12 +13,15 @@ only in request position: at the sentence start, after a request lead ("please",
 Preceded by a determiner ("the update", "which port") it is a noun. "port" is held to this in
 every sentence, since as a noun it is common in statements too ("the port is 8080"); every other
 verb in a statement counts as before. Callers blank code spans first (routing.strip_code), so a
-backticked `add()` never counts.
+backticked `add()` never counts. An extension may read more question sentences as asking about a
+verb rather than for it (extensions.question_sentence).
 """
 
 from __future__ import annotations
 
 import re
+
+from . import extensions
 
 # a sentence ends at . ! ? followed by space, or a line break (a dot inside a path does not, nor
 # "e.g." / "i.e." / "etc." / "vs.")
@@ -58,6 +61,8 @@ def _requested(sentence: str, start: int, end: int, word: str) -> bool:
         return True
     before, after = sentence[:start], sentence[end:]
     if _NOUN_BEFORE.search(before) or _NOUN_AFTER.match(after):
+        return False
+    if extensions.question_sentence(sentence, before=before, after=after):
         return False
     return bool(_LEAD.search(before) or _OBJECT.match(after))
 

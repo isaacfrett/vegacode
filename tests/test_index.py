@@ -233,3 +233,45 @@ def test_vega_state_dir_is_hidden_from_search_and_listing(tmp_path: Path, git: b
     # An explicit read still works: the notes feature and the user's own requests keep access.
     read = execute("read_file", {"path": ".vega/notes.md"}, tmp_path)
     assert "approval prompt lives in app.py" in read
+
+
+CART = "def add_item(item, bucket=[]):\n    bucket.append(item)\n    return bucket\n"
+PREFS = '''\
+import json
+
+
+def load_prefs(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        data = {}
+    merged = dict(DEFAULTS)
+    merged.update(data)
+    return merged
+'''
+
+
+def test_core_snippets_are_stripped_lines_without_markers(tmp_path: Path) -> None:
+    """The core's snippet format (0.3.1): each picked line stripped, nothing marked (an extension may
+    supply another through the code_snippet hook)."""
+    write(tmp_path, "src/cart.py", CART)
+    result = execute("search_code", {"query": "add_item"}, tmp_path)
+    assert result.endswith("\n  1: def add_item(item, bucket=[]):\n  2: bucket.append(item)")
+    assert "…" not in result
+
+
+def test_code_snippet_hook_replaces_the_snippet(tmp_path: Path, monkeypatch) -> None:
+    from vega import extensions
+
+    seen = []
+
+    def snippet(lines, picked, start, end, *, default):
+        seen.append((picked, start, end, default))
+        return "custom"
+
+    monkeypatch.setattr(extensions, "_impl", lambda name: snippet if name == "code_snippet" else None)
+    write(tmp_path, "src/cart.py", CART)
+    hit = build_index(tmp_path).search("add_item")[0]
+    assert hit.snippet == "custom"
+    assert seen[0] == ([1, 2], 1, 3, "1: def add_item(item, bucket=[]):\n2: bucket.append(item)")

@@ -4,16 +4,20 @@ macOS's own `pip3` is Python 3.9, so `pip3 install vegacode` there installs only
 package (every dependency is marked `python_version >= "3.11"`). Running `vega` (or
 `python3 -m vega`) then lands here, which:
 
-1. finds a Python 3.11+ already on the machine (PATH, Homebrew, python.org, uv, pyenv), or offers
-   `uv python install 3.12` when uv is there, else `brew install python@3.12` (asks first; only
-   in a terminal), and otherwise says how to get one;
-2. with the user's yes (or VEGA_BOOTSTRAP_YES=1), creates a dedicated virtual environment
+1. finds a Python 3.11+ already on the machine (PATH, Homebrew, python.org, uv, pyenv); when
+   there is none, getting one becomes the first line of the plan (`uv python install 3.12` when
+   uv is there, else `brew install python@3.12`; only in a terminal), and otherwise it says how
+   to get one;
+2. shows the whole plan (Python, environment, install, commands, PATH) and asks once; with the
+   user's yes (or VEGA_BOOTSTRAP_YES=1) it installs that Python if needed, creates a dedicated
+   virtual environment
    (~/.local/share/vega/venv; XDG_DATA_HOME and VEGA_BOOTSTRAP_VENV move it) and pip-installs the
    same vegacode into it: the same version from PyPI, or the same wheel, folder or Git commit when
    this copy came from one. It never pip-installs into the Python it found, so Homebrew's
    externally managed Python (PEP 668) is left alone;
 3. links ~/.local/bin/vega and ~/.local/bin/vegacode to the environment's commands (a different
-   file already there is replaced only after asking), says how to put ~/.local/bin on PATH, and
+   file already there is replaced only after asking), adds ~/.local/bin to PATH in the shell's
+   startup file (listed in the plan), and
 4. runs the real `vega` with the original arguments.
 
 Run again, it finds the environment ready and goes straight to step 4. Windows gets instructions
@@ -25,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -46,6 +51,12 @@ _PROBE = ("import sys\ntry:\n    import venv, ensurepip\n    ok = 1\nexcept Impo
           "    ok = 0\nprint('%d.%d.%d %d' % (sys.version_info[:3] + (ok,)))")
 
 Version = tuple[int, ...]
+
+
+class PythonOffer(NamedTuple):
+    tool: str  # "uv" or "Homebrew"
+    command: list[str]
+    plan: str  # the plan's Python line: what it installs, about how much, where
 
 
 class Python(NamedTuple):
@@ -195,6 +206,35 @@ def install_spec(version: str | None, direct_url: dict | None) -> tuple[list[str
     return ["vegacode"], "PyPI (latest)"
 
 
+_RELEASE = re.compile(r"^\s*v?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|c)[-_.]?(\d*))?"
+                      r"(?:[-_.]?post[-_.]?(\d*))?(?:[-_.]?dev[-_.]?(\d*))?")
+
+
+def version_key(text: str) -> tuple | None:
+    """A sortable key for a PEP 440 version (release, pre-release, post, dev; local part ignored),
+    or None when `text` is not one. Enough to compare vegacode releases without `packaging`."""
+    match = _RELEASE.match(text or "")
+    if not match:
+        return None
+    release_text, pre, pre_n, post, dev = match.groups()
+    release = [int(part) for part in release_text.split(".")]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    phase = {"alpha": "a", "beta": "b", "c": "rc"}.get(pre or "", pre or "")
+    # dev < a < b < rc < final < post; a .devN of a pre-release sorts just below it
+    pre_key = ((["a", "b", "rc"].index(phase), int(pre_n or 0)) if phase
+               else ((-1, 0) if dev is not None and post is None else (3, 0)))
+    post_key = int(post or 0) if post is not None else -1
+    dev_key = int(dev or 0) if dev is not None else float("inf")
+    return (tuple(release), pre_key, post_key, dev_key)
+
+
+def version_newer(candidate: str, current: str) -> bool:
+    """Whether version `candidate` is newer than `current` (False when either cannot be read)."""
+    a, b = version_key(candidate), version_key(current)
+    return a is not None and b is not None and a > b
+
+
 def venv_vegacode_version(venv: Path) -> str | None:
     """The vegacode version installed in the environment, read from its dist-info folder name
     (no interpreter start)."""
@@ -285,6 +325,44 @@ def path_hint(folder: Path, env: Mapping[str, str], home: Path, system: str) -> 
     return [(f"{tilde(folder, home)} is not on your PATH yet, so a new terminal will not find "
              "`vega`. Add it with:"), "", "    " + command, "",
             f"then open a new terminal. Until then, run {tilde(folder / 'vega', home)}."]
+
+
+PATH_MARK = "# Added by Vega (vegacode): its `vega` command lives here"
+
+
+def shell_rc(env: Mapping[str, str], home: Path, system: str) -> tuple[Path, str]:
+    """The startup file of the user's shell and the line that puts ~/.local/bin on PATH."""
+    shell = os.path.basename(env.get("SHELL", ""))
+    if shell == "fish":
+        return home / ".config" / "fish" / "conf.d" / "vega.fish", "fish_add_path $HOME/.local/bin"
+    name = {"zsh": ".zshrc", "bash": ".bash_profile" if system == "Darwin" else ".bashrc"
+            }.get(shell, ".profile")
+    return home / name, 'export PATH="$HOME/.local/bin:$PATH"'
+
+
+def shell_rc_has_line(env: Mapping[str, str], home: Path, system: str) -> bool:
+    rc, line = shell_rc(env, home, system)
+    try:
+        text = rc.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return PATH_MARK in text or line in text
+
+
+def add_to_path(folder: Path, env: Mapping[str, str], home: Path, system: str) -> Path | None:
+    """Append the PATH line for `folder` (~/.local/bin) to the shell's startup file, once.
+    Returns the file written, or None when nothing was needed (already on PATH or already in
+    the file) or `folder` is not ~/.local/bin. Raises OSError when the file cannot be written."""
+    if on_path(folder, env) or os.path.realpath(folder) != os.path.realpath(home / ".local" / "bin"):
+        return None
+    rc, line = shell_rc(env, home, system)
+    text = rc.read_text(encoding="utf-8", errors="replace") if rc.exists() else ""
+    if PATH_MARK in text or line in text:
+        return None
+    rc.parent.mkdir(parents=True, exist_ok=True)
+    with rc.open("a", encoding="utf-8") as f:
+        f.write(("" if not text or text.endswith("\n") else "\n") + f"\n{PATH_MARK}\n{line}\n")
+    return rc
 
 
 # --- getting a Python when there is none -------------------------------------------------------
@@ -398,9 +476,11 @@ class Bootstrap:
         vbin = venv_bin(venv, self.system)
         wanted = self.version()
         installed = venv_vegacode_version(venv)
+        # An environment newer than this launcher (`vega update` upgraded it; the Python 3.9 copy
+        # stays behind) is ready too: never downgrade it to the launcher's version.
         ready = (vbin / "vega").exists() and installed is not None \
-            and (wanted is None or installed == wanted) and venv_python_ok(venv, self.system,
-                                                                          self.probe)
+            and (wanted is None or not version_newer(wanted, installed)) \
+            and venv_python_ok(venv, self.system, self.probe)
         if not ready:
             code = self.setup(venv, wanted, installed, here)
             if code:
@@ -409,9 +489,22 @@ class Bootstrap:
         for note in notes:
             say(note)
         if not ready:
-            hint = path_hint(bin_dir(self.home), self.env, self.home, self.system)
-            for line in hint:
-                say(line)
+            folder = bin_dir(self.home)
+            try:
+                written = add_to_path(folder, self.env, self.home, self.system)
+            except OSError as exc:
+                written = None
+                say(f"Could not add {tilde(folder, self.home)} to PATH ({exc}).")
+                for line in path_hint(folder, self.env, self.home, self.system):
+                    say(line)
+            if written is not None:
+                say(f"Added {tilde(folder, self.home)} to PATH in {tilde(written, self.home)}: "
+                    "new terminals find `vega`. In this one, run: "
+                    f"source {tilde(written, self.home)}")
+            elif not on_path(folder, self.env) and not shell_rc_has_line(self.env, self.home,
+                                                                          self.system):
+                for line in path_hint(folder, self.env, self.home, self.system):
+                    say(line)
             say("Vega is set up. Starting it...\n")
         return self.exec_command(commands.get("vega", vbin / "vega"), args)
 
@@ -427,21 +520,37 @@ class Bootstrap:
         say("pip installed only a small launcher. It can set Vega up in its own environment.")
         say()
         python, no_venv = find_python(self.env, self.home, self.system, self.probe)
+        offer = None
         if python is None:
-            python = self.get_python(no_venv)
-            if python is None:
+            for found in no_venv:
+                say(f"{found.path} is Python {dotted(found.version)} but cannot create virtual "
+                    "environments; on Debian/Ubuntu: "
+                    f"sudo apt install python3.{found.version[1]}-venv")
+            # Getting a Python is part of the one plan below, not a question of its own.
+            offer = self.python_offer() if self.interactive() else None
+            if offer is None:
+                for line in no_python_help(self.system, self.brew(), self.env):
+                    say(line)
                 return 1
         vbin = venv_bin(venv, self.system)
-        plan = [("Python", f"{python.path} ({dotted(python.version)})"),
+        plan = [("Python", offer.plan if offer else f"{python.path} ({dotted(python.version)})"),
                 ("Environment", tilde(venv, self.home)),
                 ("Install", f"vegacode from {source} with its dependencies (about 120 MB)"),
                 ("Commands", ", ".join(tilde(bin_dir(self.home) / n, self.home)
                                        for n in COMMANDS))]
+        folder = bin_dir(self.home)
+        adds_path = (not on_path(folder, self.env)
+                     and not shell_rc_has_line(self.env, self.home, self.system))
+        if adds_path:
+            rc, _ = shell_rc(self.env, self.home, self.system)
+            plan.append(("PATH", (f"adds {tilde(folder, self.home)} in {tilde(rc, self.home)} "
+                                  "(two lines at the end) so new terminals find `vega`")))
         for label, value in plan:
             say(f"  {label + ':':<12} {value}")
         say()
-        say(f"Nothing is installed into {python.path} itself, and nothing outside those "
-            "folders changes.")
+        where = f"{offer.tool}'s Python" if offer else str(python.path)
+        say(f"Nothing is installed into {where} itself, and nothing outside those "
+            "folders changes" + (" apart from that PATH line." if adds_path else "."))
         if venv.exists() and any(venv.iterdir()) and not (venv / "pyvenv.cfg").exists():
             say(f"{venv} exists and is not a virtual environment; move it, or set {VENV_ENV} "
                 "to another folder.")
@@ -459,9 +568,17 @@ class Bootstrap:
             return 1
         if not consent:
             say("Nothing changed. To do it by hand:")
-            for line in self.manual_steps(python, venv, spec):
-                say(line)
+            if python is None:
+                say("    " + " ".join(offer.command))
+                say("    then run `python3 -m vega` again")
+            else:
+                for line in self.manual_steps(python, venv, spec):
+                    say(line)
             return 1
+        if python is None:
+            python = self.install_python(offer)
+            if python is None:
+                return 1
         create = [str(python.path), "-m", "venv"]
         if (venv / "pyvenv.cfg").exists():
             create.append("--clear")  # its Python is gone or too old (e.g. Homebrew upgraded it)
@@ -482,33 +599,39 @@ class Bootstrap:
             return 1
         return 0
 
-    def get_python(self, no_venv: list[Python]) -> Python | None:
-        for python in no_venv:
-            say(f"{python.path} is Python {dotted(python.version)} but cannot create virtual "
-                "environments; on Debian/Ubuntu: "
-                f"sudo apt install python3.{python.version[1]}-venv")
-        brew = find_brew(self.env) if self.system == "Darwin" else None
+    def brew(self) -> str | None:
+        return find_brew(self.env) if self.system == "Darwin" else None
+
+    def python_offer(self) -> PythonOffer | None:
+        """How to get a Python 3.11+ when none is found: uv first (no sudo, nothing outside its
+        own folder), then Homebrew; None when neither is there."""
         uv = find_uv(self.env, self.home)
-        # One offer, uv first (no sudo, nothing outside its own folder), then Homebrew.
-        offer = ([uv, "python", "install", UV_PYTHON] if uv
-                 else [brew, "install", BREW_FORMULA] if brew else None)
-        if offer and self.interactive():
-            tool = "uv" if uv else "Homebrew"
-            say(f"No Python 3.11 or newer was found. {tool} can install one:")
-            say()
-            say("    " + " ".join(offer))
-            say()
-            if self.ask("Run it now?"):
-                if self.run_command(offer) == 0:
-                    python, _ = find_python(self.env, self.home, self.system, self.probe)
-                    if python is not None:
-                        return python
-                    say(f"{tool} finished but no Python 3.11+ was found afterwards.")
-                else:
-                    say(f"`{' '.join(offer[1:])}` failed.")
-        for line in no_python_help(self.system, brew, self.env):
-            say(line)
+        if uv:
+            data = Path(self.env.get("XDG_DATA_HOME") or str(self.home / ".local" / "share"))
+            where = Path(self.env.get("UV_PYTHON_INSTALL_DIR") or str(data / "uv" / "python"))
+            return PythonOffer("uv", [uv, "python", "install", UV_PYTHON],
+                               f"Python {UV_PYTHON}, installed by uv first (about 60 MB, in "
+                               f"{tilde(where.expanduser(), self.home)})")
+        brew = self.brew()
+        if brew:
+            prefix = Path(brew).parent.parent
+            return PythonOffer("Homebrew", [brew, "install", BREW_FORMULA],
+                               f"Python {UV_PYTHON}, installed by Homebrew first (brew install "
+                               f"{BREW_FORMULA}; about 110 MB with its dependencies, in {prefix})")
         return None
+
+    def install_python(self, offer: PythonOffer) -> Python | None:
+        """Run the agreed Python install, then find the Python it added."""
+        if self.run_command(offer.command) != 0:
+            say(f"`{' '.join(offer.command[1:])}` failed (the output above says why); nothing "
+                "else was changed.")
+            return None
+        python, _ = find_python(self.env, self.home, self.system, self.probe)
+        if python is None:
+            say(f"{offer.tool} finished but no Python 3.11+ was found afterwards.")
+            for line in no_python_help(self.system, self.brew(), self.env):
+                say(line)
+        return python
 
 
 def run(args: list[str]) -> int:

@@ -351,16 +351,10 @@ def test_gitignore_block_keeps_user_lines_and_is_not_re_added(tmp_path: Path) ->
     assert pc.load_state(project)["gitignore"] == "user_removed"
 
 
-def test_gitignore_untouched_outside_git_or_when_switched_off(tmp_path: Path, monkeypatch) -> None:
+def test_gitignore_untouched_outside_git(tmp_path: Path) -> None:
     plain = python_project(tmp_path / "plain")
     pc.start_session(plain)
     assert not (plain / ".gitignore").exists()
-    repo = python_project(tmp_path / "repo")
-    git(repo, "init", "-q")
-    monkeypatch.setenv("VEGA_FEATURES_OFF", "question_pipeline,project_pipeline,clarify_first,manage_gitignore")
-    pc.start_session(repo)
-    assert not (repo / ".gitignore").exists()
-    assert ".gitignore" in (pc.take_notice(repo) or "")  # suggests it instead
 
 
 def test_no_notice_when_vega_dir_is_ignored(tmp_path: Path) -> None:

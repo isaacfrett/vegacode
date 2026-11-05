@@ -83,6 +83,41 @@ def test_wrong_code_is_repaired_from_the_failing_example(tmp_path: Path, monkeyp
     assert "response_format" not in str(seen)  # free text, not constrained JSON
 
 
+OWN_ASSERTS = '''"""
+Write a function to find the maximum of two numbers.
+assert biggest(2, 5) == 5
+"""
+
+def biggest(a, b):
+    return min(a, b)
+
+assert biggest(2, 5) == 5
+'''
+
+
+@pytest.mark.skipif(not sandbox.available(), reason="needs the macOS sandbox")
+def test_core_examples_report_a_breaking_own_assert_as_the_examples_error(tmp_path: Path) -> None:
+    """0.3.1: a false module-level assert of the file makes every example "raise AssertionError"
+    (an extension may run another script through extensions.example_script)."""
+    (tmp_path / "solution.py").write_text(OWN_ASSERTS)
+    failures = pipeline.run_examples(tmp_path, "solution.py", pipeline.examples_from_source(OWN_ASSERTS))
+    assert failures == ["biggest(2, 5) raised AssertionError:  (example in the docstring)"]
+
+
+def test_example_script_hook_runs_another_script(tmp_path: Path, monkeypatch) -> None:
+    from vega import extensions
+
+    ran, seen = [], []
+    monkeypatch.setattr(sandbox, "run_check", lambda command, project, **k: ran.append(command)
+                        or 'exit code: 0\n["one failure"]')
+    hooks = {"example_script": lambda script: "print(1)",
+             "examples_failed": lambda failures, *, path: seen.append((failures, path))}
+    monkeypatch.setattr(extensions, "_impl", lambda name: hooks.get(name))
+    examples = pipeline.examples_from_source(OWN_ASSERTS)
+    assert pipeline.run_examples(tmp_path, "solution.py", examples) == ["one failure"]
+    assert ran[0].startswith("python -c 'print(1)'") and seen == [(["one failure"], "solution.py")]
+
+
 def test_pipeline_is_on_by_default_and_can_be_switched_off(monkeypatch) -> None:
     assert features.on("direct_pipeline")
     monkeypatch.setenv(features.ENV, "direct_pipeline")

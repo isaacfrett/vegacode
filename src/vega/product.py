@@ -299,8 +299,11 @@ def tree_fingerprint(project: Path) -> str:
         digest.update((head or "").encode())
         paths = [line[3:].strip().strip('"') for line in status.splitlines() if line.strip()]
     else:
-        paths = [str(p.relative_to(project)) for p in sorted(project.rglob("*"))[:5000]
-                 if p.is_file() and ".git" not in p.parts and ".vega" not in p.parts]
+        from .tools import _project_files  # bounded; never enters ignored folders (an rglob
+        # of the home folder took minutes, 2026-10-28)
+
+        paths = [str(p.relative_to(project)) for p in _project_files(project, 5000)
+                 if p.is_file()]
     for relative in paths:
         if relative.startswith(".vega/"):
             continue

@@ -205,3 +205,37 @@ def test_real_sandbox_timeout_message_carries_the_hint(tmp_path, monkeypatch):
         "import time\n\ndef test_slow():\n    time.sleep(30)\n")
     output = sandbox.run_check(COMMAND, project, timeout=2)
     assert output.startswith("Check timed out after 2s.") and "not a test failure" in output
+
+
+# -- the hooks an extension fills (the lab's suite_map); without one, the 0.3.1 order above -------
+
+def test_hook_defaults_keep_the_core_order_and_texts(tmp_path):
+    from vega import extensions
+
+    project = large_project(tmp_path)
+    assert extensions.targeted_first(Spec(task="t", tests=COMMAND), project, changed=[], stop=None,
+                                     item=None) is None
+    assert extensions.timeout_hint(" hint", command=COMMAND, project=project, timeout=60) == " hint"
+    assert extensions.check_result(None, COMMAND, "Check timed out after 60s. x", changed=[],
+                                   read=[]) == "Check timed out after 60s. x"
+    assert "tests/test_<module>.py" in targeted_tests.run_check_hint(COMMAND, project, 60)
+
+
+def test_targeted_first_runs_before_the_related_files_and_may_decide(tmp_path, monkeypatch):
+    from vega import extensions
+
+    project = large_project(tmp_path)
+    calls = fake_checks(monkeypatch, lambda c, t: "exit code: 0\n1 passed in 0.1s")
+    decided = {"stop": True, "suite": None}
+
+    def first(spec, project_, *, changed, stop, item):
+        return {"items": [item(f"{spec.tests} tests/test_tools.py::test_one", project_, stop, "tests")],
+                **decided}
+
+    monkeypatch.setattr(extensions, "_impl", lambda name: first if name == "targeted_first" else None)
+    acceptance.run(Spec(task="t", tests=COMMAND), project, ["src/pkg/tools.py"])
+    assert len(calls) == 1 and "::test_one" in calls[0][0]
+    decided.update(stop=False, suite=acceptance.Item("tests", "whole suite", True, "not run here", note=True))
+    calls.clear()
+    result = acceptance.run(Spec(task="t", tests=COMMAND), project, ["src/pkg/tools.py"])
+    assert len(calls) == 2 and "not run here" in result.as_run()  # first, the related files, the note

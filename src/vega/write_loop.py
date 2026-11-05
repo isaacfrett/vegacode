@@ -29,6 +29,7 @@ files are when steps other than the loop's writes change them.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 from collections.abc import Callable
@@ -36,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from . import data_preview, debuglog, edits, features
+from . import data_preview, debuglog, edits, elision, extensions, features
 from .codemerge import _parses
 from .tools import execute
 
@@ -49,6 +50,7 @@ DEFAULT_NUM_CTX = 8192
 FEEDBACK_FAILURES = 8  # failing checks shown in one repair prompt
 QUOTED_FAILURES = 3  # failing checks quoted in the answer
 QUOTED_CHARS = 200
+MAX_STALL_ROUNDS = 2  # extensions.stalled_round: rounds it may add to a loop (they ran no checks)
 
 
 # -- the host -------------------------------------------------------------------------------------
@@ -203,11 +205,14 @@ def fenced(reply: str) -> list[tuple[int, int, str, str]]:
     """Every fenced block of a reply as (start, end, info string, body); the body keeps its last
     newline. With fence_lines the fences are whole lines (falling back to the old inline match
     when no block has line fences, e.g. "Here: ```python ... x```")."""
+    inline = [(m.start(), m.end(), m.group(1), m.group(2)) for m in _FENCED.finditer(reply)]
     if features.on("fence_lines"):
         found = [(m.start(), m.end(), m.group(2), m.group(3)) for m in _FENCE_LINES.finditer(reply)]
         if found:
+            if [(f[2].strip(), f[3]) for f in found] != [(i[2].strip(), i[3]) for i in inline]:
+                features.mark_acted("fence_lines", where="fenced")  # other blocks than inline
             return found
-    return [(m.start(), m.end(), m.group(1), m.group(2)) for m in _FENCED.finditer(reply)]
+    return inline
 
 
 def code_blocks(reply: str, any_language: bool = False) -> list[str]:
@@ -223,6 +228,10 @@ def code_blocks(reply: str, any_language: bool = False) -> list[str]:
         if (_ANY_INFO.fullmatch(info) is not None if any_language
                 else info.lower() in _PYTHON_INFO):
             blocks.append(body)
+    pattern = (r"```[\w.+-]*[ \t]*\n(.*?)```" if any_language
+               else r"```(?:python|py)?[ \t]*\n(.*?)```")
+    if blocks != re.findall(pattern, reply, re.DOTALL):
+        features.mark_acted("fence_lines", where="code_blocks")
     return blocks
 
 
@@ -232,6 +241,8 @@ def fence_for(text: str) -> str:
     if not features.on("fence_lines"):
         return "```"
     longest = max((len(run) for run in _BACKTICK_RUN.findall(text)), default=0)
+    if longest >= 3:
+        features.mark_acted("fence_lines", where="fence_for")
     return "`" * max(3, longest + 1)
 
 
@@ -239,7 +250,10 @@ def inside_open_block(text: str) -> bool:
     """Whether `text` (a reply cut off at the token limit) stops inside a code block: an odd
     number of fence lines (fence_lines, when it has any), else of ``` anywhere."""
     lines = len(_FENCE_LINE.findall(text)) if features.on("fence_lines") else 0
-    return lines % 2 == 1 if lines else text.count("```") % 2 == 1
+    inside = lines % 2 == 1 if lines else text.count("```") % 2 == 1
+    if lines and inside != (text.count("```") % 2 == 1):
+        features.mark_acted("fence_lines", where="inside_open_block")
+    return inside
 
 
 _PATHLIKE = re.compile(r"(?<![\w/.-])((?:[\w.-]+/)*[\w-][\w.-]*\.[A-Za-z]\w{0,9})(?![\w/])")
@@ -395,14 +409,47 @@ class Checks:
     failures: list[str] = field(default_factory=list)
     test_output: str = ""  # the visible tests' failing output, if any (one failing check)
     report: str | None = None  # the run_check result shown, instead of "N/M checks passed ..."
+    # each check with the checker that produced it (item()), for extensions.checks_recorded;
+    # None: the pipeline does not record them one by one. The answer never reads it.
+    items: list[dict[str, Any]] | None = None
+    # failing lines an extension added in checks_recorded (add_failure): part of `failures`
+    added: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
         return sum(self.kinds.values())
 
+    def add_failure(self, source: str, label: str, line: str) -> None:
+        """A failing check an extension found (extensions.checks_recorded, before the loop decides
+        whether to repair): counted as failing, its line in the repair feedback and its record in
+        `items`."""
+        self.failures.append(line)
+        self.added.append(line)
+        if self.items is not None:
+            self.items.append(item(source, label, False, line))
+
     @property
     def failed(self) -> int:
         return len(self.failures) + (1 if self.test_output else 0)
+
+
+def item(source: str, label: str, ok: bool, detail: str = "", **extra: Any) -> dict[str, Any]:
+    """One check for Checks.items: the checker that produced it (extensions.checks_recorded
+    lists them), what it checked, whether it passed, and its failing line or detail."""
+    return {"source": source, "label": label, "ok": ok, "detail": detail, **extra}
+
+
+def counted_items(source: str, label: str, total: int, failures: list[str]) -> list[dict[str, Any]]:
+    """`total` checks of one checker that reports only a count and its failing lines: one
+    failing item per line, then the passing rest."""
+    return ([item(source, label, False, line) for line in failures]
+            + [item(source, label, True) for _ in range(max(total - len(failures), 0))])
+
+
+def acceptance_items(result: Any) -> list[dict[str, Any]]:
+    """An acceptance.Result's items for Checks.items."""
+    return [item("acceptance", i.label, i.ok, i.detail or "", kind=i.kind, output=i.output,
+                 note=i.note) for i in (result.items if result is not None else [])]
 
 
 @dataclass
@@ -436,6 +483,15 @@ class LoopConfig:
     # unchanged_rounds, several-target loops: gives the next round's writers the note (without
     # it, a round that changed nothing ends the loop: the same prompts would give the same files)
     on_unchanged: Callable[[str], None] | None = None
+    task: str = ""  # the request (for extensions.checks_recorded)
+    # the request for checks_recorded's evidence providers only (`request`), where `task` stays ""
+    # because the task-gated hooks were never measured on that loop (the web pipeline)
+    request: str = ""
+    # extensions.stalled_round: a several-target loop's way to add files to its rounds
+    # ((paths, change text) -> the paths added), and whether a single-file loop's caller can hand
+    # a stall over to another pipeline (LoopResult.handover)
+    widen: Callable[[list[str], str], list[str]] | None = None
+    handover: bool = False
 
 
 @dataclass
@@ -456,6 +512,9 @@ class LoopResult:
     snapshot: dict[str, str | None]  # the kept round's files
     messages: list[dict[str, Any]]
     refused: dict[str, str]  # path -> why its last write was not saved
+    # extensions.stalled_round: the stall the loop ended on, for the caller to hand over
+    # ({"paths", "failure", "reason"}); None: no handover
+    handover: dict[str, Any] | None = None
 
     @property
     def kept(self) -> Attempt | None:
@@ -471,19 +530,33 @@ def _read(path: Path) -> str | None:
 
 def save(host: PipelineHost, config: LoopConfig, relative: str, write: Write) -> str:
     """Write one file through the normal write path (review, undo); with pipeline_signals the
-    atomic check refuses a write that would not parse or adds new static findings, and a Python
-    reply that does not parse by itself is refused before the merge silently drops it."""
+    atomic check refuses a write that would not parse or adds new static findings, a Python
+    reply that does not parse by itself is refused before the merge silently drops it, and
+    (elision_guard) a write whose comment or `...` stands in for code the file had is refused."""
     project = host.project
     args = {"path": relative, "content": write.content}
     host.emit("tool_call", name="write_file", args=args)
     refusal = None
     if features.on("pipeline_signals"):
+        features.mark_acted("pipeline_signals", where="save")  # the atomic write check ran
         now = _read(project / relative)
         original = config.originals.get(relative)
         if write.code is not None and original is not None and _parses(original):
             refusal = edits.unparsable_reply(relative, write.code, project)
+        if refusal is None and features.on("elision_guard"):
+            # a comment or `...` standing in for code the file had (2026-10-27: 3 of the 12
+            # saved elisions in the logs were pipeline writes)
+            found = elision.elided(relative, now, write.content, write.code)
+            if found is not None:
+                features.mark_acted("elision_guard", path=relative)
+                refusal = elision.refusal("pipeline", relative, found)
         if refusal is None:
-            refusal = edits.check("pipeline", relative, now, write.content, project).refusal
+            verdict = edits.check("pipeline", relative, now, write.content, project,
+                                  pending=[t for t in config.targets if t != relative],
+                                  repair=True)
+            refusal = verdict.refusal
+            if refusal is None and verdict.after is not None:  # repaired (extensions hook)
+                args = {"path": relative, "content": verdict.after}
         if refusal is not None:
             debuglog.record("stage", stage=f"{config.name}.refused", path=relative,
                             refusal=refusal[:600])
@@ -510,6 +583,28 @@ def unchanged_note(saved: list[str], failures: list[str]) -> str:
     failing = failures[0] if failures else "(the failing checks above)"
     return UNCHANGED_NOTE.format(files="file" if len(saved) == 1 else "files",
                                  paths=", ".join(saved), failing=failing[:QUOTED_CHARS * 2])
+
+
+def _can_sample(host: PipelineHost) -> bool:
+    """Whether one round's requests can carry their own sampling (an AgentHost's agent)."""
+    return isinstance(getattr(getattr(host, "agent", None), "sampling", None), dict)
+
+
+@contextlib.contextmanager
+def _sampled(host: PipelineHost, overrides: dict[str, Any]):
+    """The agent's request options with `overrides` (e.g. a temperature) for one round's
+    calls; the rest (the seed an eval pins) as they are. Restored afterwards."""
+    sampling = getattr(getattr(host, "agent", None), "sampling", None)
+    if not overrides or not isinstance(sampling, dict):
+        yield
+        return
+    saved = dict(sampling)
+    sampling.update(overrides)
+    try:
+        yield
+    finally:
+        sampling.clear()
+        sampling.update(saved)
 
 
 def _write_each(host: PipelineHost, config: LoopConfig, state: dict[str, str | None],
@@ -546,7 +641,8 @@ def run_loop(host: PipelineHost, config: LoopConfig,
     from . import teaching
 
     attempts: list[Attempt] = []
-    best: tuple[tuple[int, ...], int, dict[str, str | None]] | None = None  # (score, attempt, files)
+    # (rank, attempt, files, the loop's own rank): the rank may come from extensions.round_score
+    best: tuple[tuple[int, ...], int, dict[str, str | None], tuple[int, ...]] | None = None
     refused: dict[str, str] = {}
     state = dict(config.originals)  # what each target holds: the last content saved
     each = config.produce_each is not None
@@ -556,14 +652,27 @@ def run_loop(host: PipelineHost, config: LoopConfig,
     checked: dict[str, str | None] | None = None
     checked_problems: list[str] = []
     unchanged_before = False
-    for round_number in range(config.repairs + 1):
+    # extensions.stalled_round: unchanged rounds in a row, the last action taken on one, the next
+    # round's sampling, the rounds it added, and a handover the loop ends on
+    stalls = 0
+    stall_action: dict[str, Any] | None = None
+    sampling: dict[str, Any] = {}
+    limit, added_rounds = config.repairs + 1, 0
+    handover: dict[str, Any] | None = None
+    round_number = -1
+    while round_number + 1 < limit:
+        round_number += 1
+        overrides, sampling = sampling, {}
         produced = Produced()
         written_reply = reply = ""
         if each:
-            saved = _write_each(host, config, state, refused)
+            with _sampled(host, overrides):
+                saved = _write_each(host, config, state, refused)
         else:
             try:
-                reply = config.ask(messages) if config.ask is not None else host.ask(messages)
+                with _sampled(host, overrides):
+                    reply = (config.ask(messages) if config.ask is not None
+                             else host.ask(messages))
                 assert config.produce is not None and config.not_saved is not None
                 produced = config.produce(reply)
             except Exception as exc:  # noqa: BLE001 - fall back to the agent loop
@@ -608,10 +717,62 @@ def run_loop(host: PipelineHost, config: LoopConfig,
             # at temperature 0 the same feedback gives the same reply
             debuglog.record("stage", stage=f"{config.name}.unchanged", round=round_number + 1,
                             files=saved, again=unchanged_before)
+            features.mark_acted("unchanged_rounds", where=config.name)
             previous = attempts[-1].checks
             if config.done is not None and previous is not None \
                     and config.done(previous, round_number):
                 break  # the check would repeat the last one, and that ends the loop (stalled)
+            stalls += 1
+            action = (extensions.stalled_round(
+                config.name, project=host.project, targets=sorted(set(saved)), saved=saved,
+                failures=list(attempts[-1].failures),
+                output="\n".join(text for text in (previous.test_output, previous.report or "")
+                                 if text) if previous is not None else "",
+                stalls=stalls, previous=stall_action, can_widen=config.widen is not None,
+                can_handover=config.handover, can_sample=_can_sample(host), task=config.task,
+                round=round_number + 1) if not each or config.on_unchanged is not None else None)
+            if action is not None:
+                handed = action.get("handover")
+                if isinstance(handed, dict) and config.handover:
+                    handover = handed
+                    debuglog.record("stage", stage=f"{config.name}.stalled",
+                                    round=round_number + 1, stalls=stalls,
+                                    branch=action.get("branch", ""),
+                                    reason=action.get("reason", ""),
+                                    handover=handed.get("paths"))
+                    host.emit("notice", message=f"{config.title}: the rewrite left the file as it "
+                                                "was and the failing check points at another "
+                                                "file; handing the task to the project pipeline.")
+                    break
+                widened = (config.widen(list(action.get("widen") or []),
+                                        str(action.get("why") or ""))
+                           if action.get("widen") and config.widen is not None else [])
+                note_for = action.get("note_for")
+                note = (note_for(widened) if callable(note_for) else str(action.get("note") or "")
+                        ) or unchanged_note(saved, attempts[-1].failures)
+                temperature = action.get("temperature")
+                if isinstance(temperature, (int, float)) and _can_sample(host):
+                    sampling = {"temperature": float(temperature)}
+                if action.get("extra_round") and added_rounds < MAX_STALL_ROUNDS:
+                    added_rounds += 1
+                    limit += 1
+                stall_action = {"note": note, "branch": action.get("branch", "")}
+                debuglog.record("stage", stage=f"{config.name}.stalled", round=round_number + 1,
+                                stalls=stalls, branch=action.get("branch", ""),
+                                reason=action.get("reason", ""), widened=widened,
+                                temperature=sampling.get("temperature"), added=added_rounds,
+                                note=note[:1500])
+                unchanged_before = True
+                host.emit("discarded", reason="the rewrite left every file unchanged", retry=True)
+                if each:
+                    assert config.on_unchanged is not None
+                    config.on_unchanged(note)
+                else:
+                    messages += [{"role": "assistant", "content": reply},
+                                 {"role": "user", "content": note}]
+                if config.stop_early is not None and config.stop_early(round_number):
+                    break
+                continue
             if unchanged_before or (each and config.on_unchanged is None):
                 host.emit("notice", message=f"{config.title}: the rewrite left every file as it "
                                             "was; keeping the best round.")
@@ -629,6 +790,7 @@ def run_loop(host: PipelineHost, config: LoopConfig,
                 break
             continue
         unchanged_before = False
+        stalls, stall_action = 0, None
         checks = config.check(saved)
         if unchanged:  # every file the loop targets or saved, as this round's check left them
             checked_problems = list(produced.problems)  # format problems are part of the result
@@ -638,6 +800,13 @@ def run_loop(host: PipelineHost, config: LoopConfig,
             checks.kinds = {"format checks": produced.checked, **checks.kinds}
         refused_now = [f"{path}: not saved — {text.splitlines()[0] if text else ''}"
                        for path, text in refused.items() if path in produced.writes]
+        if checks.items is not None:  # the format checks and unsaved writes, as above
+            checks.items = (counted_items("format", "", max(produced.checked,
+                                                            len(produced.problems)),
+                                          produced.problems)
+                            + [item("write", line.split(":", 1)[0], False,
+                                    line.split(" — ", 1)[-1]) for line in refused_now]
+                            + checks.items)
         checks.failures = produced.problems + refused_now + checks.failures
         if checks.report is None:
             summary = (f"{checks.total - checks.failed}/{checks.total} checks passed"
@@ -652,13 +821,27 @@ def run_loop(host: PipelineHost, config: LoopConfig,
                                       if checks.test_output else [])
         attempts.append(Attempt(checks.total - checks.failed, checks.total, failures,
                                 dict(checks.kinds), checks.failed, written_reply, checks))
+        extensions.checks_recorded(config.name, checks=checks, round=round_number + 1,
+                                   project=host.project, task=config.task,
+                                   request=config.request or config.task,
+                                   last=round_number >= config.repairs,
+                                   ask=host.ask, originals=config.originals)
+        if checks.added:  # an extension's failing checks: in this round's record too
+            attempts[-1].failures += checks.added
+            attempts[-1].failed = checks.failed
         debuglog.record("stage", stage=f"{config.name}.round", round=round_number + 1,
                         files=saved, checks=checks.total, failing=checks.failed)
-        score = config.score(checks) if config.score is not None else (checks.failed,)
+        own = config.score(checks) if config.score is not None else (checks.failed,)
+        score = extensions.round_score(config.name, checks=checks, default=own,
+                                       round=round_number + 1, project=host.project,
+                                       task=config.task)
+        if score != own:
+            debuglog.record("stage", stage=f"{config.name}.rank", round=round_number + 1,
+                            score=list(score), own=list(own))
         if best is None or score < best[0]:
             files = (config.snapshot() if config.snapshot is not None
                      else {path: state.get(path) for path in config.targets})
-            best = (score, len(attempts) - 1, files)
+            best = (score, len(attempts) - 1, files, own)
         if config.done(checks, round_number) if config.done is not None else checks.failed == 0:
             break
         if each:
@@ -673,7 +856,7 @@ def run_loop(host: PipelineHost, config: LoopConfig,
         if config.stop_early is not None and config.stop_early(round_number):
             break
     if best is None:
-        return LoopResult(attempts, None, {}, messages, refused)
+        return LoopResult(attempts, None, {}, messages, refused, handover)
     kept = best[2]
     if config.snapshot is not None and features.on("restore_later_files"):
         # A file first written after the kept round is not in its snapshot: put it back as it
@@ -681,9 +864,11 @@ def run_loop(host: PipelineHost, config: LoopConfig,
         # stayed, and the package failed its own tests).
         later = {path: config.originals[path] for path in config.snapshot()
                  if path not in kept and path in config.originals}
+        if later:
+            features.mark_acted("restore_later_files", paths=sorted(later))
         kept = {**kept, **later}
-    restore(host, config, kept, failing=best[0][0] if config.score is None else best[0])
-    return LoopResult(attempts, best[1], kept, messages, refused)
+    restore(host, config, kept, failing=best[3][0] if config.score is None else best[3])
+    return LoopResult(attempts, best[1], kept, messages, refused, handover)
 
 
 def restore(host: PipelineHost, config: LoopConfig, snapshot: dict[str, str | None], *,
@@ -778,8 +963,9 @@ def left_note(left: dict[str, str]) -> str:
 
 
 def answer_for(result: LoopResult, config: LoopConfig, *, done: str = "Implemented the code in",
-               nothing: str = "checks", what: str = "code") -> str:
-    """honest_answer for a finished loop, with the failing lines quoted and the files left."""
+               nothing: str = "checks", what: str = "code", agent: Any = None) -> str:
+    """honest_answer for a finished loop, with the failing lines quoted and the files left
+    (`agent`: the pipeline's agent, passed on to the final_answer hook)."""
     kept = result.kept
     assert kept is not None
     changed = [p for p in config.targets
@@ -791,13 +977,18 @@ def answer_for(result: LoopResult, config: LoopConfig, *, done: str = "Implement
                            kept=unchanged or config.targets[:1], done=done, nothing=nothing,
                            what=what)
     if kept.failed and features.on("failing_checks_quoted"):
-        answer += failing_lines(kept.failures)
+        quoted = failing_lines(kept.failures)
+        if quoted:
+            features.mark_acted("failing_checks_quoted", where="write_loop")
+        answer += quoted
     left = {}
     for path in config.targets:
         if result.snapshot.get(path) is None:
             why = result.refused.get(path, "")
             left[path] = (why.splitlines()[0][:160] if why else "not produced")
-    return answer + left_note(left)
+    return extensions.final_answer(answer + left_note(left), source=config.name, result=result,
+                                   config=config, changed=changed, left=left, what=what,
+                                   **({"agent": agent} if agent is not None else {}))
 
 
 # -- the named check command ----------------------------------------------------------------------

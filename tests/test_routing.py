@@ -235,6 +235,41 @@ def test_run_takes_the_route_and_records_it(tmp_path: Path, monkeypatch) -> None
     assert agent.last_route["targets"] == ["sundial/cycles.py"]
 
 
+def test_core_does_not_record_a_direct_pipelines_exchange(tmp_path: Path, monkeypatch) -> None:
+    """0.3.1: the direct pipeline's exchange is not added to the conversation (an extension may add
+    it through the routed_answer hook)."""
+    from vega import extensions
+
+    _package(tmp_path)
+    task = "Implement `sundial.cycles.next_chime(cycles, after=0)`. " + "More spec. " * 60
+    agent = _agent(tmp_path, monkeypatch, [])
+    assert agent.run(task) == "(direct)"
+    assert not [m for m in agent.messages if m.get("role") == "user" and m.get("content") == task]
+    seen = []
+    monkeypatch.setattr(extensions, "_impl", lambda name: (lambda *a, **k: seen.append((a, k)))
+                        if name == "routed_answer" else None)
+    agent = _agent(tmp_path, monkeypatch, [])
+    agent.run(task)
+    (args, kwargs), = seen
+    assert args[1:] == (task, "(direct)") and kwargs["route"] == "direct" and kwargs["before"] >= 1
+
+
+def test_a_pipeline_that_records_itself_is_not_recorded_twice(tmp_path: Path, monkeypatch) -> None:
+    from vega import pipeline
+
+    _package(tmp_path)
+    agent = _agent(tmp_path, monkeypatch, [])
+
+    def records(agent, task, **kwargs):
+        agent.messages += [{"role": "user", "content": task}, {"role": "assistant", "content": "x"}]
+        return "x"
+
+    monkeypatch.setattr(pipeline, "run", records)
+    task = "Implement `sundial.cycles.next_chime(cycles, after=0)`. " + "More spec. " * 60
+    agent.run(task)
+    assert sum(m.get("content") == task for m in agent.messages) == 1
+
+
 def test_a_pipeline_that_declines_falls_back_to_the_agent_loop(tmp_path: Path, monkeypatch) -> None:
     from vega import pipeline
 
@@ -265,3 +300,78 @@ def test_switched_off_pipelines_are_skipped_by_the_table(tmp_path: Path, monkeyp
     route = routing.route_task("Implement `sundial.cycles.next_chime`.", tmp_path)
     assert route.name == "project"  # the next row: one target, with acceptance checks
     assert "direct_pipeline is off" in "; ".join(route.reasons)
+
+
+# -- reference_docs: a document named as where the rules are is an input --------------------------
+
+def _consent(root: Path) -> None:
+    (root / "mailroom").mkdir()
+    (root / "mailroom" / "__init__.py").write_text("")
+    (root / "mailroom" / "consent.py").write_text(
+        'def withdraw_consent(user_id):\n    """Stop marketing mail."""\n    raise NotImplementedError\n')
+    (root / "docs").mkdir()
+    (root / "docs" / "CONSENT.md").write_text("# Consent\n\nRecord the withdrawal time.\n")
+
+
+@pytest.mark.parametrize("task", [
+    "Implement `withdraw_consent` in mailroom/consent.py. What it has to do is in docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py; the rules are in docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py as described in docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py (`docs/CONSENT.md` describes it).",
+    "Implement `withdraw_consent` in mailroom/consent.py, following docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py per docs/CONSENT.md.",
+    ("Everything it needs to do is listed in docs/CONSENT.md: implement `withdraw_consent` in "
+    "mailroom/consent.py."),
+])
+def test_a_named_reference_doc_is_an_input(tmp_path: Path, task: str,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    _consent(tmp_path)
+    monkeypatch.setenv(features.ENV_ON, "reference_docs")  # opt-in since 2026-11-03 (night A/B hurt)
+    route = routing.route_task(task, tmp_path)
+    assert "docs/CONSENT.md" in route.inputs and "docs/CONSENT.md" not in route.other_targets
+    assert route.targets == ["mailroom/consent.py"]
+    monkeypatch.delenv(features.ENV_ON)
+    if "has to do" in task:  # the measured case: "to" read as a change cue before the switch
+        assert "docs/CONSENT.md" in routing.route_task(task, tmp_path).other_targets
+
+
+@pytest.mark.parametrize("task", [
+    "Implement `withdraw_consent` in mailroom/consent.py and document it in docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py and add a section to docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py and fix the typo in docs/CONSENT.md.",
+    "Implement `withdraw_consent` in mailroom/consent.py and update docs/CONSENT.md.",
+])
+def test_a_doc_to_change_stays_a_target(tmp_path: Path, task: str) -> None:
+    _consent(tmp_path)
+    route = routing.route_task(task, tmp_path)
+    assert "docs/CONSENT.md" in route.other_targets
+
+
+def test_the_project_pipeline_shows_a_reference_doc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vega import project_pipeline
+
+    monkeypatch.setenv(features.ENV_ON, "reference_docs")
+    _consent(tmp_path)
+    task = "Implement `withdraw_consent` in mailroom/consent.py. What it has to do is in docs/CONSENT.md."
+    record = routing.route_task(task, tmp_path).record()
+    inputs = project_pipeline.read_only_inputs(tmp_path, record)
+    assert inputs == ["docs/CONSENT.md"]
+    assert "Record the withdrawal time." in project_pipeline.inputs_text(tmp_path, inputs)
+
+
+# -- extensions.question_sentence: without an extension the core counts the verb (0.3.1) ----------
+
+def test_question_sentence_hook_decides_a_question_verb(tmp_path: Path, monkeypatch) -> None:
+    from vega import extensions
+
+    task = "Which tests should we add?"
+    assert routing.change_verbs(task) == ["add"]  # 0.3.1: "should we add" is a request lead
+    seen = []
+
+    def asked(sentence, *, before, after):
+        seen.append((before, after))
+        return True
+
+    monkeypatch.setattr(extensions, "_impl", lambda name: asked if name == "question_sentence" else None)
+    assert routing.change_verbs(task) == []
+    assert seen[0] == ("Which tests should we ", "?")

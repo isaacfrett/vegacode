@@ -185,7 +185,8 @@ def ask_approval(plan: WritePlan, out: Console | None = None) -> bool:
 class TerminalRenderer:
     """on_event handler for CodingAgent that draws progress in the terminal as it happens."""
 
-    def __init__(self, out: Console | None = None, *, stream_text: bool = False):
+    def __init__(self, out: Console | None = None, *, stream_text: bool = False,
+                 hold_questions: bool = False):
         # By default the model's raw text is held back until it is known to be the final answer:
         # a 7B often "thinks out loud", writes tool calls as JSON text or asks questions that the
         # harness sends back, and printing that live buried the progress lines (2026-10-13).
@@ -196,6 +197,9 @@ class TerminalRenderer:
         self._working = None  # spinner shown while the model reads/writes
         self._turn_started = 0.0
         self._last_label = 0.0
+        # the chat loop shows an answer that asks questions itself (extensions.present_questions)
+        self.hold_questions = hold_questions
+        self.held: tuple[str, list[Any]] | None = None
 
     def __call__(self, kind: str, data: dict[str, Any]) -> None:
         handler = getattr(self, f"_on_{kind}", None)
@@ -288,9 +292,27 @@ class TerminalRenderer:
         self._end_stream()
         self.console.print(Text(message, style="dim"))
 
-    def _on_final(self, text: str, streamed: bool) -> None:
+    def _on_final(self, text: str, streamed: bool, addendum: str = "",
+                  questions: list[Any] | None = None) -> None:
         self._stop_working()
         self._end_stream()
         self._turn_started = 0.0
+        from . import extensions
+
+        if questions and self.hold_questions and not streamed:
+            self.held = (text, questions)  # take_held: the chat loop shows it
+            return
         if not (streamed and self.stream_text):  # held-back text is shown here, formatted
-            self.console.print(Markdown(text))
+            self.console.print(Markdown(extensions.render_markdown(text)))
+        elif addendum:  # streamed: the answer is on screen; text added after it follows
+            self.console.print(Markdown(extensions.render_markdown(addendum)))
+
+    def take_held(self) -> tuple[str, list[Any]] | None:
+        """The answer held back because it asks questions (hold_questions), once."""
+        held, self.held = self.held, None
+        return held
+
+    def show_answer(self, text: str) -> None:
+        from . import extensions
+
+        self.console.print(Markdown(extensions.render_markdown(text)))

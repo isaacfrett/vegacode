@@ -119,6 +119,7 @@ def _lint_note(project: Path, path: Path, text: str) -> str:
     findings = _ruff_findings(ruff, project, path, text)
     if findings is None:  # ruff failed (bad config, timeout): stay quiet rather than add noise
         return ""
+    features.mark_acted("lint", findings=len(findings))  # "Lint: OK." is a change too
     if not findings:
         return "\nLint: OK."
     shown = findings[:LINT_LIMIT]

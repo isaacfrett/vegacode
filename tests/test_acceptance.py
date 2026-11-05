@@ -430,8 +430,7 @@ def test_a_script_the_task_only_runs_is_not_a_target(tmp_path: Path) -> None:
 
 # -- broad sample 2026-10-17: prose `f()` and stubs ---------------------------------------------------
 
-def test_prose_call_with_empty_parens_is_not_a_zero_arg_signature(tmp_path: Path,
-                                                                   monkeypatch) -> None:
+def test_prose_call_with_empty_parens_is_not_a_zero_arg_signature(tmp_path: Path) -> None:
     """A task saying "use it in `cashdesk/receipt.py`'s `total_line()`" was read as
     total_line() taking no parameters, failing a correct total_line(amounts)."""
     (tmp_path / "cashdesk").mkdir()
@@ -448,9 +447,6 @@ def test_prose_call_with_empty_parens_is_not_a_zero_arg_signature(tmp_path: Path
     (tmp_path / "cashdesk" / "app.py").write_text("def create_app(config=None):\n    return 1\n")
     kept = acceptance.extract(tmp_path, "Fix `create_app()` in `cashdesk/app.py`.").names[0]
     assert kept.params == []  # the code takes no required parameters: the statement stands
-    switch_off(monkeypatch, "acceptance_prose_calls")
-    off = {r.attr: r for r in acceptance.extract(tmp_path, task).names}
-    assert off["total_line"].params == []
 
 
 STUBBY = '''from abc import ABC, abstractmethod

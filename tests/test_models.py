@@ -45,6 +45,18 @@ def test_modelfile_has_base_ctx_and_params(profiles_file: Path) -> None:
     assert text.startswith("FROM qwen2.5-coder:7b-instruct-q4_K_M\n")
     assert "PARAMETER num_ctx 8192" in text and "PARAMETER temperature 0.2" in text
     assert "temperature" not in models.get("thinker").modelfile()
+    assert "RENDERER" not in models.get("small").modelfile()  # a library model keeps its own wiring
+
+
+def test_modelfile_sets_ollamas_renderer_and_parser(profiles_file: Path) -> None:
+    profiles_file.write_text(PROFILES + '\n[profiles.hf]\nbase = "hf.co/org/repo:Q4_K_M"\n'
+                             'renderer = "lfm2"\nparser = "lfm2"\n')
+    text = models.get("hf").modelfile()
+    assert text.startswith("FROM hf.co/org/repo:Q4_K_M\nRENDERER lfm2\nPARSER lfm2\n\nPARAMETER num_ctx 8192\n")
+    # one Modelfile word: a value that would add a line (or an instruction) is refused at load
+    profiles_file.write_text(PROFILES + '\n[profiles.hf]\nbase = "x"\nparser = "lfm2\\nSYSTEM hi"\n')
+    with pytest.raises(ValueError, match="parser .* is not an Ollama parser name"):
+        models.load()
 
 
 def test_unknown_profile_and_bad_default(profiles_file: Path) -> None:

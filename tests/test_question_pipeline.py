@@ -196,3 +196,16 @@ def test_nothing_runs_without_one_literal_input(tmp_path: Path, task: str, monke
 def test_question_numbers_skip_templates_lines_and_versions() -> None:
     assert question_pipeline.question_numbers(FUEL) == ["500"]
     assert question_pipeline.question_numbers("On SQLite 3.50, line 12: what is f for `7`?") == ["7"]
+
+
+def test_change_request_hook_turns_a_question_into_a_change(monkeypatch) -> None:
+    """0.3.1: "can you build an AI assistant?" is a conversational question (an extension may read
+    it as a change through extensions.change_request)."""
+    from vega import extensions
+
+    task = "can you build an AI assistant?"
+    assert question_pipeline.is_question(task) and question_pipeline.is_conversation(task)
+    monkeypatch.setattr(extensions, "_impl", lambda name: (lambda t: t == task)
+                        if name == "change_request" else None)
+    assert not question_pipeline.is_question(task)
+    assert question_pipeline.is_question("What does `load` return?")

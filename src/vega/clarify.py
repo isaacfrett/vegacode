@@ -15,7 +15,8 @@ A gate at the start of a new top-level turn classifies the request with cheap ru
 - `vague`: an open-ended thing to build ("a workflow", "an app", "a pipeline", "a dashboard", ...)
   with nothing that pins it down, or a short request whose only object is "it"/"this" with no
   earlier conversation to resolve it. Vega replies with 2-4 numbered questions whose options come
-  from the project (data files, modules, the test command); no tool runs, no file is written.
+  from the project (data files, modules); no tool runs, no file is written. Never where the code
+  should live (the folder Vega runs in) or how to verify it (Vega decides; 2026-10-24).
 - `unsure`: a short change request with no anchor ("Add low-stock alerts to the inventory."). The
   project may settle it (a README naming the export format) or not. With the switch
   `clarify_model` (default on since 2026-10-17) one short model call with a constrained JSON reply
@@ -34,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import debuglog, features, verbs
+from . import debuglog, extensions, features, verbs
 
 if TYPE_CHECKING:
     from .agent import CodingAgent
@@ -103,14 +104,21 @@ _PRONOUN_ONLY = re.compile(
 _CONSTRAINT = re.compile(r"\b(?:Do not|Don't|Only report)[^.!?]*[.!?]", re.IGNORECASE)
 _MONITOR = re.compile(r"\b(?:loop|watch\w*|monitor\w*|measur\w*|track\w*|metrics?|schedul\w*)\b",
                       re.IGNORECASE)
-_VERIFY = re.compile(r"\b(?:verify|verif\w+|test\w*|check\w*|end to end|e2e|validat\w*)\b",
-                     re.IGNORECASE)
 
 
 @dataclass
 class Verdict:
     kind: str  # CLEAR, VAGUE or UNSURE
     reasons: list[str] = field(default_factory=list)
+    # questions to ask as they are (an extension's verdict); empty: the gate builds its own
+    questions: list[tuple[str, list[str]]] = field(default_factory=list)
+    # the reply to send as it is with those questions ("": the gate renders them)
+    reply: str = ""
+    # what "go with your picks" means for those questions: the recommended options, one line each
+    defaults: str = ""
+    # a clear request that leaves choices open: what Vega assumed (added to the request every
+    # route sees, and listed at the start of the reply)
+    assumptions: list[str] = field(default_factory=list)
 
 
 def classify(task: str, *, follow_up: bool = False) -> Verdict:
@@ -226,35 +234,32 @@ def _top_modules(modules: list[str]) -> list[str]:
 
 
 def rule_questions(task: str, facts: ProjectFacts) -> list[tuple[str, list[str]]]:
-    """2-4 questions with options grounded in the project, for a request the rules call vague."""
+    """2-4 questions with options grounded in the project, for a request the rules call vague.
+
+    Never where the code should live (the project is the folder Vega runs in) nor how to verify
+    it (Vega writes and runs the checks itself): owner feedback 2026-10-24, "where it should live
+    should be based on the directory I'm in", "how it should verify is up to Vega"."""
     thing = _OPEN_BUILD.search(task)
     noun = re.sub(r"^(?:a|an|some|me\s+an?|my|new|the\s+new)\s+", "", thing.group(0),
                   flags=re.IGNORECASE).strip() if thing else "change"
-    inputs = [f"read `{path}`" for path in facts.data_files]
-    what = [*inputs[:2], "call a model on prompts I give you and save the replies",
-            "something else (describe the input and the output)"]
     if not thing:  # "make it faster", "fix it": the target is the open question
         targets = [f"`{path}`" for path in (facts.related or facts.modules)[:3]]
-        questions = [("Which part of the project do you mean?", [*targets, "something else (name it)"]),
-                     ("What counts as done?", ["a number to reach (e.g. a time or size)",
-                                               "a failing test or example that should pass",
-                                               "something else"])]
-        if facts.test_command:
-            questions.append(("How should I check it?",
-                              [f"run the tests (`{facts.test_command}`)", "a before/after timing",
-                               "both"]))
-        return questions
-    where = [f"inside `{path}`" for path in facts.related[:2]]
-    where += [f"a new module in `{name}`" for name in facts.modules[:2] if name.endswith("/")]
-    where.append("a new standalone script")
-    questions = [(f"What should the {noun} take in and produce?", what[:4]),
-                 ("Where should it live?", where[:4])]
-    if _VERIFY.search(task) or facts.test_command:
-        check = []
-        if facts.test_command:
-            check.append(f"pytest tests run with `{facts.test_command}`")
-        check += ["a sample run on a small input, output shown to you", "both"]
-        questions.append(("How should I verify it end to end?", check[:3]))
+        return [("Which part of the project do you mean?", [*targets, "something else (name it)"]),
+                ("What should be better afterwards?", ["faster (a time to reach)",
+                                                       "a failing example that should work",
+                                                       "simpler code, same behaviour",
+                                                       "something else"])]
+    inputs = [f"read `{path}`" for path in facts.data_files]
+    source = [*inputs[:2], "files you give it (CSV or JSON)",
+              "a sourcing tool I build that pulls public data (official APIs, open datasets)",
+              "data you type in"]
+    questions = [(f"Where should the {noun}'s data come from?", source[:4]),
+                 (f"How do you want to use the {noun}?",
+                  ["a command-line tool that prints reports", "a small local web page",
+                   "a Python library you call from your own code"]),
+                 ("How much should the first version do?",
+                  ["the core feature end to end, then build on it",
+                   "a fuller version with more features in one go"])]
     if _MONITOR.search(task):
         questions.append(("What should the loop measure, and when should it run?",
                           ["latency and success rate of each run",
@@ -316,22 +321,24 @@ def model_check(agent: CodingAgent, task: str) -> list[tuple[str, list[str]]] | 
     any error: the gate never blocks a turn)."""
     from .tools import _project_files
 
+    readme_chars = extensions.budget("clarify.README_CHARS", README_CHARS, agent=agent)
+    context_chars = extensions.budget("clarify.CONTEXT_CHARS", CONTEXT_CHARS, agent=agent)
     files = []
     for path in _project_files(agent.project, limit=FILES_SHOWN):
         files.append(path.relative_to(agent.project).as_posix())
     readme = ""
     for name in ("README.md", "README.rst", "README.txt", "README"):
-        readme = _read(agent.project / name, README_CHARS)
+        readme = _read(agent.project / name, readme_chars)
         if readme:
             break
     if not readme:
-        readme = next((_read(agent.project / f, README_CHARS) for f in files
+        readme = next((_read(agent.project / f, readme_chars) for f in files
                        if f.lower().endswith("readme.md")), "")
     # what the agent loaded at session start (VEGA.md, session digests, notes): "the bug we found
     # last session" is settled there, not in the README
     loaded = (getattr(agent, "context_section", "") or "").strip()
-    if len(loaded) > CONTEXT_CHARS:
-        loaded = "…" + loaded[-CONTEXT_CHARS:]  # the newest digests are last
+    if len(loaded) > context_chars:
+        loaded = "…" + loaded[-context_chars:]  # the newest digests are last
     user = (f"Request: {task}\n\nProject files:\n" + "\n".join(files)
             + (f"\n\nREADME:\n{readme}" if readme else "")
             + (f"\n\nProject context from earlier sessions:\n{loaded}" if loaded else ""))
@@ -340,9 +347,11 @@ def model_check(agent: CodingAgent, task: str) -> list[tuple[str, list[str]]] | 
     sampling = {**agent.sampling,
                 **({"temperature": CHECK_TEMPERATURE} if features.on("clarify_greedy") else {}),
                 "max_tokens": min(CHECK_MAX_TOKENS, agent.sampling.get("max_tokens", 10**6))}
+    if features.on("clarify_greedy") and agent.sampling.get("temperature") != CHECK_TEMPERATURE:
+        features.mark_acted("clarify_greedy")
     try:
         reply = agent.client.chat.completions.create(
-            model=agent.model, **sampling,
+            model=extensions.side_model("clarify", agent=agent), **sampling,
             messages=[{"role": "system", "content": CHECK_SYSTEM}, {"role": "user", "content": user}],
             response_format={"type": "json_schema",
                              "json_schema": {"name": "clarify", "schema": CHECK_SCHEMA}},
@@ -370,36 +379,74 @@ def is_follow_up(agent: CodingAgent) -> bool:
                for m in agent.messages[1:])
 
 
+# "go with your picks", "defaults", "your call": the user takes every recommended option
+ACCEPT_DEFAULTS = re.compile(
+    r"^\W*(?:ok(?:ay)?[,\s]+|sure[,\s]+|yes[,\s]+|just\s+)*(?:go\s+(?:with|for)\s+)?"
+    r"(?:(?:your|the)\s+(?:picks?|recommendations?|recommended(?:\s+options?)?|defaults?|choices?"
+    r"|call|suggestions?)|defaults?|recommended(?:\s+options?)?|you\s+(?:choose|pick|decide)"
+    r"|whatever\s+you\s+(?:recommend|think|suggest)|all\s+recommended)\W*$",
+    re.IGNORECASE,
+)
+
+
 def answered(agent: CodingAgent, task: str) -> str:
     """The turn after Vega's questions: the original request with the user's answers, so the goal
     stands on its own (pipelines see only the task, and compaction keeps the goal but may drop the
-    questions). Any other turn: the task unchanged."""
+    questions). "go with your picks" / "defaults" becomes the recommended options themselves. Any
+    other turn: the task unchanged."""
     pending = getattr(agent, "_clarify_pending", None)
+    defaults = getattr(agent, "_clarify_defaults", "")
     agent._clarify_pending = None
+    agent._clarify_defaults = ""
     if not pending:
         return task
+    hooked = extensions.clarify_answer(agent, task, pending=pending, defaults=defaults)
+    if hooked is not None:
+        return hooked
+    if defaults and ACCEPT_DEFAULTS.match(task):
+        return f"{pending}\n\nMy answers to your questions (your recommended options):\n{defaults}"
     return f"{pending}\n\nMy answers to your questions:\n{task}"
+
+
+def assumptions_note(assumptions: list[str]) -> str:
+    """What the routes see after a clear request that leaves choices open."""
+    lines = "\n".join(f"- {item}" for item in assumptions)
+    return ("(Vega: the request leaves these choices open; build it with these assumptions, "
+            f"which the reply lists first:\n{lines})")
+
+
+def assumptions_text(assumptions: list[str]) -> str:
+    """The list at the start of the reply."""
+    return "Assumptions:\n" + "\n".join(f"- {item}" for item in assumptions)
 
 
 def run(agent: CodingAgent, task: str) -> str | None:
     """The clarifying reply for an underspecified request, or None to go on with the turn. Call
     `answered` first: a turn that answers Vega's questions is never gated again."""
-    verdict = classify(task, follow_up=is_follow_up(agent))
+    follow_up = is_follow_up(agent)
+    verdict = classify(task, follow_up=follow_up)
     debuglog.record("stage", stage="clarify.route", verdict=verdict.kind, reasons=verdict.reasons)
+    verdict = extensions.clarify_verdict(task, verdict, agent=agent, follow_up=follow_up)
+    agent._clarify_assumptions = list(verdict.assumptions) if verdict.kind == CLEAR else []
     if verdict.kind == CLEAR:
         return None
     questions: list[tuple[str, list[str]]] | None
-    if verdict.kind == VAGUE:
+    if verdict.questions:
+        questions = verdict.questions
+    elif verdict.kind == VAGUE:
         questions = rule_questions(task, project_facts(agent.project, task))
     elif features.on("clarify_model"):
+        features.mark_acted("clarify_model")  # a model call the rules alone would not make
         agent._emit("notice", message="Checking whether the request needs a decision from you")
         questions = model_check(agent, task)
     else:
         return None
     if not questions:
         return None
-    reply = render(questions)
+    reply = verdict.reply if verdict.questions and verdict.reply else render(questions)
     agent._emit("notice", message="Asking before building: the request leaves decisions open")
     agent.messages += [{"role": "user", "content": task}, {"role": "assistant", "content": reply}]
     agent._clarify_pending = task
+    agent._clarify_defaults = verdict.defaults if verdict.questions else ""
+    agent.questions_asked = list(questions)
     return reply

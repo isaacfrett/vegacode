@@ -9,13 +9,22 @@ Options (2026-10-20):
 - `values` (script_error_values): on an exception the traceback starts at the script (the runner's
   own frames dropped) with its source lines, followed by the values of the names on the failing
   line of the script's innermost frames (`values_frames`, each repr cut at `values_width`).
-- `guard` (sandbox_read_guard): an audit hook refuses reads (open, listdir, scandir, glob, and
+- `guard` (always on; the switch sandbox_read_guard is retired): an audit hook refuses reads (open, listdir, scandir, glob, and
   subprocess arguments) of host paths outside the project: home folders, /etc, /var, /Volumes and
   the like. Python-level only and platform independent; the macOS sandbox profile enforces the
   same at the kernel level. `fixture_root`: the task maps a folder of the project to `/`
   ("`root/` stands for `/`"), so a refused absolute path says where its copy is.
+- `linked_sites` (set by an extension; absent by default): `guard` also allows the real targets of
+  symlinked entries in the folders on the interpreter's import path (a site whose packages are links).
+- `path_map` (2026-10-27, set by an extension; absent by default): the folder the task maps to
+  `/`. A read of an absolute path (open for reading, stat, listdir, scandir and what uses them:
+  os.path.exists, pathlib, glob, os.walk) whose copy exists under that folder reads the copy, so
+  the script keeps the real path (`/etc/nginx/nginx.conf`) in its variables and its answer.
+  Writes are never mapped; a path without a copy is left alone (and refused by `guard`).
 """
 
+import builtins
+import io
 import json
 import linecache
 import os
@@ -44,7 +53,69 @@ def _windows_denied():
     return (os.path.normcase(system + "\\Users"), os.path.normcase(system + "\\ProgramData"))
 
 
-def install_guard(cwd, fixture_root="", real_home=""):
+def install_path_map(cwd, folder):
+    """`path_map`: reads of `/<p>` go to `<cwd>/<folder>/<p>` when that copy exists."""
+    base = os.path.realpath(os.path.join(cwd, folder))
+    inside = os.path.realpath(cwd)
+    real_open, real_stat, real_lstat = builtins.open, os.stat, os.lstat
+    real_listdir, real_scandir = os.listdir, os.scandir
+
+    def mapped(raw):
+        if raw is None or isinstance(raw, int):
+            return raw
+        try:
+            text = os.fspath(raw)
+        except TypeError:
+            return raw
+        if isinstance(text, bytes) or not text.startswith("/") or _under(text, [inside, base]):
+            return raw
+        candidate = os.path.normpath(os.path.join(base, text.lstrip("/")))
+        if not _under(candidate, [base]):
+            return raw
+        try:
+            real_lstat(candidate)
+        except OSError:
+            return raw
+        return candidate
+
+    def map_open(file, mode="r", *args, **kwargs):
+        if isinstance(mode, str) and not any(flag in mode for flag in "wax+"):
+            file = mapped(file)
+        return real_open(file, mode, *args, **kwargs)
+
+    def map_stat(path, *args, **kwargs):
+        return real_stat(mapped(path), *args, **kwargs)
+
+    def map_lstat(path, *args, **kwargs):
+        return real_lstat(mapped(path), *args, **kwargs)
+
+    def map_listdir(path="."):
+        return real_listdir(mapped(path))
+
+    def map_scandir(path="."):
+        return real_scandir(mapped(path))
+
+    builtins.open = io.open = map_open
+    os.stat, os.lstat, os.listdir, os.scandir = map_stat, map_lstat, map_listdir, map_scandir
+
+
+def _has_copy(cwd, folder, text):
+    """`path_map`: absolute `text` has a copy under `<cwd>/<folder>` (for a glob pattern, the
+    folder before its first wildcard)."""
+    if not folder or not text.startswith("/"):
+        return False
+    base = os.path.realpath(os.path.join(cwd, folder))
+    literal = _MAGIC.split(text, 1)[0]
+    if literal != text:
+        literal = os.path.dirname(literal)
+    candidate = os.path.normpath(os.path.join(base, literal.lstrip("/")))
+    return _under(candidate, [base]) and os.path.lexists(candidate)
+
+
+_MAGIC = re.compile(r"[*?\[]")
+
+
+def install_guard(cwd, fixture_root="", real_home="", mapped="", linked_sites=False):
     """Refuse reads of host paths outside `cwd` and the interpreter's own folders."""
     allowed = [os.path.realpath(cwd)]
     for entry in os.scandir(cwd):  # the clone's linked folders (.git, .venv, node_modules)
@@ -53,6 +124,12 @@ def install_guard(cwd, fixture_root="", real_home=""):
     for root in (sys.prefix, sys.base_prefix, sys.exec_prefix, *sys.path):
         if root:
             allowed += [os.path.abspath(root), os.path.realpath(root)]
+    for root in filter(None, sys.path) if linked_sites else ():  # a site whose packages are links
+        try:
+            allowed += [os.path.realpath(entry.path) for entry in os.scandir(root)
+                        if entry.is_symlink()]
+        except OSError:
+            pass
     allowed += [os.path.realpath(p) for p in ALLOWED_INSIDE] + list(ALLOWED_INSIDE)
     allowed += [os.path.realpath(os.environ.get("TMPDIR", cwd))]
     # never a root that would open a whole home folder (a python in ~/bin, a `/` on sys.path)
@@ -71,12 +148,17 @@ def install_guard(cwd, fixture_root="", real_home=""):
             text = os.fsdecode(raw)
         except TypeError:
             return None
+        if mapped and _has_copy(cwd, mapped, text):
+            return None  # path_map reads its copy (a glob pattern: its folder has one)
         full = os.path.realpath(os.path.join(cwd, os.path.expanduser(text)))
         check = os.path.normcase(full)
         if not _under(check, denied) or _under(check, [os.path.normcase(a) for a in allowed]):
             return None
         hint = ""
-        if fixture_root and text.startswith("/"):
+        if fixture_root and text.startswith("/") and mapped:
+            hint = (" The task says `" + fixture_root + "/` stands for `/`, and the snapshot has "
+                    "no " + fixture_root + text + ": read only the files it has.")
+        elif fixture_root and text.startswith("/"):
             hint = (" The task says `" + fixture_root + "/` stands for `/`: read "
                     + fixture_root + text + " instead.")
         return PermissionError(
@@ -153,9 +235,12 @@ def main():
     path = os.path.abspath(options.get("name", "deliverable_script.py"))  # as if in the root
     namespace = {"__name__": "__main__", "__file__": path}
     code = compile(source, path, "exec")
+    if options.get("path_map"):
+        install_path_map(os.getcwd(), options["path_map"])
     if options.get("guard"):
         install_guard(os.getcwd(), options.get("fixture_root") or "",
-                      options.get("real_home") or "")
+                      options.get("real_home") or "", mapped=options.get("path_map") or "",
+                      linked_sites=bool(options.get("linked_sites")))
     if options.get("values"):
         linecache.cache[path] = (len(source), None, source.splitlines(True), path)
         try:

@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import data_preview, features, pipeline, verbs
+from . import data_preview, extensions, features, home_start, pipeline, verbs
 from .pipeline import (
     _CHANGE_AFTER,
     _CHANGE_CUE,
@@ -147,6 +147,13 @@ class Route:
     # direct_context: project modules the target imports and docs naming a distinctive task
     # token, shown to the direct writer after the inputs, within what the window leaves
     related: list[str] = field(default_factory=list)
+    # set only by an extension's route_task hook: "advise" is a read-only advice turn ("what
+    # should we do next?"), run by the agent loop with no write tool (CodingAgent._run_advice)
+    # in at most `steps` tool steps (0: the agent's own limit); "answer" the same read-only turn
+    # for a question; "reply" one answer with no tools; "knowledge" one answer with no tools from
+    # the model's own knowledge (CodingAgent._reply_answer)
+    mode: str = ""
+    steps: int = 0
 
     def record(self) -> dict[str, Any]:
         return asdict(self)
@@ -206,7 +213,10 @@ def asks(task: str) -> bool:
 
     text = strip_code(task)
     cues = _ASKS_VERB if features.on("question_change_cues") else _ASKS
-    return bool(_QUESTION.search(text) or cues.search(text) or _ABOUT_VEGA.search(text))
+    asked = bool(_QUESTION.search(text) or cues.search(text) or _ABOUT_VEGA.search(text))
+    if cues is _ASKS_VERB and not asked and _ASKS.search(text):  # "report" as a noun: not a cue
+        features.mark_acted("question_change_cues", where="asks")
+    return asked
 
 
 def requirements(task: str) -> list[str]:
@@ -276,6 +286,53 @@ def _reads_here(masked: str, start: int) -> bool:
     changes = [m.end() for m in _PATH_CHANGE.finditer(clause)]
     inputs = [m.end() for m in _READ_CUE.finditer(clause)]
     return bool(inputs) and (not changes or max(inputs) > max(changes))
+
+
+# reference_docs (2026-10-28): a document the task names as where its rules are ("What it has
+# to do is in docs/CONSENT.md", "Our logging rules are in docs/LOGGING.md", "described in
+# docs/X.md", "follow / see / per docs/X.md", "`docs/tokens.md` describes them") is an input, not
+# a file to change. _changes_here took the "to" of "has to do" / "needs to accept" as a change
+# cue, so the route said "not direct: also changes docs/CONSENT.md" and the project pipeline
+# planned a doc edit and never showed the doc (privacy/legal/security review, 2026-10-28).
+_REFERENCE_BEFORE = re.compile(
+    r"(?:\b(?:is|are|was|were|'s|lives?|live|sits?|stays?)\s+(?:all\s+)?(?:(?:listed|described|"
+    r"written|set\s+out|spelled\s+out|laid\s+out|documented|specified|defined|given|found|kept|"
+    r"explained|summari[sz]ed)\s+)?in|\b(?:listed|described|documented|specified|defined|"
+    r"explained|set\s+out|spelled\s+out|laid\s+out|summari[sz]ed|stated)\s+in|\bsee|\bfollow(?:s|"
+    r"ing)?(?:\s+the\s+(?:rules|guidelines|policy|spec)\s+in)?|\bper|\baccording\s+to|\bin\s+line"
+    r"\s+with|\bas\s+(?:described|specified|documented|defined|set\s+out|explained)\s+in"
+    r")\s*[`'\"(]*$", re.IGNORECASE)
+_REFERENCE_AFTER = re.compile(
+    r"^[`'\")]*\s*(?:\([^)]*\)\s*)?(?:describes|specifies|lists|defines|documents|explains|says|"
+    r"sets\s+out|spells\s+out|lays\s+out|gives|has\s+the\s+(?:rules|details|spec)|covers)\b",
+    re.IGNORECASE)
+
+
+_FAULT = re.compile(r"\b(?:typos?|bugs?|errors?|mistakes?|problems?|(?:an|the|this|that)\s+issue|"
+                    r"broken|wrong|outdated|stale|out\s+of\s+date|missing|incorrect|inaccurate)\b",
+                    re.IGNORECASE)
+
+
+def references(masked: str, start: int, end: int) -> bool:
+    """The path at masked[start:end] is named as a reference ("is in X", "described in X",
+    "follow X", "see X", "per X", "X describes them") and the words right before it are not a
+    change aimed at it ("add a section to X", "document it in X", "update X")."""
+    before = masked[max(0, start - 60):start]
+    cut = max(before.rfind(c) for c in ".;:!?\n")
+    clause = before[cut + 1:] if cut >= 0 else before
+    if _CHANGE_AFTER.search(masked[end:end + 80]) or _FAULT.search(clause):
+        return False  # "README.md is wrong", "the typo is in README.md": the file to fix
+    if _REFERENCE_AFTER.search(masked[end:end + 40]):
+        return True
+    hit = _REFERENCE_BEFORE.search(clause)
+    if not hit:
+        return False
+    # "document the API in docs/API.md", "add the rule to docs/X.md, as described in ...": a change
+    # cue within the few words right before the reference cue aims at the file
+    near = clause[max(0, hit.start() - 30):hit.start()]
+    return not re.search(r"\b(?:document|write|add|put|save|record|append|note|update|change|edit|"
+                         r"modify|extend|insert|list|describe|explain)\w*\s+(?:\w+\s+){0,3}$", near,
+                         re.IGNORECASE)
 
 
 def _helpers(task: str) -> set[str]:
@@ -359,14 +416,16 @@ def writer_tokens(task: str, file_chars: int, input_chars: int) -> int:
     return int(chars / CHARS_PER_TOKEN)
 
 
-def _input_chars(project: Path, inputs: list[str]) -> int:
+def _input_chars(project: Path, inputs: list[str], num_ctx: int | None = None) -> int:
     total = 0
+    caps = pipeline.input_caps(num_ctx=num_ctx) if num_ctx else {"data": INPUT_CHARS,
+                                                                  "other": DOC_CHARS}
     for path in inputs[:INPUTS_MAX]:
         try:
             size = (project / path).stat().st_size
         except OSError:
             continue
-        cap = DOC_CHARS if _kind(path) in {"doc", "config", "code"} else INPUT_CHARS
+        cap = caps["other"] if _kind(path) in {"doc", "config", "code"} else caps["data"]
         total += min(size, cap)
     return total
 
@@ -374,11 +433,19 @@ def _input_chars(project: Path, inputs: list[str]) -> int:
 # -- the decision -----------------------------------------------------------------------------------
 
 def route_task(task: str, project: Path, *, num_ctx: int | None = None,
-               can_write: bool = True) -> Route:
-    """The task's shape and the path it goes to (no model call)."""
-    from . import project_pipeline, question_pipeline
+               can_write: bool = True, agent: Any = None) -> Route:
+    """The task's shape and the path it goes to (no model call). `agent` (the agent routing its
+    turn, or None) is passed on to the extensions' route_task hook only."""
+    from . import project_pipeline
 
     project = Path(project)
+    hooked = home_start.route_task(task, project=project, agent=agent)  # just chat: no tools
+    if hooked is None:
+        hooked = extensions.route_task(task, project=project, can_write=can_write, num_ctx=num_ctx,
+                                       agent=agent)
+    if hooked is not None:
+        hooked.task_chars = len(task)
+        return hooked
     route = Route(AGENT, task_chars=len(task))
     masked = mask_code(task)
     verbs = change_verbs(task)
@@ -393,6 +460,7 @@ def route_task(task: str, project: Path, *, num_ctx: int | None = None,
         route.reasons.append("asks for a change: " + ", ".join(verbs[:5]))
     elif asks(task) and features.on("question_change_cues") and requirements(task):
         route.change = True  # "The stock report must also mark ...": requirements, not a question
+        features.mark_acted("question_change_cues", where="requirements")
         route.reasons.append("states requirements with must: treated as a change")
     elif asks(task):
         route.question = True
@@ -402,18 +470,7 @@ def route_task(task: str, project: Path, *, num_ctx: int | None = None,
         route.reasons.append("no question form: treated as a change")
 
     if route.question:
-        if question_pipeline._ABOUT_VEGA.search(task) or not question_pipeline._CODE_ANCHOR.search(task):
-            route.reasons.append("conversation: nothing in the project to look up")
-            return route
-        if question_pipeline.is_broad(task):
-            route.reasons.append("broad question: the agent loop explores")
-            return route
-        if not features.on("question_pipeline"):
-            route.reasons.append("specific question; question_pipeline is off")
-            return route
-        route.name = QUESTION
-        route.reasons.append("specific question about the code")
-        return route
+        return question_route(task, route)
     if not can_write:
         route.reasons.append("read-only session")
         return route
@@ -466,6 +523,11 @@ def route_task(task: str, project: Path, *, num_ctx: int | None = None,
                 _add(route.other_targets, name)  # changed in place, or an output to produce
             # else: a file that does not exist, named with no change cue (a default path)
         elif kind in {"doc", "config"}:
+            if real and features.on("reference_docs") and references(masked, start, end):
+                _add(route.inputs, name)  # "What it has to do is in docs/CONSENT.md"
+                if changes:  # off: a change cue would make it a target
+                    features.mark_acted("reference_docs", path=name)
+                continue
             if real and not changes:
                 _add(route.inputs, name)
             elif real or changes:
@@ -575,6 +637,8 @@ def route_task(task: str, project: Path, *, num_ctx: int | None = None,
         route.inputs += [c for c in candidates if c not in route.inputs]
         route.reasons.append("read-only for existing files: " + ", ".join(candidates))
         candidates = []
+    if (features.on("web_file_permissions") or features.on("web_lone_page")) and not candidates:
+        _permitted_web_inputs(route, task, masked, files, protected)
     route.targets = candidates
     route.inputs = [i for i in route.inputs if i not in candidates and i not in route.other_targets]
     route = decide(route, task, project, files, num_ctx=num_ctx)
@@ -585,6 +649,28 @@ def route_task(task: str, project: Path, *, num_ctx: int | None = None,
                                       exclude={*route.inputs, *route.targets})
         if route.related:
             route.reasons.append("context for the writer: " + ", ".join(route.related))
+            features.mark_acted("direct_context", where="route", related=route.related)
+    return route
+
+
+def question_route(task: str, route: Route) -> Route:
+    """Where a question goes (route.question set): a conversation (nothing in the project to look
+    up) and a broad question stay on the agent loop; a specific question about the code goes to
+    the question pipeline. Also used by extensions' route_task hooks that decide a turn is a
+    question (vega_lab.request_position)."""
+    from . import question_pipeline
+
+    if question_pipeline._ABOUT_VEGA.search(task) or not question_pipeline._CODE_ANCHOR.search(task):
+        route.reasons.append("conversation: nothing in the project to look up")
+        return route
+    if question_pipeline.is_broad(task):
+        route.reasons.append("broad question: the agent loop explores")
+        return route
+    if not features.on("question_pipeline"):
+        route.reasons.append("specific question; question_pipeline is off")
+        return route
+    route.name = QUESTION
+    route.reasons.append("specific question about the code")
     return route
 
 
@@ -759,6 +845,13 @@ def _entry_targets(route: Route, task: str, project: Path, files: set[str], all_
             added.append((path, why))
     if not added:
         return route
+    whys = {why for _, why in added}
+    if "runs the backticked command" in whys:
+        features.mark_acted("route_cli_target")
+    if "defines a class the task names" in whys:
+        features.mark_acted("route_prose_class")
+    if "python -m needs it" in whys:
+        features.mark_acted("route_module_entry")
     wider = Route(**{**route.record(), "name": AGENT,
                      "targets": [*route.targets, *(p for p, _ in added)],
                      "reasons": [r for r in route.reasons if not r.startswith("one code target")]})
@@ -999,9 +1092,11 @@ def decide(route: Route, task: str, project: Path, files: set[str], *,
             direct_blocker = "rename/move reaches other files"
         else:
             size = path.stat().st_size
-            route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs))
-            if size > MAX_FILE_CHARS:
-                direct_blocker = f"{target} is {size} characters (> {MAX_FILE_CHARS})"
+            route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs, num_ctx))
+            max_file = extensions.budget("pipeline.MAX_FILE_CHARS", MAX_FILE_CHARS,
+                                         num_ctx=num_ctx)
+            if size > max_file:
+                direct_blocker = f"{target} is {size} characters (> {max_file})"
             elif route.writer_tokens > int(window * WINDOW_SHARE):
                 direct_blocker = (f"writer needs ~{route.writer_tokens} tokens "
                                   f"(> {int(window * WINDOW_SHARE)} of the {window} window)")
@@ -1034,7 +1129,7 @@ def decide(route: Route, task: str, project: Path, files: set[str], *,
             route.other_targets, route.inputs = web_targets, web_inputs
             size = sum((project / t).stat().st_size for t in web_targets
                        if (project / t).is_file())
-            route.writer_tokens = writer_tokens(task, size, _input_chars(project, web_inputs))
+            route.writer_tokens = writer_tokens(task, size, _input_chars(project, web_inputs, num_ctx))
             route.name = NONPYTHON
             route.pipeline = "web"
             route.reasons.append("front-end files: " + ", ".join(route.other_targets[:5])
@@ -1044,6 +1139,8 @@ def decide(route: Route, task: str, project: Path, files: set[str], *,
             route.reasons.append("not web: " + blocker)
     deliverables = deliverable_pipeline.targets(project, task)
     wide = features.on("deliverable_wide")
+    if wide and deliverables:  # the only case where the wider rule can change the route
+        features.mark_acted("deliverable_wide", where="route")
     # deliverable_wide: a helper script the task lets the model write and run (`you may write one
     # helper script at scratch/check.py and run it`) is the pipeline's own script, not a target
     helpers = [t for t in targets if t in route.helpers and not (project / t).exists()] \
@@ -1099,9 +1196,11 @@ def _nonpython_blocker(route: Route, task: str, project: Path, window: int) -> s
         return "the task names no check command to run"
     path = project / target
     size = path.stat().st_size if path.is_file() else 0
-    if size > nonpython_pipeline.MAX_FILE_CHARS:
-        return f"{target} is {size} characters (> {nonpython_pipeline.MAX_FILE_CHARS})"
-    route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs))
+    max_file = extensions.budget("nonpython_pipeline.MAX_FILE_CHARS",
+                                 nonpython_pipeline.MAX_FILE_CHARS, num_ctx=window)
+    if size > max_file:
+        return f"{target} is {size} characters (> {max_file})"
+    route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs, window))
     if route.writer_tokens > int(window * WINDOW_SHARE):
         return (f"writer needs ~{route.writer_tokens} tokens "
                 f"(> {int(window * WINDOW_SHARE)} of the {window} window)")
@@ -1115,20 +1214,165 @@ _KEEP_UNCHANGED = re.compile(r"\bkeep\b((?:[^.;\n]|\.(?=[\w/`]))*?)\b(?:unchange
                              r"(?:is|are))\b", re.IGNORECASE)
 
 
+# web_file_permissions (2026-10-29, front-end failure review, fix 4): the
+# clauses that say which files may change. "you may edit both files" / "you may change `a` and
+# `b`" make those files targets; "keep ... `styles.css`" (a file as a list item of a keep
+# clause, with or without "unchanged") makes it read-only; "keep the other two / the other files
+# (unchanged)" makes every file but the one named just before read-only. "keep every id",
+# "keep the class names in `index.html`" keep something inside a file: no file is protected.
+_PERMIT = re.compile(r"\b(?:may|can|are (?:allowed|free) to)\s+(?:edit|change|modify|touch|rewrite|"
+                     r"update)\s+((?:[^.;\n]|\.(?=[\w/`]))*)", re.IGNORECASE)
+_KEEP_CLAUSE = re.compile(r"\bkeep\b((?:[^.;:)\n]|\.(?=[\w/`]))*)", re.IGNORECASE)
+_KEPT_AS_IS = re.compile(r"\s+(?:unchanged|untouched|intact|as is|(?:exactly )?as (?:it|they) "
+                         r"(?:is|are)|the same)$", re.IGNORECASE)
+_OTHER_FILES = re.compile(r"(?:all )?(?:the )?(?:other|remaining) (?:files|two|three|four|ones)"
+                          r"(?: files)?|every other file|everything else|the rest", re.IGNORECASE)
+_BOTH = re.compile(r"(?:both|the two)(?: files)?(?: of them)?", re.IGNORECASE)
+_SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+
+
+def _list_items(clause: str) -> list[str]:
+    """The items of a listed clause ("`a.js`, the texts and `b.css`"), parentheses dropped, a
+    leading article and a trailing "unchanged" / "as it is" removed."""
+    clause = re.sub(r"\([^)]*\)?", " ", clause)
+    items = []
+    for item in re.split(r",|\band\b", clause):
+        item = re.sub(r"^(?:the|also|both|then)\s+", "", " ".join(item.split()), flags=re.IGNORECASE)
+        items.append(_KEPT_AS_IS.sub("", item).strip(" `'\""))
+    return items
+
+
+def _file_item(item: str, files: set[str]) -> str | None:
+    """The project file (or folder, "vendor/") an item is exactly, else None."""
+    whole = _NEGATED_PATH.fullmatch(item)
+    if not whole:
+        return None
+    path = whole.group(1).rstrip(".")
+    if path.endswith("/"):
+        return path if any(f.startswith(path) or f"/{path}" in f"/{f}" for f in files) else None
+    return path if path in files else next((f for f in files if f.endswith("/" + path)), None)
+
+
+def _paths_before(masked: str, end: int, files: set[str]) -> list[str]:
+    """Project files named in masked[:end], latest last (each once, at its last mention)."""
+    found: list[str] = []
+    for match in _NEGATED_PATH.finditer(masked[:end]):
+        real = _file_item(match.group(1), files)
+        if real:
+            if real in found:
+                found.remove(real)
+            found.append(real)
+    return found
+
+
+def permitted_files(masked: str, files: set[str]) -> set[str]:
+    """Files the task explicitly lets the model edit: "you may edit `a.html` and `b.js`" (a
+    parenthesis inside the list is skipped), "you may edit both files" (the last two files named
+    before it). The list stops at the first item that is not a file."""
+    found: set[str] = set()
+    for match in _PERMIT.finditer(masked):
+        clause = match.group(1).strip()
+        if _BOTH.fullmatch(clause.strip(" ,")) or re.match(r"(?:both|the two) files\b", clause,
+                                                           re.IGNORECASE):
+            before = _paths_before(masked, match.start(), files)
+            if len(before) >= 2:
+                found.update(before[-2:])
+            continue
+        for item in _list_items(clause):
+            real = _file_item(item, files)
+            if not real:
+                break
+            found.add(real)
+    return found
+
+
+def kept_files(masked: str, files: set[str]) -> tuple[set[str], str | None]:
+    """Files a keep clause makes read-only: a file that is a whole item of the clause's list
+    ("keep the ids, `data.js` and `styles.css`"), and, for "keep the other files / the other two",
+    the file named just before the clause in its sentence, returned as the one file left
+    writable (None when no such clause or no file before it)."""
+    kept: set[str] = set()
+    only: str | None = None
+    for match in _KEEP_CLAUSE.finditer(masked):
+        items = _list_items(match.group(1))
+        for item in items:
+            real = _file_item(item, files)
+            if real:
+                kept.add(real)
+        if any(_OTHER_FILES.fullmatch(item) for item in items):
+            ends = list(_SENTENCE_END.finditer(masked, 0, match.start()))
+            start = ends[-1].end() if ends else 0
+            before = [p for p in _paths_before(masked, match.start(), files)
+                      if re.search(r"(?<![\w/.-])" + re.escape(Path(p).name) + r"(?![\w/-])",
+                                   masked[start:match.start()])]
+            if before:
+                only = before[-1]
+    return kept, only
+
+
+def _permitted_web_inputs(route: Route, task: str, masked: str, files: set[str],
+                          protected: set[str]) -> None:
+    """web_file_permissions, for a change with no Python target: a front-end file the task says
+    may be edited is a target even when no change cue sits before it (an HTML file is read as a
+    document otherwise). web_lone_page (opt-in): when the only file named is one HTML page,
+    read-only so far and in no keep clause, the change is to it ("Use the browser's built-in
+    constraint validation (HTML attributes only ...)" on `index.html`)."""
+    if read_only(task):
+        return
+    kept, _ = kept_files(masked, files)
+    movable = [i for i in route.inputs if web_pipeline_takes(i) and i in files
+               and not _is_protected(i, protected) and not _is_protected(i, kept)]
+    permitted = permitted_files(masked, files) if features.on("web_file_permissions") else set()
+    moved = [i for i in movable if i in permitted]
+    pages = [i for i in route.inputs if i.lower().endswith((".html", ".htm"))]
+    if not moved and not route.other_targets and len(route.inputs) == 1 and pages \
+            and pages[0] in movable and not _KEEP_UNCHANGED.search(task) \
+            and features.on("web_lone_page"):
+        features.mark_acted("web_lone_page", where="route", files=pages)
+        moved = pages
+    if moved:
+        route.inputs = [i for i in route.inputs if i not in moved]
+        for path in moved:
+            _add(route.other_targets, path)
+        route.reasons.append("the task lets these files change: " + ", ".join(moved))
+        if permitted:
+            features.mark_acted("web_file_permissions", where="route", files=moved)
+
+
 def _web_files(route: Route, task: str, project: Path) -> tuple[list[str], list[str]]:
     """The web pipeline's targets and inputs: files in a "keep ... unchanged" clause (and HTML
     files when the clause keeps "the markup") become read-only inputs, and a project
     `package.json` the task names becomes a target beside the code (an ES module conversion
-    sets its "type")."""
+    sets its "type"). web_file_permissions: the keep clauses are read item by item (kept_files),
+    and a file the task says may be edited (permitted_files) stays a target."""
     kept: set[str] = set()
     markup = False
+    permissions = features.on("web_file_permissions")
+    permitted: set[str] = set()
+    only: str | None = None
+    if permissions:
+        masked = mask_code(task)
+        files = {*route.other_targets, *route.inputs}
+        try:
+            files |= {p.relative_to(project).as_posix() for p in _project_files(project)}
+        except OSError:
+            pass
+        kept, only = kept_files(masked, files)
+        permitted = permitted_files(masked, files)
+        if kept or permitted or only:
+            features.mark_acted("web_file_permissions", where="web_files", kept=sorted(kept),
+                                permitted=sorted(permitted), only=only)
     for match in _KEEP_UNCHANGED.finditer(task):
         clause = match.group(1)
-        kept.update(m.group(1).rstrip(".") for m in _NEGATED_PATH.finditer(clause))
+        if not permissions:
+            kept.update(m.group(1).rstrip(".") for m in _NEGATED_PATH.finditer(clause))
         markup = markup or bool(re.search(r"\b(?:markup|html)\b", clause, re.IGNORECASE))
     targets, inputs = [], list(route.inputs)
     for target in route.other_targets:
-        if _is_protected(target, kept) or (markup and target.lower().endswith((".html", ".htm"))):
+        if target in permitted:
+            targets.append(target)
+        elif _is_protected(target, kept) or (markup and target.lower().endswith((".html", ".htm"))) \
+                or (only is not None and target != only and only in route.other_targets):
             _add(inputs, target)
         else:
             targets.append(target)
@@ -1162,7 +1406,7 @@ def _web_blocker(route: Route, task: str, project: Path, window: int) -> str:
     if deliverables and all(t in deliverables and not (project / t).exists() for t in targets):
         return "only new deliverable files"
     size = sum((project / t).stat().st_size for t in targets if (project / t).is_file())
-    route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs))
+    route.writer_tokens = writer_tokens(task, size, _input_chars(project, route.inputs, window))
     if route.writer_tokens > int(window * WINDOW_SHARE):
         return (f"writer needs ~{route.writer_tokens} tokens "
                 f"(> {int(window * WINDOW_SHARE)} of the {window} window)")

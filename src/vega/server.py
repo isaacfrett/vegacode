@@ -7,6 +7,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -119,6 +120,26 @@ def has_model(name: str | None = None) -> bool:
     return any(model in wanted for model in installed_models())
 
 
+def app_bundles() -> list[Path]:
+    """Where the Ollama macOS app may live: ~/Applications (Vega's own install, no admin rights
+    needed) and /Applications (the usual drag-and-drop install)."""
+    return [Path.home() / "Applications" / "Ollama.app", Path("/Applications/Ollama.app")]
+
+
+def ollama_executable() -> str | None:
+    """The `ollama` command: on PATH (Homebrew, the Linux install script), else the CLI inside
+    the macOS app, which is not on PATH until the app links it (and Vega's own install does not)."""
+    found = shutil.which("ollama")
+    if found:
+        return found
+    if sys.platform == "darwin":
+        for bundle in app_bundles():
+            candidate = bundle / "Contents" / "Resources" / "ollama"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return None
+
+
 def _owned_pid() -> int | None:
     """PID of the server Vega started, if it is still alive and still Ollama."""
     try:
@@ -137,9 +158,10 @@ def start(timeout: float = 20.0) -> str:
         return f"Server already running at {_ollama_root()}."
     if not is_local():
         return f"{base_url()} is not a local address; start that server where it runs."
-    executable = shutil.which("ollama")
+    executable = ollama_executable()
     if not executable:
-        raise RuntimeError("Ollama is not installed. Install it from https://ollama.com/download.")
+        raise RuntimeError("Ollama is not installed. Run `vega setup` (or install it from "
+                           "https://ollama.com/download).")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     port = urlparse(base_url()).port or 11434
     from . import features
@@ -231,7 +253,7 @@ def ensure_running(model: str | None = None) -> None:
     an endpoint profile runs on that server, which Vega does not start: nothing to do."""
     if _endpoint_profile(model) is not None:
         return
-    if is_local() and not is_running() and shutil.which("ollama"):
+    if is_local() and not is_running() and ollama_executable():
         start()
 
 

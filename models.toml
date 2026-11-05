@@ -10,8 +10,10 @@
 #
 # Fields: base (Ollama model to build FROM), description, num_ctx, and any other Ollama PARAMETER
 # under [profiles.NAME.parameters]. Omit temperature to keep the base model's own recommended
-# sampling. request = { key = value } adds fields to every request. Memory figures were measured
-# on a 16 GB Apple Silicon Mac.
+# sampling. request = { key = value } adds fields to every request. renderer / parser = Ollama's
+# built-in prompt renderer and reply parser (Modelfile RENDERER / PARSER) for a Hugging Face GGUF
+# whose hf.co template has no tool format; a library model keeps its own. Memory figures were
+# measured on a 16 GB Apple Silicon Mac.
 #
 # Another local OpenAI-compatible server instead of Ollama (LM Studio, llama-server,
 # mlx_lm.server): endpoint = "http://127.0.0.1:1234/v1" and, if it serves the model under another
@@ -39,7 +41,7 @@ temperature = 0.2
 
 [profiles.coder-14b]
 base = "qwen2.5-coder:14b"
-description = "Over Vega's under-10B limit (14B; removed from comparisons 2026-10-14): kept for reference only. ~9.6 GB: heavy swap on 16 GB."
+description = "Over the 10 GB memory budget (~8.7 GB download, ~12.9 GB loaded estimated; removed from comparisons 2026-10-14 under the old under-10B rule): kept for reference only. Heavy swap on 16 GB."
 num_ctx = 8192
 [profiles.coder-14b.parameters]
 temperature = 0.2
@@ -60,3 +62,162 @@ base = "qwen3:8b"
 description = "Qwen3 8B with thinking off (reasoning_effort none: 17*23 answered in 4 tokens). Compared with granite-8b on 2026-10-15."
 num_ctx = 8192
 request = { reasoning_effort = "none" }
+
+# Small models for machines with 8 GB of RAM or less (candidates, being compared)
+[profiles.granite-micro]
+base = "granite4:micro"
+description = "Granite 4 Micro 3B: small-machine candidate."
+num_ctx = 8192
+
+# Granite 4 hybrids (Mamba-2 layers + a few attention layers, arch granitehybrid): a fixed-size
+# recurrent state instead of a per-token KV cache for most layers, ~10x less context memory.
+# Tags checked on ollama.com/library/granite4/tags (2026-10-28). Prompt-cache risk on this Ollama
+# build (context-efficiency review, 2026-10-28): run `vega lab bench cache-check <profile>`
+# before any quality comparison. Template and stop tokens come from the base model (FROM); plan off
+# as on granite-8b, so the comparison with the default runs the same loop.
+[profiles.granite-micro-h]
+base = "granite4:micro-h"
+description = "Granite 4 H-Micro 3.2B hybrid (Mamba-2 + attention), Q4_K_M, 1.9 GB (= granite4:3b-h). Candidate: less context memory; prompt-cache reuse unchecked."
+num_ctx = 8192
+features_off = ["plan"]
+
+[profiles.granite-tiny-h]
+base = "granite4:tiny-h"
+description = "Granite 4 H-Tiny 6.9B MoE hybrid (~1B active; Mamba-2 + attention), Q4_K_M, 4.2 GB (= granite4:7b-a1b-h). Candidate: less context memory; prompt-cache reuse unchecked."
+num_ctx = 8192
+features_off = ["plan"]
+
+[profiles.phi4-mini]
+base = "phi4-mini:3.8b"
+description = "Phi-4-mini 3.8B: small-machine candidate."
+num_ctx = 8192
+
+[profiles.gemma3-4b]
+base = "gemma3:4b"
+description = "Gemma 3 4B: small-machine candidate."
+num_ctx = 8192
+
+[profiles.coder-3b]
+base = "qwen2.5-coder:3b"
+description = "Qwen2.5-Coder 3B: small-machine candidate."
+num_ctx = 8192
+
+[profiles.qwen3-4b-nothink]
+base = "qwen3:4b"
+description = "Qwen3 4B with thinking off: small-machine candidate."
+num_ctx = 8192
+request = { reasoning_effort = "none" }
+
+[profiles.llama32-3b]
+base = "llama3.2:3b"
+description = "Llama 3.2 3B: small-machine candidate."
+num_ctx = 8192
+
+[profiles.coder-1p5b]
+base = "qwen2.5-coder:1.5b"
+description = "Qwen2.5-Coder 1.5B: candidate for 4 GB machines."
+num_ctx = 8192
+
+[profiles.lfm2-8b-a1b]
+base = "hf.co/LiquidAI/LFM2-8B-A1B-GGUF:Q4_K_M"
+description = "From the catalogue: Pulled from Hugging Face; Ollama's lfm2 renderer/parser is only wired up for library tags, so tool calling must be measured (screen probe)."
+num_ctx = 8192
+
+# Vega's own MLX server instead of Ollama (lab, roadmap item mlx-customizations): the same Granite 4
+# H-Tiny, 4-bit MLX weights in ~/.vega/models/mlx/<base> (provenance: PROVENANCE.json there), served
+# on 127.0.0.1:8091 by `vega lab mlx start granite-tiny-h-mlx` (private lab: vega_lab.mlx_serve),
+# which unloads Ollama's models first and reloads them on `vega lab mlx stop` (never both models in
+# 16 GB). [mlx.pacing]: GPU pacing inside a request (vega_lab.mlx_pacing: off | temp | duty);
+# [mlx.sampling]: used when a request names none (Ollama's own defaults, for parity with
+# granite-tiny-h). Speed, heat and pass parity vs Ollama: `vega lab bench mlx-pace`.
+[profiles.granite-tiny-h-mlx]
+base = "granite-4.0-h-tiny-4bit"
+description = "Granite 4 H-Tiny on Vega's own MLX server (4-bit MLX, ~3.9 GB) with in-request GPU pacing; lab, start it with `vega lab mlx start`. Candidate: same weights family as granite-tiny-h."
+num_ctx = 8192
+endpoint = "http://127.0.0.1:8091/v1"
+features_off = ["plan"]
+[profiles.granite-tiny-h-mlx.mlx]
+# the prompt as Ollama renders it for this model (compact tool JSON, collated roles, Vega's SYSTEM):
+# parity with granite-tiny-h; "hf" = the model folder's chat_template.jinja (mlx-lm's rendering)
+template = "ollama"
+[profiles.granite-tiny-h-mlx.mlx.pacing]
+mode = "off"
+target_c = 78.0
+hysteresis_c = 3.0
+sensor = "gpu"
+duty = 0.6
+max_added_s = 30.0
+[profiles.granite-tiny-h-mlx.mlx.sampling]
+# Ollama's defaults for whatever a request leaves out (evals send temperature 0 and seed 7)
+temperature = 0.8
+top_p = 0.9
+top_k = 40
+repeat_penalty = 1.1
+repeat_last_n = 64
+
+# Vega's own serving layer over llama.cpp (lab, option B of the inference-serving options plan):
+# the same GGUF Ollama loads (read from Ollama's manifest of `base`, read-only), run by the llama-server
+# binary inside Ollama's own install, behind Vega's server on 127.0.0.1:8092 (private lab:
+# vega_lab.llama_serve). `vega lab llama start granite-tiny-h-llama` unloads Ollama's models first and
+# `vega lab llama stop` reloads them (never both models in 16 GB). The prompt is rendered exactly as
+# Ollama renders it and the child runs with Ollama's runner flags (q8_0 KV, flash attention, --no-jinja,
+# one slot); llama.cpp's prompt cache is on and every reply reports the cached-token share.
+# [llama.sampling]: for whatever a request leaves out, what Ollama 0.34.3's runner applies to Vega's
+# /v1 requests (its own log): no repeat penalty, top_p 1, top_k 40, min_p 0, temperature 1 when unset.
+# Not Ollama's documented native defaults (repeat penalty 1.1): with them B split from Ollama on every
+# diverging reply of the 2026-11-03 parity bench (option B parity review, 2026-11-03).
+# [llama.pacing]: chunked continuation (chunk_tokens per call) with mlx_pacing's rules. [llama.server]:
+# child options (ctx_checkpoints, checkpoint_min_step, cache_ram_mib, batch, ubatch, gpu_layers,
+# threads); each one set differs from Ollama's runner. Parity and speed vs Ollama:
+# `vega lab bench mlx-pace --arms ollama,llama`.
+[profiles.granite-tiny-h-llama]
+base = "vega-granite-tiny-h"
+api_model = "granite-tiny-h-llama"
+description = "Granite 4 H-Tiny (the Ollama GGUF, Q4_K_M) on Vega's own server over llama.cpp's llama-server; lab, start it with `vega lab llama start`. Candidate: parity with granite-tiny-h by construction."
+num_ctx = 8192
+endpoint = "http://127.0.0.1:8092/v1"
+features_off = ["plan"]
+[profiles.granite-tiny-h-llama.llama]
+chunk_tokens = 48
+[profiles.granite-tiny-h-llama.llama.server]
+# hybrid (Mamba-2) model: a prefix is reused only back to a context checkpoint. Ollama's runner keeps
+# the binary's defaults (32 checkpoints, 8192 apart; it still checkpoints near each prompt's end) and
+# reused more in the 2026-11-03 parity bench (cached share: median 52%, total 64%) than this
+# profile's former 8 / 512 apart (45%, 62%), so B keeps the defaults too: the same restore points
+# as Ollama, and no tuning without a measured gain
+cache_ram_mib = 1024
+[profiles.granite-tiny-h-llama.llama.pacing]
+mode = "off"
+target_c = 78.0
+hysteresis_c = 3.0
+sensor = "gpu"
+duty = 0.6
+max_added_s = 30.0
+[profiles.granite-tiny-h-llama.llama.sampling]
+temperature = 1.0
+top_p = 1.0
+top_k = 40
+min_p = 0.0
+repeat_penalty = 1.0
+repeat_last_n = 64
+
+[profiles.granite-8b-llama]
+base = "vega-granite-8b"
+api_model = "granite-8b-llama"
+description = "Granite 4.1 8B (the Ollama GGUF behind `vega`) on Vega's own server over llama.cpp's llama-server; lab, start it with `vega lab llama start granite-8b-llama`."
+num_ctx = 8192
+endpoint = "http://127.0.0.1:8092/v1"
+features_off = ["plan"]
+[profiles.granite-8b-llama.llama]
+chunk_tokens = 48
+[profiles.granite-8b-llama.llama.server]
+cache_ram_mib = 1024
+[profiles.granite-8b-llama.llama.pacing]
+mode = "off"
+[profiles.granite-8b-llama.llama.sampling]
+temperature = 1.0
+top_p = 1.0
+top_k = 40
+min_p = 0.0
+repeat_penalty = 1.0
+repeat_last_n = 64

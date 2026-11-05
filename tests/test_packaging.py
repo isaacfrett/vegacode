@@ -163,3 +163,29 @@ def test_keyword_check_reports_drift() -> None:
     assert any("personal path" in p for p in
                check_keywords.check(readme + "\nsee /Users/someone/x\n", PYPROJECT["project"],
                                     keywords))
+
+
+PIN_SCRIPT = CHECK_SCRIPT.parent / "check_pinned_actions.py"
+
+
+@pytest.mark.skipif(not PIN_SCRIPT.is_file(), reason="release files not in this tree")
+def test_public_workflow_actions_are_sha_pinned(tmp_path: Path) -> None:
+    """Every `uses:` in the public workflows is pinned to a commit SHA with a version comment,
+    and the check rejects a tag reference or a pin without its comment."""
+    workflows = CHECK_SCRIPT.parent.parent / "workflows"
+    result = subprocess.run([sys.executable, str(PIN_SCRIPT), str(workflows)], check=False,
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    bad = tmp_path / "bad.yml"
+    bad.write_text("steps:\n  - uses: actions/checkout@v4\n"
+                   "  - uses: actions/cache@" + "a" * 40 + "\n"
+                   "  - uses: ./local-action\n"
+                   "  - uses: actions/setup-python@" + "b" * 40 + " # v6.0.0\n",
+                   encoding="utf-8")
+    result = subprocess.run([sys.executable, str(PIN_SCRIPT), str(bad)], check=False,
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1
+    lines = result.stdout.splitlines()
+    assert len(lines) == 2, result.stdout
+    assert "actions/checkout@v4 is not pinned" in lines[0]
+    assert "no '# vX.Y.Z' comment" in lines[1]

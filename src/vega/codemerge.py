@@ -24,8 +24,16 @@ def merge_code(original: str, generated: str, *, replace_whole: bool = True) -> 
     else:
         merged = _merge(original, generated, replace_whole=replace_whole)
     if features.on("pipeline_signals"):
-        merged = carry_assignments(merged, generated)
-    return keep_docstrings(original, merged) if features.on("keep_docstrings") else merged
+        carried = carry_assignments(merged, generated)
+        if carried != merged:
+            features.mark_acted("pipeline_signals", where="carry_assignments")
+        merged = carried
+    if not features.on("keep_docstrings"):
+        return merged
+    kept = keep_docstrings(original, merged)
+    if kept != merged:
+        features.mark_acted("keep_docstrings")
+    return kept
 
 
 def carry_assignments(merged: str, generated: str) -> str:

@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import debuglog, features, sandbox
+from . import debuglog, extensions, features, sandbox
 from .tools import _project_files
 
 if TYPE_CHECKING:
@@ -96,6 +96,7 @@ class Check:
     dropped: str = ""  # why it is no longer used ('' = active)
     green_fails: int = 0  # consecutive rounds failing while everything else passed
     failed_last: bool = False
+    last: str = ""  # its failing line the last time it ran ('' when it passed)
 
     def label(self) -> str:
         return f"`{self.claim}`" if self.kind in _COMMANDS else f'"{self.claim}"'
@@ -502,7 +503,8 @@ def ask_model(agent: CodingAgent, task: str, repo_map: str) -> tuple[list[Check]
     sampling = {**agent.sampling, "max_tokens": min(MODEL_MAX_TOKENS,
                                                      agent.sampling.get("max_tokens", 10**6))}
     reply = agent.client.chat.completions.create(
-        model=agent.model, messages=[{"role": "system", "content": MODEL_SYSTEM},
+        model=extensions.side_model("task_checks", agent=agent),
+        messages=[{"role": "system", "content": MODEL_SYSTEM},
                                      {"role": "user", "content": user}],
         response_format={"type": "json_schema",
                          "json_schema": {"name": "checks", "schema": MODEL_SCHEMA}},
@@ -838,6 +840,7 @@ class TaskChecks:
             elif problem:
                 lines.append(self._line(check, problem))
             check.failed_last = bool(problem)
+            check.last = problem
             if check.dropped:
                 self.notes.append(f"task check dropped: {check.label()}: {check.dropped}")
         self.previous_project_failing = project_failing
@@ -898,7 +901,10 @@ def prepare(project: Path, task: str, *, rules: bool, model: list[Check] | None 
     if rules:
         checks += cli_checks(project, task) + env_checks(project, task)
         if features.on("task_module_commands"):
-            checks += module_checks(project, task)
+            modules = module_checks(project, task)
+            if modules:
+                features.mark_acted("task_module_commands", where="task_checks")
+            checks += modules
     model_dropped = list(model_dropped or [])
     for check in model or []:
         unknown = unknown_imports(check.spec["code"], project, task)

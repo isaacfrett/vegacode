@@ -3,7 +3,11 @@
 The evals grade pages in macOS's own WebKit (headless Chrome cannot start in
 the check sandbox, WebKit runs in-process with no sockets). This is the same engine host, cut to
 what the web pipeline measures (load a page, evaluate script, let timers run, resize, light or
-dark appearance), so Vega checks its own CSS/HTML/JS the way a browser lays it out.
+dark appearance, real key presses), so Vega checks its own CSS/HTML/JS the way a browser lays it
+out and the way a keyboard drives it. Keys are AppKit key events sent through the off-screen
+window to the focused element (`Page.press`, `Page.type`): trusted events with their default
+actions, as the evals' grader sends them. The window is never made key or ordered front, so the
+owner's frontmost app keeps the keyboard.
 
 Platform: WebKit through `osascript -l JavaScript` exists on macOS only. `available()` says
 whether it can run here (macOS, osascript, and the sandbox, because the page runs model-written
@@ -89,7 +93,21 @@ function resize(msg) {
   spin(0.02);
   return evaluate('[innerWidth, innerHeight]', 5);
 }
-const commands = {open, resize,
+// Real key presses: AppKit key-down/key-up events sent through the window to the focused element,
+// as a user's keyboard would (event.isTrusted; default actions run: Tab moves focus, Enter/Space
+// activate a button, characters go into a field). The window is never made key or ordered front.
+function keys(msg) {
+  for (const k of msg.keys) {
+    for (const type of [$.NSEventTypeKeyDown, $.NSEventTypeKeyUp]) {
+      win.sendEvent($.NSEvent.keyEventWithTypeLocationModifierFlagsTimestampWindowNumberContextCharactersCharactersIgnoringModifiersIsARepeatKeyCode(
+        type, $.NSMakePoint(0, 0), k.flags, 0, win.windowNumber, null, $(k.chars), $(k.plain), false, k.code));
+      spin(0.003);
+    }
+    spin(msg.settle);
+  }
+  return null;
+}
+const commands = {open, resize, keys,
   eval: msg => evaluate(msg.expr, msg.timeout),
   wait: msg => { spin(msg.ms / 1000); return null; }};
 function run() {
@@ -128,6 +146,53 @@ window.__vegaScrolls = [];
 
 class RenderError(RuntimeError):
     pass
+
+
+# Real key presses (Page.press / Page.type): name -> (characters, macOS virtual key code, flags).
+# The function keys carry AppKit's private-use characters, as a hardware keyboard sends them.
+_FN = 1 << 23  # NSEventModifierFlagFunction
+_PAD = 1 << 21  # NSEventModifierFlagNumericPad (the arrow keys)
+MODIFIERS = {"Shift": 1 << 17, "Control": 1 << 18, "Ctrl": 1 << 18, "Alt": 1 << 19,
+             "Option": 1 << 19, "Meta": 1 << 20, "Cmd": 1 << 20}
+KEYS: dict[str, tuple[str, int, int]] = {
+    "Tab": ("\t", 48, 0), "Enter": ("\r", 36, 0), "Escape": ("\x1b", 53, 0),
+    "Space": (" ", 49, 0), " ": (" ", 49, 0), "Backspace": ("\x7f", 51, 0),
+    "Delete": ("", 117, _FN),
+    "ArrowUp": ("", 126, _FN | _PAD), "ArrowDown": ("", 125, _FN | _PAD),
+    "ArrowLeft": ("", 123, _FN | _PAD), "ArrowRight": ("", 124, _FN | _PAD),
+    "Home": ("", 115, _FN), "End": ("", 119, _FN),
+    "PageUp": ("", 116, _FN), "PageDown": ("", 121, _FN),
+}
+# US-layout key codes of typed letters and digits (they set KeyboardEvent.code only; the
+# characters are what is typed)
+_CHAR_CODES = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11,
+    "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21,
+    "6": 22, "5": 23, "9": 25, "7": 26, "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35,
+    "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
+}
+
+
+def key_event(name: str) -> dict[str, Any]:
+    """One key press for the host: "ArrowRight", "Shift+Tab", "Escape", " ", or one character."""
+    mods: list[str] = []
+    key = name
+    if len(name) > 1 and "+" in name[:-1]:
+        *mods, key = name.split("+")
+    flags = 0
+    for mod in mods:
+        if mod not in MODIFIERS:
+            raise ValueError(f"unknown modifier {mod!r} in {name!r}")
+        flags |= MODIFIERS[mod]
+    if key in KEYS:
+        chars, code, extra = KEYS[key]
+        return {"chars": chars, "plain": chars, "code": code, "flags": flags | extra}
+    if len(key) != 1:
+        raise ValueError(f"unknown key {name!r}")
+    lower = key.lower()
+    if key != lower:
+        flags |= MODIFIERS["Shift"]
+    return {"chars": key, "plain": lower, "code": _CHAR_CODES.get(lower, 0), "flags": flags}
 
 
 @functools.cache
@@ -323,6 +388,18 @@ class Page:
 
     def wait(self, ms: int) -> None:
         self.renderer.command("wait", ms=ms, timeout=ms / 1000 + 10)
+
+    def press(self, *names: str, settle_ms: int = 30) -> None:
+        """Real key presses (down and up) to whatever has focus, in order, page time running
+        `settle_ms` after each: "ArrowRight", "Shift+Tab", "Escape", "Enter", " " (Space)."""
+        events = [key_event(name) for name in names]
+        if events:
+            self.renderer.command("keys", keys=events, settle=settle_ms / 1000,
+                                  timeout=len(events) * (settle_ms / 1000 + 0.05) + 10)
+
+    def type(self, text: str, settle_ms: int = 10) -> None:
+        """Type `text` with real key presses into whatever has focus."""
+        self.press(*text, settle_ms=settle_ms)
 
     def resize(self, width: int, height: int | None = None) -> None:
         height = height or self.height

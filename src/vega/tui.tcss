@@ -145,6 +145,9 @@ MarkdownFence { margin: 1 0; }
 
 /* input and status bar ----------------------------------------------------------------------- */
 
+#footer { height: auto; }
+.layout-quiet #footer, .layout-chat #footer { align-horizontal: center; }
+
 #input-row {
     height: auto;
     max-height: 10;
@@ -233,3 +236,39 @@ ViewScreen {
     background: $vega-overlay;
 }
 #view-body { width: 100%; }
+
+/* the / menu (SlashMenu): over the bottom of the conversation, above the input ---------------- */
+
+#menu {
+    dock: bottom;
+    layer: overlay;
+    width: 100%;
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+    border: none;
+    border-top: solid $vega-rule;
+    background: $background;
+    scrollbar-size-vertical: 1;
+}
+#menu:focus { border: none; border-top: solid $vega-rule; }
+#menu > .option-list--option-highlighted { background: $panel; text-style: bold; }
+#menu > .option-list--option-hover { background: $panel; }
+.note.hint .note-body { color: $vega-muted; }
+
+/* the terminal theme (App class ansi): no tinted backdrops, the terminal's background shows */
+.ansi ChoiceScreen, .ansi HelpScreen, .ansi EvidenceScreen { background: ansi_default; }
+.ansi #menu > .option-list--option-highlighted,
+.ansi #menu > .option-list--option-hover { background: ansi_default; text-style: none; }
+
+/* Markdown tables in replies (tui_table.TableBlock): a table too wide for the column scrolls
+   sideways inside itself, on a quiet one-row scrollbar */
+.answer TableBlock > HorizontalScroll {
+    background: transparent;
+    scrollbar-color: $vega-rule;
+    scrollbar-color-hover: $vega-muted;
+    scrollbar-color-active: $vega-muted;
+    scrollbar-background: $background;
+    scrollbar-background-hover: $background;
+    scrollbar-background-active: $background;
+}

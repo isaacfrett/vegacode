@@ -140,4 +140,6 @@ def problems(project: Path, task: str, paths: list[str] | None = None) -> list[s
         if "sources" in keys and "sources" in data and not (
                 isinstance(sources, list) and all(isinstance(item, str) for item in sources)):
             found.append(f'{path}: "sources" must be a list of strings (the URLs relied on)')
+    if found:
+        features.mark_acted("json_template", where="problems")
     return found

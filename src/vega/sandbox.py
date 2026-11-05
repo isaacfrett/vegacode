@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import features
+from . import extensions, features
 
 EXECUTABLE = "sandbox-exec"  # macOS: the only sandbox so far (readonly_argv is the seam)
 TIMEOUT = 60
@@ -39,7 +39,7 @@ ALLOWED = {
     "make": {"test", "check"},
     "node": {"--test"},
 }
-# sandbox_toolchains (2026-10-17): compilers and script runners for non-Python tasks.
+# Toolchains (2026-10-17): compilers and script runners for non-Python tasks.
 # They run under the same sandbox (no network, writes only inside the clone). `node` also takes a
 # script file inside the project (NODE_SCRIPTS); `Rscript` likewise takes an .R script.
 TOOLCHAIN_ALLOWED: dict[str, set[str] | None] = {"javac": None, "java": None, "Rscript": None}
@@ -92,25 +92,29 @@ def _quoted(path: Path | str) -> str:
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _profile(workdir: Path, read_roots: list[Path] | None = None) -> str:
-    """The clone's profile: no network, writes only inside the clone. `read_roots`
-    (sandbox_read_guard): reads of GUARDED_READS are denied too, except under these roots."""
+def _profile(workdir: Path, read_roots: list[Path] | None = None,
+             private_tmp: Path | None = None) -> str:
+    """The clone's profile: no network, writes only inside the clone (and `private_tmp`, the
+    run's own temp folder beside it). `read_roots` (the read guard): reads of GUARDED_READS
+    are denied too, except under these roots."""
+    writable = [workdir, *([private_tmp] if private_tmp is not None else [])]
+    subpaths = " ".join(f"(subpath {_quoted(path)})" for path in writable)
     profile = (
         "(version 1)(allow default)(deny network*)(deny file-write*)"
-        f"(allow file-write* (subpath {_quoted(workdir)})"
+        f"(allow file-write* {subpaths}"
         ' (literal "/dev/null") (literal "/dev/stdout") (literal "/dev/stderr"))'
     )
     if read_roots is not None:
         denied = " ".join(f"(subpath {_quoted(path)})" for path in GUARDED_READS)
-        allowed = " ".join([*(f"(subpath {_quoted(root)})" for root in [workdir, *read_roots]),
+        allowed = " ".join([*(f"(subpath {_quoted(root)})" for root in [*writable, *read_roots]),
                             *(f"(literal {_quoted(path)})" for path in READ_LITERALS),
                             *(f"(subpath {_quoted(path)})" for path in READ_SUBPATHS)])
         profile += f"(deny file-read-data {denied})(allow file-read-data {allowed})"
     return profile
 
 
-# sandbox_read_guard (2026-10-20): a model-written deliverable script read the Mac's own /etc
-# config file instead of the task's copy under root/etc/.
+# The read guard (2026-10-20; plain code since 2026-11-04): a model-written deliverable script
+# read the Mac's own /etc config file instead of the task's copy under root/etc/.
 # Host areas whose contents a private_home run may not read (metadata stays readable, and
 # `lsof`/`ps` ask the kernel, not these files) ...
 GUARDED_READS = ("/Users", "/Volumes", "/private/etc", "/private/var", "/private/tmp",
@@ -143,19 +147,23 @@ def _interpreter_roots(argv: list[str]) -> list[Path]:
 
 
 def _read_roots(workdir: Path, argv: list[str]) -> list[Path]:
-    """sandbox_read_guard: what a private_home run may read under GUARDED_READS besides the clone:
+    """The read guard: what a private_home run may read under GUARDED_READS besides the clone:
     its linked folders' targets (.venv and the like) and the interpreter's folders."""
     linked = [entry.resolve() for entry in workdir.iterdir() if entry.is_symlink()]
     return [*linked, *_interpreter_roots(argv)]
 
 
-def scrub_paths(output: str, workdir: Path, project: Path) -> str:
-    """sandbox_path_scrub: host paths in command output replaced, so none reaches
+def scrub_paths(output: str, workdir: Path, project: Path, private_tmp: Path | None = None) -> str:
+    """Host paths in command output replaced (always, since 2026-11-04), so none reaches
     the model or an answer: the clone and the project by `.`, Vega's venv by <venv>, the
     interpreter's install (a uv or pyenv python) by <python>, the user's home folder by `~`.
-    Only these real paths: a fixture's /Users/dana/... in output or a deliverable is left alone."""
+    Only these real paths: a fixture's /Users/dana/... in output or a deliverable is left alone.
+    `private_tmp` (the run's temp folder, outside the clone) becomes <tmp>."""
     pairs: set[tuple[str, str]] = set()
-    for path, label in ((workdir, "."), (project, "."), (Path(sys.prefix), "<venv>"),
+    temp = ((private_tmp, "<tmp>"),) if private_tmp is not None else ()
+    isolated = extensions.check_python()  # a stand-in interpreter's environment reads like Vega's own
+    temp += ((env_root(isolated), "<venv>"),) if isolated is not None else ()
+    for path, label in (*temp, (workdir, "."), (project, "."), (Path(sys.prefix), "<venv>"),
                         (Path(sys.exec_prefix), "<venv>"), (Path(sys.base_prefix), "<python>"),
                         (Path.home(), "~")):
         for form in {str(path), str(path.resolve())}:
@@ -207,12 +215,31 @@ def readonly_argv(argv: list[str]) -> list[str]:
     return [EXECUTABLE, "-p", readonly_profile(), *argv]
 
 
+def env_root(python: Path) -> Path:
+    """The environment folder of an interpreter at <root>/bin/python."""
+    return python.parent.parent
+
+
+def stand_in_path(python: Path, path: str | None) -> str:
+    """PATH for a command run with a stand-in interpreter (extensions.check_python): its bin/ first
+    and Vega's own bin/ left out, so `python`, `python3` and `pytest` name that interpreter."""
+    own = {str(Path(sys.prefix) / "bin"), str((Path(sys.prefix) / "bin").resolve())}
+    rest = [part for part in (path or os.defpath).split(os.pathsep) if part and part not in own]
+    return os.pathsep.join([str(python.parent), *rest])
+
+
 def find_python_tool(project: Path, name: str) -> str | None:
-    """Locate a Python-installed checker: project venv, then Vega's environment, then PATH."""
-    for root in (project / ".venv", project / "venv", Path(sys.prefix)):
+    """Locate a Python-installed checker: project venv, then Vega's environment, then PATH. With a
+    stand-in interpreter (extensions.check_python) its environment stands in for Vega's, and PATH
+    is searched without Vega's own bin/."""
+    isolated = extensions.check_python()
+    own = env_root(isolated) if isolated is not None else Path(sys.prefix)
+    for root in (project / ".venv", project / "venv", own):
         candidate = root / "bin" / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate)
+    if isolated is not None:
+        return shutil.which(name, path=stand_in_path(isolated, os.environ.get("PATH")))
     return shutil.which(name)
 
 
@@ -224,10 +251,12 @@ def _not_found(tool: str, where: str) -> str:
 
 
 def _python_for(project: Path) -> str:
+    """The interpreter a check runs with: the project's own venv, else an extension's stand-in
+    (extensions.check_python), else Vega's own."""
     for candidate in (project / ".venv" / "bin" / "python", project / "venv" / "bin" / "python"):
         if candidate.exists():
             return str(candidate)
-    return sys.executable
+    return str(extensions.check_python() or sys.executable)
 
 
 SHELL_TOKENS = {"|", "||", "&&", ";", "<", ">", ">>", "2>", "2>&1", "&", "$(", "`"}
@@ -255,16 +284,14 @@ def parse_command(command: str, project: Path, harness: bool = False) -> list[st
         return ("`python` with no script reads stdin, which is empty here, so nothing would run. "
                 "Write the script to a file and run `python file.py`, or use `python -c \"...\"`.")
     program = Path(argv[0]).name
-    toolchains = features.on("sandbox_toolchains")
-    allowed_programs = {**ALLOWED, **(HARNESS_ALLOWED if harness else {}),
-                        **(TOOLCHAIN_ALLOWED if toolchains else {})}
+    allowed_programs = {**ALLOWED, **(HARNESS_ALLOWED if harness else {}), **TOOLCHAIN_ALLOWED}
     if program not in allowed_programs:
-        allowed = "; ".join(RUN_CHECK_PROGRAMS + (TOOLCHAIN_PROGRAMS if toolchains else ()))
+        allowed = "; ".join(RUN_CHECK_PROGRAMS + TOOLCHAIN_PROGRAMS)
         return (
             f"run_check only runs test/check programs ({allowed}). "
             "Use run_command for anything else."
         )
-    script = _script_argument(argv, project) if toolchains else None
+    script = _script_argument(argv, project)
     if isinstance(script, str):
         return script
     subcommands = None if script else allowed_programs[program]
@@ -298,7 +325,7 @@ def parse_command(command: str, project: Path, harness: bool = False) -> list[st
 
 
 def _script_argument(argv: list[str], project: Path) -> bool | str | None:
-    """sandbox_toolchains: `node <script.js>` / `Rscript <script.R>`. True for a script file inside
+    """`node <script.js>` / `Rscript <script.R>`. True for a script file inside
     the project, an error message for a script path outside it or missing, None when the command
     is not a script run (node's other forms keep their own rules)."""
     program = Path(argv[0]).name
@@ -326,7 +353,12 @@ def run_stoppable(argv: list[str] | str, *, cwd: Path, env: dict[str, str] | Non
                   shell: bool = False) -> subprocess.CompletedProcess[str]:
     """subprocess.run that also ends early when `stop` is set: the whole process group is killed at
     once (a test runner's children too), so Esc/Ctrl+C never waits out a long command.
-    Raises subprocess.TimeoutExpired like subprocess.run, and StoppedRun when stopped."""
+    Raises subprocess.TimeoutExpired like subprocess.run, and StoppedRun when stopped.
+    An extension may run (and watch) the command instead (extensions.command_run)."""
+    watched = extensions.command_run(argv, cwd=cwd, env=env, timeout=timeout, stop=stop,
+                                     shell=shell)
+    if watched is not None:
+        return watched
     process = subprocess.Popen(
         argv, cwd=cwd, env=env, shell=shell, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, start_new_session=(os.name != "nt"),
@@ -361,7 +393,7 @@ def _kill_tree(process: subprocess.Popen[str]) -> None:
 
 
 def toolchain_env(private_tmp: Path) -> dict[str, str]:
-    """sandbox_toolchains: writable caches inside the clone for toolchains that default to the
+    """Writable caches in the run's private temp folder for toolchains that default to the
     home folder (2026-10-17: every `go test` failed with "failed to initialize build
     cache" because ~/Library/Caches/go-build is not writable in the sandbox). No network, so Go
     must not try to download modules or toolchains."""
@@ -385,6 +417,7 @@ def clip_output(output: str, limit: int = OUTPUT_LIMIT) -> str:
         return output
     if not features.on("output_head_tail") or limit > OUTPUT_LIMIT:
         return "... [earlier output truncated]\n" + output[-limit:]
+    features.mark_acted("output_head_tail")
     head = output[:int(limit * HEAD_SHARE)].rsplit("\n", 1)[0]
     tail = output[len(output) - (limit - len(head)):]
     tail = tail.split("\n", 1)[1] if "\n" in tail else tail
@@ -409,33 +442,40 @@ def run_check(command: str, project: Path, timeout: int = TIMEOUT,
     """Run one allowed command in a sandboxed clone of the project; `exit code: N` + output.
     `private_home`: HOME (and USERPROFILE) point at the clone, so a model-written script that
     expands `~` writes and reads inside it and never puts the user's home path into its output
-    (a deliverable once held /Users/<name>/...)."""
+    (a deliverable once held /Users/<name>/...).
+    Layout: <temp>/vega-check-XXXX is the clone (cwd) and its .vega-tmp folder the TMPDIR, unless
+    an extension lays the run out otherwise (extensions.check_workspace: a clone and a temp folder
+    beside it, labelled <tmp> in the output)."""
     if not available():
         return "Sandboxed checks are unavailable on this system (macOS sandbox-exec not found)."
     argv = parse_command(command, project, harness=harness)
     if isinstance(argv, str):
         return argv
-    workdir = Path(tempfile.mkdtemp(prefix="vega-check-")).resolve()
+    workspace = Path(tempfile.mkdtemp(prefix="vega-check-")).resolve()
     try:
+        layout = extensions.check_workspace(workspace)
+        beside = layout is not None  # the temp folder is outside the clone
+        workdir, private_tmp = layout if layout is not None else (workspace, workspace / ".vega-tmp")
+        workdir.mkdir(exist_ok=True)
         _clone(project, workdir)
-        private_tmp = workdir / ".vega-tmp"  # the only writable place besides the clone itself
-        private_tmp.mkdir()
-        inherited = os.environ
-        if features.on("sandbox_env_scrub"):
-            # Vega's own settings are not the project's: an eval's pinned VEGA_SEED /
-            # VEGA_TEMPERATURE and its A/B VEGA_FEATURES_OFF reached Vega's own tests in the
-            # selfbuild regression run and failed one in every attempt (2026-10-21).
-            inherited = {k: v for k, v in os.environ.items() if not k.startswith("VEGA_")}
+        private_tmp.mkdir()  # the only writable place besides the clone itself
+        # Vega's own settings are not the project's: an eval's pinned VEGA_SEED /
+        # VEGA_TEMPERATURE and its A/B VEGA_FEATURES_OFF reached Vega's own tests in the
+        # selfbuild regression run and failed one in every attempt (2026-10-21).
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("VEGA_")}
         env = {
             **inherited, "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(private_tmp),
             "PYTHONPATH": os.pathsep.join([str(workdir), str(workdir / "src")]),
         }
-        if features.on("sandbox_toolchains"):
-            env.update(toolchain_env(private_tmp))
+        env.update(toolchain_env(private_tmp))
+        isolated = extensions.check_python()
+        if isolated is not None:  # a check's own `python` / `pytest` children use it too
+            env["PATH"] = stand_in_path(isolated, env.get("PATH"))
         if private_home:
             env.update(HOME=str(workdir), USERPROFILE=str(workdir))
-        guard = private_home and features.on("sandbox_read_guard")
-        profile = _profile(workdir, _read_roots(workdir, argv) if guard else None)
+        # a private_home run's profile denies host reads outside the clone
+        profile = _profile(workdir, _read_roots(workdir, argv) if private_home else None,
+                           private_tmp if beside else None)
         try:
             result = run_stoppable([EXECUTABLE, "-p", profile, *argv],
                                    cwd=workdir, env=env, timeout=timeout, stop=stop)
@@ -445,13 +485,14 @@ def run_check(command: str, project: Path, timeout: int = TIMEOUT,
         except StoppedRun:
             return STOPPED_CHECK
         output = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
+        if beside:
+            output = output.replace(str(private_tmp), "<tmp>")
         output = output.replace(str(workdir), ".")
-        if features.on("sandbox_path_scrub"):
-            output = scrub_paths(output, workdir, project)
+        output = scrub_paths(output, workdir, project, private_tmp if beside else None)
         output = clip_output(output, output_limit)
         return f"exit code: {result.returncode}\n{output or '(no output)'}"
     finally:
-        _remove(workdir)
+        _remove(workspace)
 
 
 def _remove(workdir: Path) -> None:

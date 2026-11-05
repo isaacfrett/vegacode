@@ -500,6 +500,7 @@ class SearxngBackend:
                                "does not fetch.")
         adapter = site_adapter(url) if features.on("web_site_apis") else None
         if adapter is not None:
+            features.mark_acted("web_site_apis", host=host)
             page = adapter(self.api_get)
             if page is not GENERIC:
                 return page
@@ -1157,6 +1158,8 @@ def site_adapter(url: str) -> Callable[[ApiGet], Any] | None:
         from . import adapter_builder
 
         reader = adapter_builder.stored_reader(url)
+        if reader is not None:
+            features.mark_acted("web_adapter_builder", where="stored_reader")
     return reader
 
 
@@ -1483,6 +1486,8 @@ class WebSession:
                 self.turn_meta.setdefault(canonical_url(result.url), result)
             if features.on("web_official_hint"):
                 official = official_urls(query, urls, self._extra_official())
+                if official:
+                    features.mark_acted("web_official_hint")
                 self.turn_official += [url for url in urls
                                        if url in official and url not in self.turn_official]
                 text = mark_official(text, official)
@@ -1547,6 +1552,7 @@ class WebSession:
         if site in self.adapter_attempted:
             return None
         self.adapter_attempted.add(site)
+        features.mark_acted("web_adapter_builder", where="build", site=site)
         previous = adapter_builder.find(url, include_unusable=True)
         if previous is not None and previous.meta.get("status") != "failing":
             previous = None  # changed by hand or unapproved: build afresh, keep nothing of it
@@ -1781,8 +1787,11 @@ class WebSession:
             return []
         fetched = {canonical_url(url) for url in self.turn_urls}
         cited = set(listed)
-        return [(self._shown(url), why) for url, why in self.turn_named.items()
-                if url in fetched and url not in cited]
+        missing = [(self._shown(url), why) for url, why in self.turn_named.items()
+                   if url in fetched and url not in cited]
+        if missing:
+            features.mark_acted("cite_named_pages", pages=len(missing))
+        return missing
 
     def _old_citation_note(self, answer: str) -> str | None:
         relied = self.turn_urls or self.turn_results

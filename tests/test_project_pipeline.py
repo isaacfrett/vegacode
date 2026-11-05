@@ -391,3 +391,25 @@ def test_end_to_end_large_file_fix_then_the_tests_pass(tmp_path: Path, monkeypat
     assert len(calls) == 2
     text = (tmp_path / "shop" / "store.py").read_text()
     assert text.count("    def metric_") == 60 and "def unrelated_59(x)" in text
+
+
+def test_failures_an_extension_adds_count_and_reach_the_writers() -> None:
+    """write_loop.Checks.add_failure (extensions.checks_recorded): the project pipeline's round
+    is not done, ranks like a failing test, and the next round's writers see the line."""
+    from types import SimpleNamespace
+
+    from vega import write_loop
+
+    checks = project_pipeline._Checks(items=[])
+    assert checks.failed == 0 and checks.score() == (0, 0, 0, 0)
+    checks.add_failure("contract", "`f(...)`", "calling `f(...)` fails: raised NameError")
+    assert checks.failed == 1 and checks.score() == (0, 1, 0, 0)
+    assert checks.items == [write_loop.item("contract", "`f(...)`", False,
+                                            "calling `f(...)` fails: raised NameError")]
+    rounds = SimpleNamespace(previous_still=0, failure="")
+    assert not project_pipeline._Rounds.done(rounds, checks, 0)
+    assert rounds.failure == "- calling `f(...)` fails: raised NameError"
+    assert checks.open_items == ["calling `f(...)` fails: raised NameError"]
+    plain = write_loop.Checks()
+    plain.add_failure("contract", "x", "line")
+    assert plain.failed == 1 and plain.failures == ["line"] and plain.items is None

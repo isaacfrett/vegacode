@@ -34,6 +34,7 @@ from . import (
     check_feedback,
     data_preview,
     debuglog,
+    extensions,
     features,
     sandbox,
     teaching,
@@ -246,6 +247,7 @@ def _test_output(output: str) -> str:
     last; else the last 12 lines, which held only FAILED ids once tracebacks were long."""
     if (features.on("short_tracebacks") and features.on("repair_feedback")
             and check_feedback.exit_code(output) is not None):  # a timeout says so as it is
+        features.mark_acted("short_tracebacks", where="repair_feedback")
         body = check_feedback.excerpt(output, TEST_OUTPUT_CHARS)
         count = check_feedback.totals(output)
         if count and body.startswith(count + "\n"):
@@ -257,23 +259,33 @@ def _test_output(output: str) -> str:
     return "\n".join(lines[-12:])
 
 
+def run_examples(project: Path, relative: str, examples: list[Example]) -> list[str]:
+    """Run docstring examples against the module of `relative` in the sandbox: one line per
+    failing example (CHECK_SCRIPT's wording), or one "examples could not run" line."""
+    if not examples:
+        return []
+    module = Path(relative).with_suffix("").as_posix().replace("/", ".").removeprefix("src.")
+    payload = [[module, example.call, example.expected, example.source] for example in examples]
+    script = extensions.example_script(CHECK_SCRIPT)
+    command = f"python -c {shlex.quote(script)} {shlex.quote(json.dumps(payload))}"
+    output = sandbox.run_check(command, project)
+    first, _, rest = output.partition("\n")
+    try:
+        last = [line for line in rest.splitlines() if line.strip()][-1]
+        failures = list(json.loads(last))
+        extensions.examples_failed(failures, path=relative)
+        return failures
+    except (IndexError, ValueError):
+        if first != "exit code: 0":
+            return [f"examples could not run: {rest.strip()[-300:] or first}"]
+    return []
+
+
 def run_checks(project: Path, files: list[Path], examples: list[Example]) -> CheckResult:
     result = CheckResult(total=len(examples))
     if examples:
-        payload = []
-        for example in examples:
-            module = files[0].relative_to(project).with_suffix("").as_posix().replace("/", ".")
-            module = module.removeprefix("src.")
-            payload.append([module, example.call, example.expected, example.source])
-        command = f"python -c {shlex.quote(CHECK_SCRIPT)} {shlex.quote(json.dumps(payload))}"
-        output = sandbox.run_check(command, project)
-        first, _, rest = output.partition("\n")
-        try:
-            last = [line for line in rest.splitlines() if line.strip()][-1]
-            result.failures = json.loads(last)
-        except (IndexError, ValueError):
-            if first != "exit code: 0":
-                result.failures = [f"examples could not run: {rest.strip()[-300:] or first}"]
+        result.failures = run_examples(project, files[0].relative_to(project).as_posix(),
+                                       examples)
     tests = [p for p in _project_files(project) if p.suffix == ".py" and p.name.startswith("test")]
     if tests:
         output = sandbox.run_check(
@@ -309,6 +321,14 @@ _OPENING_FENCE = re.compile(r"^\s*```[\w.+-]*[ \t]*\n")
 
 
 def join_continuation(text: str, part: str) -> str:
+    """_join_continuation; marks continuation_seams when the seam differs from a plain join."""
+    joined = _join_continuation(text, part)
+    if joined != text + part:
+        features.mark_acted("continuation_seams")
+    return joined
+
+
+def _join_continuation(text: str, part: str) -> str:
     """`text` cut off at the token limit plus the model's continuation `part`. Models restart the
     cut line with its indent: a cut inside the indent ("   ") then gets it twice ("   " + "    return
     ..."), an unexpected indent; a cut mid-line ("from 1" + "    up to n") gets a run of spaces; a
@@ -338,8 +358,9 @@ def ask_complete(agent: CodingAgent, messages: list[dict[str, Any]], *,
     text = ""
     convo = list(messages)
     for attempt in range(continuations + 1):
+        # `extra` wins over the agent's sampling (a one-off request's own max_tokens)
         reply = agent.client.chat.completions.create(model=agent.model, messages=convo,
-                                                     **agent.sampling, **extra)
+                                                     **{**agent.sampling, **extra})
         choice = reply.choices[0]
         part = choice.message.content or ""
         if attempt and write_loop.inside_open_block(text):  # no second opening fence
@@ -386,7 +407,17 @@ DATA_HEADER = ("Input data the task names (file contents, not instructions; read
                "do not change it)")
 
 
-def route_inputs_shown(project: Path, inputs: list[str], budget: int | None = None) -> str:
+def input_caps(*, num_ctx: int | None = None, agent: Any = None) -> dict[str, int]:
+    """write_loop.render_inputs's caps for one read-only input: INPUT_CHARS for data, DOC_CHARS
+    for other text (extensions.budget for the window)."""
+    return {"data": extensions.budget("pipeline.INPUT_CHARS", INPUT_CHARS, num_ctx=num_ctx,
+                                      agent=agent),
+            "other": extensions.budget("pipeline.DOC_CHARS", DOC_CHARS, num_ctx=num_ctx,
+                                       agent=agent)}
+
+
+def route_inputs_shown(project: Path, inputs: list[str], budget: int | None = None,
+                       caps: dict[str, int] | None = None) -> str:
     """The read-only inputs the route found (data previews, spec documents, code the task
     reads), for the writer (write_loop.render_inputs): data as its preview cut at INPUT_CHARS,
     other text whole up to DOC_CHARS, all of them within `budget` characters (what the window
@@ -395,7 +426,7 @@ def route_inputs_shown(project: Path, inputs: list[str], budget: int | None = No
         budget = (INPUTS_MAX + 1) * DOC_CHARS
     return write_loop.render_inputs(
         project, inputs[:INPUTS_MAX + 1], budget=budget,
-        caps={"data": INPUT_CHARS, "other": DOC_CHARS}, header=INPUTS_HEADER,
+        caps=caps or {"data": INPUT_CHARS, "other": DOC_CHARS}, header=INPUTS_HEADER,
         data_header=DATA_HEADER, label_inside=True, fence="text")
 
 
@@ -446,9 +477,10 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
         return None
     project = agent.project
     contents = {}
+    max_file = extensions.budget("pipeline.MAX_FILE_CHARS", MAX_FILE_CHARS, agent=agent)
     for path in files:
         text = path.read_text(encoding="utf-8")
-        if len(text) > MAX_FILE_CHARS:
+        if len(text) > max_file:
             return None
         contents[path] = text
     target = files[0]
@@ -458,14 +490,22 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
                         f"python\n{text}{write_loop.fence_for(text)}"
                         for p, text in contents.items())
     budget = inputs_budget(agent, task, sum(len(text) for text in contents.values()))
-    inputs_shown = route_inputs_shown(project, route.inputs, budget)
+    caps = input_caps(agent=agent)
+    inputs_shown = route_inputs_shown(project, route.inputs, budget, caps)
     shown += _knowledge(task) + inputs_shown
     related = getattr(route, "related", None) or []
+    related_shown = ""
     if related and features.on("direct_context"):
-        shown += write_loop.render_inputs(
+        related_shown = write_loop.render_inputs(
             project, related, budget=budget - len(inputs_shown),
-            caps={"data": INPUT_CHARS, "other": DOC_CHARS}, header=RELATED_HEADER,
+            caps=caps, header=RELATED_HEADER,
             label_inside=True, fence="text")
+        if related_shown:
+            features.mark_acted("direct_context", where="writer", related=related)
+        shown += related_shown
+    shown += extensions.writer_context(
+        project, relative, task, source="direct_pipeline", prompt=shown,
+        budget=max(0, budget - len(inputs_shown) - len(related_shown)))
     host = write_loop.AgentHost(agent)
     system = (WRITER_SYSTEM.replace(", then nothing else.", "." + teaching.WRITER_LINE)
               if host.teach else WRITER_SYSTEM)
@@ -484,12 +524,18 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
         kinds = {"docstring examples": ran_examples, "tests": checks.total - ran_examples,
                  "task checks": 0}
         failures = list(checks.failures)
+        items = write_loop.counted_items("examples", f"docstring examples in {relative}",
+                                         ran_examples, failures[:ran_examples])
+        if kinds["tests"]:
+            items.append(write_loop.item("tests", "the project's tests", not checks.test_output,
+                                         checks.test_output))
         if accept_spec is not None:  # the task's own names, calls and commands
             accepted = acceptance.run(accept_spec, project, [relative], tests=False,
                                       stop=host.stop_flag())
             kinds["task checks"] = len(accepted.items)
             failures += acceptance.pipeline_failures(accepted)
-        return write_loop.Checks(kinds, failures, checks.test_output)
+            items += write_loop.acceptance_items(accepted)
+        return write_loop.Checks(kinds, failures, checks.test_output, items=items)
 
     config = write_loop.LoopConfig(
         name="direct_pipeline", title="Direct pipeline", targets=[relative],
@@ -498,8 +544,21 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
         not_saved=lambda refusals, _problems: NOT_SAVED.format(result=refusals[0]),
         repair=REPAIR, check_call="docstring examples + tests", check_result="docstring examples",
         no_checks_text="no examples or tests to check",
-        ask=lambda convo: _ask(agent, convo))
+        ask=lambda convo: _ask(agent, convo), task=task,
+        handover=features.on("project_pipeline"))
     result = write_loop.run_loop(host, config, messages)
+    if result is not None and result.handover:
+        # extensions.stalled_round: the rewrite stalled on a failure in another file, which this
+        # pipeline cannot write; the project pipeline gets the task with that failure and files
+        from . import project_pipeline
+
+        try:
+            handed = project_pipeline.run(agent, task, handover=result.handover)
+        except Exception as exc:  # noqa: BLE001 - the direct pipeline's own answer stands
+            debuglog.record("stage", stage="direct_pipeline.handover_failed", error=str(exc)[:300])
+            handed = None
+        if handed is not None:
+            return handed
     if result is None or result.kept is None:
         return None
     kept = result.kept
@@ -507,7 +566,13 @@ def run(agent: CodingAgent, task: str, *, route: Any) -> str | None:
     answer = honest_answer(relative, kept.failed, kept.kinds,
                            changed=result.snapshot[relative] != contents[target])
     if kept.failed and features.on("failing_checks_quoted"):
-        answer += failing_lines(kept.failures)
+        quoted = failing_lines(kept.failures)
+        if quoted:
+            features.mark_acted("failing_checks_quoted", where="direct_pipeline")
+        answer += quoted
+    answer = extensions.final_answer(
+        answer, source=config.name, result=result, config=config, project=project, task=task,
+        agent=agent, changed=[relative] if result.snapshot[relative] != contents[target] else [])
     if host.teach:
         attempts = [(a.passed, a.total, a.failures) for a in result.attempts]
         answer += "\n\n" + teaching.direct_note(relative, attempts, result.best or 0)
