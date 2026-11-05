@@ -19,12 +19,12 @@ import pytest
 
 
 def test_sleeps_past_the_watchdog():
-    time.sleep(2.5)
+    time.sleep(8)
 
 
-@pytest.mark.watchdog(30)
+@pytest.mark.watchdog(60)
 def test_marked_slow_is_given_longer():
-    time.sleep(2.5)
+    time.sleep(5)
 '''
 
 
@@ -36,24 +36,26 @@ def run(tmp_path: Path, test: str, seconds: str, exit_after: str = "") -> subpro
                VEGA_HOME=str(tmp_path / "home"))
     return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                            f"test_slow.py::{test}"], cwd=tmp_path, env=env, capture_output=True,
-                          text=True, timeout=120, check=False)
+                          text=True, timeout=300, check=False)
 
 
 def test_a_slow_test_has_its_stack_dumped_and_still_passes(tmp_path):
-    done = run(tmp_path, "test_sleeps_past_the_watchdog", "1")
+    # 3 s, not 1: the timer is armed before setup, and on a cold CI runner setup's first imports took
+    # over a second, so a 1 s dump named an import instead of the test (vegacode PR #10, macOS 3.12)
+    done = run(tmp_path, "test_sleeps_past_the_watchdog", "3")
     assert done.returncode == 0, done.stdout + done.stderr
-    assert "Timeout (0:00:01)!" in done.stderr
+    assert "Timeout (0:00:03)!" in done.stderr
     assert "in test_sleeps_past_the_watchdog" in done.stderr  # the dump names the test
 
 
 def test_exit_mode_ends_the_run_after_the_dump(tmp_path):
-    done = run(tmp_path, "test_sleeps_past_the_watchdog", "1", exit_after="1")
+    done = run(tmp_path, "test_sleeps_past_the_watchdog", "3", exit_after="1")
     assert done.returncode != 0 and "in test_sleeps_past_the_watchdog" in done.stderr
     assert " passed" not in done.stdout  # killed mid-test: no summary
 
 
 def test_the_marker_gives_longer_and_zero_switches_it_off(tmp_path):
-    marked = run(tmp_path, "test_marked_slow_is_given_longer", "1")
+    marked = run(tmp_path, "test_marked_slow_is_given_longer", "3")
     off = run(tmp_path, "test_sleeps_past_the_watchdog", "0")
     for done in (marked, off):
         assert done.returncode == 0, done.stdout + done.stderr
